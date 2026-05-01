@@ -5323,7 +5323,7 @@ fn lexical_rebuild_first_budget_promotion_wait() -> Duration {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(30_000),
+            .unwrap_or(5_000),
     )
 }
 
@@ -12764,7 +12764,13 @@ fn rebuild_tantivy_from_db_via_staged_shards(
                 *processed_conversations =
                     processed_conversations.saturating_add(result.shard.conversation_count);
                 *indexed_docs = indexed_docs.saturating_add(result.indexed_docs);
-                *observed_messages = observed_messages.saturating_add(result.shard.message_count);
+                let shard_observed_messages =
+                    if lexical_shard_message_count_is_known(result.shard.message_count) {
+                        result.shard.message_count
+                    } else {
+                        result.indexed_docs
+                    };
+                *observed_messages = observed_messages.saturating_add(shard_observed_messages);
                 *last_processed_conversation_id = Some(result.shard.last_conversation_id);
                 completed_shard_artifacts.push(validated_artifact);
                 *conversations_since_progress_persist = conversations_since_progress_persist
@@ -22489,6 +22495,17 @@ mod tests {
         assert_eq!(
             lexical_rebuild_staged_shard_merge_settings(&settings, 32),
             LexicalRebuildShardMergeSettings { workers: 3 }
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_first_budget_promotion_wait_defaults_to_short_bounded_wait() {
+        let _guard = unset_env_var("CASS_TANTIVY_REBUILD_FIRST_BUDGET_PROMOTION_WAIT_MS");
+
+        assert_eq!(
+            lexical_rebuild_first_budget_promotion_wait(),
+            Duration::from_millis(5_000)
         );
     }
 
