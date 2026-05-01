@@ -487,6 +487,18 @@ fn status_json_surfaces_lexical_generation_lifecycle_inventory() {
         false,
         false,
     );
+    write_generation_manifest(
+        &data_dir
+            .join("synced-sessions")
+            .join("remote-a")
+            .join("generation-decoy-outside-index"),
+        "gen-decoy-outside-index",
+        "validated",
+        "published",
+        "published",
+        false,
+        false,
+    );
 
     let out = Command::new(assert_cmd::cargo::cargo_bin!("cass"))
         .args([

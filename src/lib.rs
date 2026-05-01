@@ -11140,8 +11140,9 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
         )),
     }
 
+    let lexical_manifest_root = diag_lexical_manifest_scan_root(index_path);
     let lexical_manifest_entries = collect_diag_lexical_manifest_entries(
-        data_dir,
+        &lexical_manifest_root,
         now,
         &mut report.warnings,
         &mut report.summary,
@@ -11368,7 +11369,7 @@ fn collect_diag_quarantine_report(data_dir: &Path, index_path: &Path) -> DiagQua
 }
 
 fn collect_diag_lexical_manifest_entries(
-    data_dir: &Path,
+    manifest_root: &Path,
     now: std::time::SystemTime,
     warnings: &mut Vec<String>,
     summary: &mut DiagQuarantineSummary,
@@ -11378,13 +11379,25 @@ fn collect_diag_lexical_manifest_entries(
     };
 
     let mut lexical_manifest_entries = Vec::new();
-    for entry in walkdir::WalkDir::new(data_dir).follow_links(false) {
+    match manifest_root.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return lexical_manifest_entries,
+        Err(err) => {
+            warnings.push(format!(
+                "failed to inspect lexical generation manifest root {}: {err}",
+                manifest_root.display()
+            ));
+            return lexical_manifest_entries;
+        }
+    }
+
+    for entry in walkdir::WalkDir::new(manifest_root).follow_links(false) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(err) => {
                 warnings.push(format!(
-                    "failed to walk quarantine roots under {}: {err}",
-                    data_dir.display()
+                    "failed to walk lexical generation manifests under {}: {err}",
+                    manifest_root.display()
                 ));
                 continue;
             }
@@ -11431,6 +11444,10 @@ fn collect_diag_lexical_manifest_entries(
     }
 
     lexical_manifest_entries
+}
+
+fn diag_lexical_manifest_scan_root(index_path: &Path) -> PathBuf {
+    index_path.parent().unwrap_or(index_path).to_path_buf()
 }
 
 fn apply_diag_quarantine_cleanup(
@@ -11543,8 +11560,9 @@ fn apply_diag_quarantine_cleanup(
         lexical_generation_publish_state_counts: lexical_generation_publish_state_zero_counts(),
         ..DiagQuarantineSummary::default()
     };
+    let lexical_manifest_root = diag_lexical_manifest_scan_root(index_path);
     let lexical_manifest_entries = collect_diag_lexical_manifest_entries(
-        data_dir,
+        &lexical_manifest_root,
         std::time::SystemTime::now(),
         &mut scan_warnings,
         &mut scan_summary,
