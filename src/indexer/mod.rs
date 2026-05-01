@@ -10946,49 +10946,12 @@ fn release_completed_lexical_rebuild_pages(
     }
 }
 
-fn reserve_lexical_rebuild_prepared_page_budget(
-    sequence: u64,
-    page: &mut LexicalRebuildPreparedPage,
-    flow_limiter: &StreamingByteLimiter,
-    producer_telemetry: &LexicalRebuildProducerTelemetry,
-) -> Result<usize> {
-    let page_message_bytes = page
-        .packets
-        .iter()
-        .map(|packet| packet.message_bytes)
-        .sum::<usize>();
-    let (reserved_bytes, budget_wait_duration, waited_for_budget) = flow_limiter
-        .acquire_with_wait(page_message_bytes)
-        .with_context(|| {
-            format!(
-                "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
-                sequence
-            )
-        })?;
-    if waited_for_budget {
-        producer_telemetry.record_budget_wait(budget_wait_duration);
-    }
-    assign_lexical_rebuild_flow_reservation_bytes(&mut page.packets, reserved_bytes);
-    tracing::debug!(
-        sequence,
-        page_messages = page
-            .packets
-            .iter()
-            .map(|packet| packet.message_count)
-            .sum::<usize>(),
-        page_message_bytes,
-        reserved_bytes,
-        budget_wait_ms = budget_wait_duration.as_millis() as u64,
-        waited_for_budget,
-        "lexical rebuild producer reserved byte budget for ordered page handoff"
-    );
-    Ok(reserved_bytes)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn prepare_lexical_rebuild_page_work(
     storage: &mut FrankenStorage,
     source_map: &HashMap<String, (SourceKind, Option<String>)>,
+    flow_limiter: &StreamingByteLimiter,
+    producer_telemetry: &LexicalRebuildProducerTelemetry,
     lexical_rebuild_worker_pool: Option<&ThreadPool>,
     work: LexicalRebuildPagePrepWork,
 ) -> Result<LexicalRebuildSequencedPreparedPage> {
@@ -11039,7 +11002,7 @@ fn prepare_lexical_rebuild_page_work(
     let message_fetch_duration = message_fetch_started.elapsed();
 
     let packet_prepare_started = Instant::now();
-    let prepared_packets = prepare_lexical_rebuild_packet_batch(
+    let mut prepared_packets = prepare_lexical_rebuild_packet_batch(
         work.conversation_page,
         grouped_messages,
         source_map,
@@ -11061,6 +11024,18 @@ fn prepare_lexical_rebuild_page_work(
         .iter()
         .map(|packet| packet.message_count)
         .sum::<usize>();
+    let (reserved_bytes, budget_wait_duration, waited_for_budget) = flow_limiter
+        .acquire_with_wait(page_message_bytes)
+        .with_context(|| {
+            format!(
+                "acquiring lexical rebuild pipeline byte budget for ordered page sequence {}",
+                sequence
+            )
+        })?;
+    if waited_for_budget {
+        producer_telemetry.record_budget_wait(budget_wait_duration);
+    }
+    assign_lexical_rebuild_flow_reservation_bytes(&mut prepared_packets, reserved_bytes);
     let configured_page_size = usize::try_from(work.configured_page_size.max(1))
         .unwrap_or(usize::MAX)
         .max(1);
@@ -11080,7 +11055,9 @@ fn prepare_lexical_rebuild_page_work(
         page_last_conversation_id = work.page_last_conversation_id,
         page_messages = page_message_count,
         page_message_bytes,
-        budget_reservation_stage = "ordered_handoff",
+        reserved_bytes,
+        budget_wait_ms = budget_wait_duration.as_millis() as u64,
+        waited_for_budget,
         batch_fetch_message_limit = work.pipeline_budget.batch_fetch_message_limit,
         batch_fetch_message_bytes_limit = work.pipeline_budget.batch_fetch_message_bytes_limit,
         max_message_bytes_in_flight = work.pipeline_budget.max_message_bytes_in_flight,
@@ -11111,6 +11088,8 @@ fn spawn_lexical_rebuild_page_prep_workers(
     source_map: Arc<HashMap<String, (SourceKind, Option<String>)>>,
     work_rx: Receiver<LexicalRebuildPagePrepWork>,
     result_tx: Sender<LexicalRebuildPagePrepResult>,
+    flow_limiter: Arc<StreamingByteLimiter>,
+    producer_telemetry: Arc<LexicalRebuildProducerTelemetry>,
     lexical_rebuild_worker_pool: Option<Arc<ThreadPool>>,
 ) -> Result<Vec<JoinHandle<()>>> {
     let tracing_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
@@ -11120,6 +11099,8 @@ fn spawn_lexical_rebuild_page_prep_workers(
             let worker_source_map = Arc::clone(&source_map);
             let worker_rx = work_rx.clone();
             let worker_result_tx = result_tx.clone();
+            let worker_flow_limiter = Arc::clone(&flow_limiter);
+            let worker_producer_telemetry = Arc::clone(&producer_telemetry);
             let worker_pool = lexical_rebuild_worker_pool.clone();
             let worker_dispatch = tracing_dispatch.clone();
             thread::Builder::new()
@@ -11149,14 +11130,19 @@ fn spawn_lexical_rebuild_page_prep_workers(
                             match prepare_lexical_rebuild_page_work(
                                 &mut storage,
                                 worker_source_map.as_ref(),
+                                worker_flow_limiter.as_ref(),
+                                worker_producer_telemetry.as_ref(),
                                 worker_pool.as_deref(),
                                 work,
                             ) {
                                 Ok(prepared) => {
+                                    let reserved_bytes =
+                                        lexical_rebuild_prepared_page_reserved_bytes(&prepared.page);
                                     if worker_result_tx
                                         .send(LexicalRebuildPagePrepResult::Prepared(prepared))
                                         .is_err()
                                     {
+                                        worker_flow_limiter.release(reserved_bytes);
                                         break;
                                     }
                                 }
@@ -11315,6 +11301,8 @@ fn spawn_lexical_rebuild_packet_producer(
                 Arc::clone(&source_map),
                 work_rx,
                 result_tx,
+                Arc::clone(&flow_limiter),
+                Arc::clone(&producer_telemetry),
                 lexical_rebuild_worker_pool.clone(),
             ) {
                 Ok(handles) => handles,
@@ -11350,17 +11338,9 @@ fn spawn_lexical_rebuild_packet_producer(
                 let mut handoff_message_bytes_since_budget = 0usize;
                 let mut completed_pages = BTreeMap::<u64, LexicalRebuildPreparedPage>::new();
                 let mut logged_current_shard_index = None;
-                // Bound the out-of-order reorder buffer. Pages behind the
-                // ordered barrier cannot be consumed yet, so deeper prefetch
-                // only grows memory and makes byte-budget stalls harder to
-                // attribute.
-                let completed_page_reorder_cap = page_prep_worker_count.saturating_mul(2).max(1);
 
                 loop {
-                    while !enumeration_done
-                        && active_work < page_prep_worker_count
-                        && completed_pages.len() < completed_page_reorder_cap
-                    {
+                    while !enumeration_done && active_work < page_prep_worker_count {
                         if let Some(shard_cursor) = planned_shard_cursor.as_mut() {
                             shard_cursor.skip_completed(last_conversation_id);
                         }
@@ -11538,14 +11518,14 @@ fn spawn_lexical_rebuild_packet_producer(
                         }
                     }
 
-                    while let Some(mut prepared_page) =
-                        completed_pages.remove(&next_sequence_to_emit)
-                    {
+                    while let Some(prepared_page) = completed_pages.remove(&next_sequence_to_emit) {
                         producer_telemetry.record(
                             page_prep_worker_count,
                             active_work,
                             completed_pages.len(),
                         );
+                        let reserved_bytes =
+                            lexical_rebuild_prepared_page_reserved_bytes(&prepared_page);
                         let page_handoff_conversations = prepared_page.packets.len();
                         let page_handoff_messages = prepared_page
                             .packets
@@ -11559,12 +11539,6 @@ fn spawn_lexical_rebuild_packet_producer(
                             .sum::<usize>();
                         let page_planned_shard_index = prepared_page.planned_shard_index;
                         let page_finishes_planned_shard = prepared_page.finishes_planned_shard;
-                        let reserved_bytes = reserve_lexical_rebuild_prepared_page_budget(
-                            next_sequence_to_emit,
-                            &mut prepared_page,
-                            flow_limiter.as_ref(),
-                            producer_telemetry.as_ref(),
-                        )?;
                         match tx.try_send(LexicalRebuildPipelineMessage::Batch(prepared_page)) {
                             Ok(()) => {}
                             Err(TrySendError::Full(message)) => {
