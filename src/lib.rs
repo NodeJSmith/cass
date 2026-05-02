@@ -8286,11 +8286,12 @@ fn run_cli_search(
         } else {
             None
         });
+    let field_mask_visible_limit = token_budget_field_mask_visible_limit(max_tokens, limit_val);
     let field_mask = resolve_field_mask(
         &fields,
         max_content_length,
         max_tokens,
-        limit_val,
+        field_mask_visible_limit,
         effective_robot,
         display_format,
     );
@@ -8336,7 +8337,10 @@ fn run_cli_search(
     let (search_limit, search_offset) = if has_aggregation {
         (1000.max(limit_val + offset_val), 0)
     } else if limit_val == 0 {
-        (0, offset_val)
+        (
+            token_budget_search_limit(max_tokens).unwrap_or(0),
+            offset_val,
+        )
     } else {
         (limit_val.saturating_add(1), offset_val)
     };
@@ -9018,6 +9022,30 @@ fn resolve_field_mask(
 }
 
 const SEARCH_PREVIEW_CONTENT_LIMIT_MAX: usize = 400;
+const TOKEN_BUDGET_DEFAULT_VISIBLE_HITS: usize = 20;
+const TOKEN_BUDGET_SEARCH_MIN_HITS: usize = 20;
+const TOKEN_BUDGET_SEARCH_MAX_HITS: usize = 4096;
+const TOKEN_BUDGET_SEARCH_CHARS_PER_HIT: usize = 256;
+
+fn token_budget_field_mask_visible_limit(
+    max_tokens: Option<usize>,
+    explicit_limit: usize,
+) -> usize {
+    if explicit_limit > 0 {
+        explicit_limit
+    } else if max_tokens.is_some() {
+        TOKEN_BUDGET_DEFAULT_VISIBLE_HITS
+    } else {
+        explicit_limit
+    }
+}
+
+fn token_budget_search_limit(max_tokens: Option<usize>) -> Option<usize> {
+    let tokens = max_tokens?;
+    let budget_chars = tokens.saturating_mul(4);
+    let hits = budget_chars / TOKEN_BUDGET_SEARCH_CHARS_PER_HIT;
+    Some(hits.clamp(TOKEN_BUDGET_SEARCH_MIN_HITS, TOKEN_BUDGET_SEARCH_MAX_HITS))
+}
 
 fn preview_content_limit_for_search(
     max_content_length: Option<usize>,
@@ -9089,6 +9117,31 @@ mod field_mask_resolution_tests {
         assert!(mask.wants_snippet());
         assert_eq!(mask.preview_content_limit(), None);
         assert!(mask.allows_cache());
+    }
+
+    #[test]
+    fn no_limit_token_budget_uses_preview_limit_and_bounded_fetch() {
+        let visible_limit = token_budget_field_mask_visible_limit(Some(1024), 0);
+        let mask = resolve_field_mask(
+            &None,
+            None,
+            Some(1024),
+            visible_limit,
+            Some(RobotFormat::Json),
+            None,
+        );
+
+        assert_eq!(visible_limit, TOKEN_BUDGET_DEFAULT_VISIBLE_HITS);
+        assert_eq!(mask.preview_content_limit(), Some(71));
+        assert_eq!(
+            token_budget_search_limit(Some(1024)),
+            Some(TOKEN_BUDGET_SEARCH_MIN_HITS)
+        );
+        assert_eq!(
+            token_budget_search_limit(Some(1_000_000)),
+            Some(TOKEN_BUDGET_SEARCH_MAX_HITS)
+        );
+        assert_eq!(token_budget_search_limit(None), None);
     }
 }
 
