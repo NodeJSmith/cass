@@ -5337,19 +5337,14 @@ fn lexical_rebuild_pipeline_channel_size() -> usize {
 fn lexical_rebuild_default_page_prep_worker_parallelism_for_workers(
     worker_parallelism: usize,
 ) -> usize {
-    // Previously clamped at 8 as a hard guardrail against runaway fanout on
-    // large hosts. Now that the responsiveness governor applies a live
-    // capacity clamp on top of this (see `effective_worker_count` in the
-    // caller), we can safely raise the ceiling: on a many-core box the
-    // governor takes care of shrinking under pressure, and on a small host
-    // the `div_ceil(2)` factor keeps us from spawning more workers than
-    // cores. 16 was picked because it keeps the producer's fetch/prep
-    // overlap meaningful on 32+ core builders without saturating the DB
-    // read path on modest hosts.
+    // Keep the producer decoupled from the tiny ordered sink channel, but cap
+    // eager page prep at the measured point where the DB read path stays cool.
+    // A 16-worker default inflated RSS and handoff pressure on the large
+    // lexical-rebuild workload; operators can still override higher explicitly.
     if worker_parallelism <= 1 {
         1
     } else {
-        worker_parallelism.div_ceil(2).clamp(2, 16)
+        worker_parallelism.div_ceil(2).clamp(2, 8)
     }
 }
 
@@ -22704,14 +22699,13 @@ mod tests {
         );
         assert_eq!(
             lexical_rebuild_default_page_prep_worker_parallelism_for_workers(32),
-            16,
-            "ceiling raised from 8 to 16 now that the responsiveness governor \
-             provides a live upper clamp; 32 cores give 32.div_ceil(2)=16"
+            8,
+            "measured ceiling stays at 8; 16 inflated RSS and producer handoff pressure"
         );
         assert_eq!(
             lexical_rebuild_default_page_prep_worker_parallelism_for_workers(128),
-            16,
-            "128-core budget is still clamped at the 16-worker ceiling"
+            8,
+            "128-core budget is still clamped at the measured 8-worker ceiling"
         );
     }
 
