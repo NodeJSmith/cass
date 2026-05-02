@@ -15354,6 +15354,7 @@ fn reset_storage(storage: &FrankenStorage) -> Result<()> {
 ///
 /// Returns `Ok(count)` where count is the number of conversations successfully indexed.
 /// This count is used by the stale detector to track indexing activity.
+#[allow(clippy::too_many_arguments)]
 fn reindex_paths(
     opts: &IndexOptions,
     paths: Vec<PathBuf>,
@@ -31343,8 +31344,7 @@ mod tests {
 
         let startup_skip = {
             let guard = storage.lock().unwrap();
-            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path)
-                .unwrap()
+            can_skip_unchanged_explicit_watch_once_index_run(&opts, &guard, &index_path).unwrap()
         };
         assert!(
             startup_skip,

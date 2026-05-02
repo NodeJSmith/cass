@@ -426,6 +426,10 @@ pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIn
         return Ok(None);
     }
 
+    if let Some(summary) = searchable_index_summary_from_tantivy_meta(index_path)? {
+        return Ok(Some(summary));
+    }
+
     let mut index = Index::open_in_dir(index_path).with_context(|| {
         format!(
             "opening searchable Tantivy index directory for summary: {}",
@@ -442,6 +446,49 @@ pub fn searchable_index_summary(index_path: &Path) -> Result<Option<SearchableIn
             .map(|segment| segment.num_docs() as usize)
             .sum(),
         segments: segment_metas.len(),
+    }))
+}
+
+fn searchable_index_summary_from_tantivy_meta(
+    index_path: &Path,
+) -> Result<Option<SearchableIndexSummary>> {
+    let meta_path = index_path.join("meta.json");
+    let bytes = fs::read(&meta_path)
+        .with_context(|| format!("reading Tantivy meta file {}", meta_path.display()))?;
+    let meta: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing Tantivy meta file {}", meta_path.display()))?;
+    let Some(segments) = meta.get("segments").and_then(|value| value.as_array()) else {
+        return Ok(None);
+    };
+
+    let mut docs = 0usize;
+    for segment in segments {
+        if segment
+            .get("deletes")
+            .is_some_and(|deletes| !deletes.is_null())
+        {
+            return Ok(None);
+        }
+        let Some(max_doc) = segment.get("max_doc").and_then(|value| value.as_u64()) else {
+            return Ok(None);
+        };
+        let max_doc = usize::try_from(max_doc).with_context(|| {
+            format!(
+                "Tantivy segment max_doc exceeds platform usize in {}",
+                meta_path.display()
+            )
+        })?;
+        docs = docs.checked_add(max_doc).with_context(|| {
+            format!(
+                "Tantivy segment doc count overflows platform usize in {}",
+                meta_path.display()
+            )
+        })?;
+    }
+
+    Ok(Some(SearchableIndexSummary {
+        docs,
+        segments: segments.len(),
     }))
 }
 
@@ -1302,6 +1349,52 @@ mod tests {
         let index = TantivyIndex::open_or_create(dir.path()).expect("create");
         let status = index.merge_status();
         assert_eq!(status.merge_threshold, 4);
+    }
+
+    #[test]
+    fn searchable_index_summary_uses_meta_file_without_opening_index() {
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(
+            dir.path().join("meta.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "segments": [
+                    {"segment_id": "a", "max_doc": 3, "deletes": null},
+                    {"segment_id": "b", "max_doc": 5}
+                ]
+            }))
+            .expect("serialize meta"),
+        )
+        .expect("write meta");
+
+        assert_eq!(
+            searchable_index_summary(dir.path())
+                .expect("summary")
+                .expect("index exists"),
+            SearchableIndexSummary {
+                docs: 8,
+                segments: 2
+            }
+        );
+    }
+
+    #[test]
+    fn searchable_index_summary_meta_fast_path_declines_deleted_segments() {
+        let dir = TempDir::new().expect("temp dir");
+        fs::write(
+            dir.path().join("meta.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "segments": [
+                    {"segment_id": "a", "max_doc": 3, "deletes": {"opstamp": 1}}
+                ]
+            }))
+            .expect("serialize meta"),
+        )
+        .expect("write meta");
+
+        assert_eq!(
+            searchable_index_summary_from_tantivy_meta(dir.path()).expect("summary"),
+            None
+        );
     }
 
     #[test]
