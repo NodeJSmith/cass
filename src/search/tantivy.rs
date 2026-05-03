@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 
 use crate::connectors::NormalizedConversation;
 use crate::connectors::NormalizedMessage;
+use crate::evidence_bundle::{
+    EVIDENCE_BUNDLE_MANIFEST_FILE, EvidenceBundleChunk, EvidenceBundleChunkRole,
+    EvidenceBundleKind, EvidenceBundleManifest,
+};
 use crate::model::conversation_packet::{
     ConversationPacket, ConversationPacketMessage, ConversationPacketProvenance,
 };
@@ -490,6 +494,141 @@ fn validate_federated_search_manifest(
 
     federated_search_manifest_summary(index_path, manifest)?;
     Ok(())
+}
+
+fn federated_evidence_chunk_role(relative_path: &str) -> EvidenceBundleChunkRole {
+    if relative_path == FEDERATED_SEARCH_MANIFEST_FILE {
+        EvidenceBundleChunkRole::Manifest
+    } else if relative_path == "schema_hash.json" || relative_path.ends_with("/meta.json") {
+        EvidenceBundleChunkRole::Metadata
+    } else if relative_path.starts_with("shards/") {
+        EvidenceBundleChunkRole::LexicalShard
+    } else {
+        EvidenceBundleChunkRole::Other
+    }
+}
+
+fn relative_artifact_path_string(relative_path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in relative_path.components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                let part = part.to_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "federated lexical artifact path is not UTF-8: {}",
+                        relative_path.display()
+                    )
+                })?;
+                parts.push(part);
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "federated lexical artifact path contains an unsafe component: {}",
+                    relative_path.display()
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(anyhow::anyhow!(
+            "federated lexical artifact path must not be empty"
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+fn collect_federated_evidence_artifact_paths(
+    root: &Path,
+    current: &Path,
+    relative_paths: &mut Vec<String>,
+) -> Result<()> {
+    let entries = fs::read_dir(current)
+        .with_context(|| format!("reading artifact dir {}", current.display()))?;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("reading artifact entry in {}", current.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading artifact file type {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_federated_evidence_artifact_paths(root, &path, relative_paths)?;
+        } else if file_type.is_file() {
+            let relative_path = path.strip_prefix(root).with_context(|| {
+                format!(
+                    "computing relative artifact path for {} under {}",
+                    path.display(),
+                    root.display()
+                )
+            })?;
+            let relative_path = relative_artifact_path_string(relative_path)?;
+            if relative_path != EVIDENCE_BUNDLE_MANIFEST_FILE {
+                relative_paths.push(relative_path);
+            }
+        } else {
+            return Err(anyhow::anyhow!(
+                "federated lexical artifact contains unsupported non-file entry: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn federated_evidence_bundle_id(chunks: &[EvidenceBundleChunk]) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cass-federated-lexical-evidence-v1\n");
+    for chunk in chunks {
+        let bytes = serde_json::to_vec(chunk).context("serializing evidence bundle chunk")?;
+        hasher.update(&bytes);
+        hasher.update(b"\n");
+    }
+    Ok(format!(
+        "cass-federated-lexical-{}",
+        hasher.finalize().to_hex()
+    ))
+}
+
+/// Build a deterministic evidence manifest for a federated lexical bundle.
+///
+/// This is the admission proof remote artifact exchange can compare before
+/// accepting a copied bundle: the federated manifest is contract-validated,
+/// every shard `meta.json` fingerprint is checked, then every regular file in
+/// the bundle is recorded with a BLAKE3 digest. The evidence manifest itself is
+/// excluded so repeated verification does not self-mutate the proof.
+pub fn federated_search_evidence_bundle_manifest(
+    index_path: &Path,
+) -> Result<EvidenceBundleManifest> {
+    let Some(manifest) = load_federated_search_manifest_internal(index_path)? else {
+        return Err(anyhow::anyhow!(
+            "cannot build federated lexical evidence bundle without {} in {}",
+            FEDERATED_SEARCH_MANIFEST_FILE,
+            index_path.display()
+        ));
+    };
+    validate_federated_search_manifest(index_path, &manifest, true)?;
+
+    let mut relative_paths = Vec::new();
+    collect_federated_evidence_artifact_paths(index_path, index_path, &mut relative_paths)?;
+    relative_paths.sort();
+
+    let chunks = relative_paths
+        .into_iter()
+        .map(|relative_path| {
+            let role = federated_evidence_chunk_role(&relative_path);
+            EvidenceBundleChunk::from_file(index_path, relative_path, role, true, None)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bundle_id = federated_evidence_bundle_id(&chunks)?;
+    let mut evidence =
+        EvidenceBundleManifest::new(bundle_id, EvidenceBundleKind::LexicalGeneration, 0);
+    evidence.chunks = chunks;
+    Ok(evidence)
+}
+
+pub fn write_federated_search_evidence_bundle_manifest(index_path: &Path) -> Result<PathBuf> {
+    let manifest = federated_search_evidence_bundle_manifest(index_path)?;
+    manifest.save(index_path)
 }
 
 fn load_federated_search_manifest_internal(
@@ -2083,6 +2222,80 @@ mod tests {
         assert!(
             format!("{error:#}").contains("federated lexical shard fingerprint mismatch"),
             "unexpected fingerprint error: {error:#}"
+        );
+    }
+
+    fn write_minimal_federated_artifact(root: &Path, segment_bytes: &[u8]) {
+        let shard = root.join("shards/shard-00000");
+        fs::create_dir_all(&shard).expect("create shard");
+        fs::write(shard.join("meta.json"), br#"{"segments":[]}"#).expect("write shard meta");
+        fs::write(shard.join("segment.bin"), segment_bytes).expect("write shard segment");
+        write_root_schema_hash_file(root).expect("write schema hash");
+
+        let manifest = FederatedSearchManifest {
+            version: FEDERATED_SEARCH_MANIFEST_VERSION,
+            kind: FEDERATED_SEARCH_MANIFEST_KIND.to_string(),
+            schema_hash: CASS_SCHEMA_HASH.to_string(),
+            shards: vec![FederatedSearchShardManifest {
+                relative_path: "shards/shard-00000".to_string(),
+                docs: 0,
+                segments: 0,
+                meta_fingerprint: meta_fingerprint_for_existing_index_dir(&shard)
+                    .expect("meta fingerprint"),
+            }],
+        };
+        write_federated_manifest_for_test(root, &manifest);
+    }
+
+    #[test]
+    fn federated_evidence_manifest_is_deterministic_and_detects_mutation() {
+        let left = TempDir::new().expect("left temp dir");
+        let right = TempDir::new().expect("right temp dir");
+        write_minimal_federated_artifact(left.path(), b"same segment bytes");
+        write_minimal_federated_artifact(right.path(), b"same segment bytes");
+
+        let left_manifest =
+            federated_search_evidence_bundle_manifest(left.path()).expect("left manifest");
+        let right_manifest =
+            federated_search_evidence_bundle_manifest(right.path()).expect("right manifest");
+        assert_eq!(
+            serde_json::to_value(&left_manifest).expect("left json"),
+            serde_json::to_value(&right_manifest).expect("right json"),
+            "byte-identical federated artifacts should produce byte-identical evidence manifests"
+        );
+        assert!(left_manifest.verify(left.path()).is_complete());
+
+        fs::write(
+            left.path().join("shards/shard-00000/segment.bin"),
+            b"SAME segment bytes",
+        )
+        .expect("mutate shard segment");
+        let report = left_manifest.verify(left.path());
+        assert!(report.is_unsafe(), "{report:?}");
+        assert!(
+            report.issues.iter().any(|issue| issue.kind
+                == crate::evidence_bundle::EvidenceBundleIssueKind::DigestMismatch),
+            "expected digest mismatch after segment mutation: {report:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn federated_evidence_manifest_rejects_symlink_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("temp dir");
+        write_minimal_federated_artifact(root.path(), b"segment bytes");
+        symlink(
+            "/tmp/not-a-bundle-file",
+            root.path().join("shards/shard-00000/link"),
+        )
+        .expect("create artifact symlink");
+
+        let error = federated_search_evidence_bundle_manifest(root.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported non-file entry"),
+            "unexpected symlink error: {error:#}"
         );
     }
 
