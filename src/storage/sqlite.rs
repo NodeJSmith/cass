@@ -2967,6 +2967,7 @@ pub struct LexicalRebuildConversationFootprintRow {
 }
 
 pub(crate) const LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE: usize = 4 * 1024;
+const LEXICAL_REBUILD_FOOTPRINT_CONVERSATION_BATCH_SIZE: i64 = 4_096;
 const LEXICAL_REBUILD_FOOTPRINT_EXACT_FALLBACK_MAX_UNKNOWN_CONVERSATIONS: usize = 4_096;
 
 fn lexical_rebuild_nonnegative_count_to_usize(count: i64) -> usize {
@@ -6228,44 +6229,62 @@ impl FrankenStorage {
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
-        let summary_rows: Vec<(i64, Option<i64>, Option<i64>, Option<i64>)> = self
-            .conn
-            .query_map_collect(
-                "SELECT id, last_message_idx, user_message_count, assistant_message_count
-                 FROM conversations
-                 ORDER BY id ASC",
-                fparams![],
-                |row| {
-                    Ok((
-                        row.get_typed(0)?,
-                        row.get_typed(1)?,
-                        row.get_typed(2)?,
-                        row.get_typed(3)?,
-                    ))
-                },
-            )
-            .with_context(|| "listing lexical rebuild conversation summary footprints")?;
-
-        let mut footprints = Vec::with_capacity(summary_rows.len());
+        let mut last_conversation_id = 0_i64;
+        let mut footprints = Vec::new();
         let mut unknown_conversation_ids = Vec::new();
-        for (conversation_id, last_message_idx, user_messages, assistant_messages) in summary_rows {
-            match lexical_rebuild_estimated_message_count_from_conversation_summary(
-                last_message_idx,
-                user_messages,
-                assistant_messages,
-            ) {
-                Some(message_count) => footprints.push(LexicalRebuildConversationFootprintRow {
-                    conversation_id,
-                    message_count,
-                    message_bytes: lexical_rebuild_estimated_message_bytes(message_count),
-                }),
-                None => {
-                    unknown_conversation_ids.push(conversation_id);
-                    footprints.push(LexicalRebuildConversationFootprintRow {
-                        conversation_id,
-                        message_count: 0,
-                        message_bytes: 0,
-                    });
+
+        loop {
+            let summary_rows: Vec<(i64, Option<i64>, Option<i64>, Option<i64>)> = self
+                .conn
+                .query_map_collect(
+                    "SELECT id, last_message_idx, user_message_count, assistant_message_count
+                     FROM conversations
+                     WHERE id > ?1
+                     ORDER BY id ASC
+                     LIMIT ?2",
+                    fparams![
+                        last_conversation_id,
+                        LEXICAL_REBUILD_FOOTPRINT_CONVERSATION_BATCH_SIZE
+                    ],
+                    |row| {
+                        Ok((
+                            row.get_typed(0)?,
+                            row.get_typed(1)?,
+                            row.get_typed(2)?,
+                            row.get_typed(3)?,
+                        ))
+                    },
+                )
+                .with_context(|| "listing lexical rebuild conversation summary footprints")?;
+            if summary_rows.is_empty() {
+                break;
+            }
+
+            footprints.reserve(summary_rows.len());
+            for (conversation_id, last_message_idx, user_messages, assistant_messages) in
+                summary_rows
+            {
+                last_conversation_id = conversation_id;
+                match lexical_rebuild_estimated_message_count_from_conversation_summary(
+                    last_message_idx,
+                    user_messages,
+                    assistant_messages,
+                ) {
+                    Some(message_count) => {
+                        footprints.push(LexicalRebuildConversationFootprintRow {
+                            conversation_id,
+                            message_count,
+                            message_bytes: lexical_rebuild_estimated_message_bytes(message_count),
+                        })
+                    }
+                    None => {
+                        unknown_conversation_ids.push(conversation_id);
+                        footprints.push(LexicalRebuildConversationFootprintRow {
+                            conversation_id,
+                            message_count: 0,
+                            message_bytes: 0,
+                        });
+                    }
                 }
             }
         }
