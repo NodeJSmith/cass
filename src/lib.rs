@@ -10317,6 +10317,8 @@ fn output_robot_results(
                         "hits": result.cache_stats.cache_hits,
                         "misses": result.cache_stats.cache_miss,
                         "shortfall": result.cache_stats.cache_shortfall,
+                        "prewarm_scheduled": result.cache_stats.prewarm_scheduled,
+                        "prewarm_skipped_pressure": result.cache_stats.prewarm_skipped_pressure,
                     },
                     // Search pipeline timing breakdown (T7.4)
                     "timing": {
@@ -10438,6 +10440,8 @@ fn output_robot_results(
                             "hits": result.cache_stats.cache_hits,
                             "misses": result.cache_stats.cache_miss,
                             "shortfall": result.cache_stats.cache_shortfall,
+                            "prewarm_scheduled": result.cache_stats.prewarm_scheduled,
+                            "prewarm_skipped_pressure": result.cache_stats.prewarm_skipped_pressure,
                         },
                         "tokens_estimated": tokens_estimated,
                         "max_tokens": max_tokens,
@@ -18300,6 +18304,14 @@ fn response_schema_search_cache_stats() -> serde_json::Value {
         ("hits", serde_json::json!({ "type": "integer" })),
         ("misses", serde_json::json!({ "type": "integer" })),
         ("shortfall", serde_json::json!({ "type": "integer" })),
+        (
+            "prewarm_scheduled",
+            serde_json::json!({ "type": "integer" }),
+        ),
+        (
+            "prewarm_skipped_pressure",
+            serde_json::json!({ "type": "integer" }),
+        ),
     ])
 }
 

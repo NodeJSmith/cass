@@ -250,6 +250,8 @@ schemas: (auto-generated from contract)
       - cache_stats: object
         - hits: integer
         - misses: integer
+        - prewarm_scheduled: integer
+        - prewarm_skipped_pressure: integer
         - shortfall: integer
       - cursor_manifest: object
         - cache_generation: object

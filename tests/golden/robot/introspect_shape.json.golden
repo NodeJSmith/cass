@@ -4362,6 +4362,22 @@
                                       "type": "string"
                                     }
                                   }
+                                },
+                                "prewarm_scheduled": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "prewarm_skipped_pressure": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
                                 }
                               }
                             }

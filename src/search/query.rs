@@ -2480,6 +2480,10 @@ pub struct CacheStats {
     pub ghost_entries: usize,
     /// Number of cache insertions rejected by adaptive admission
     pub admission_rejects: u64,
+    /// Number of adaptive query prewarm jobs scheduled from hot prefix-cache state.
+    pub prewarm_scheduled: u64,
+    /// Number of adaptive query prewarm jobs skipped because cache pressure was high.
+    pub prewarm_skipped_pressure: u64,
     /// Last observed Tantivy reader generation signature for cursor continuity metadata.
     pub reader_generation: Option<u64>,
 }
@@ -2500,6 +2504,8 @@ impl Default for CacheStats {
             eviction_policy: "unknown",
             ghost_entries: 0,
             admission_rejects: 0,
+            prewarm_scheduled: 0,
+            prewarm_skipped_pressure: 0,
             reader_generation: None,
         }
     }
@@ -2546,6 +2552,10 @@ const DEFAULT_CACHE_BYTE_CAP_MEMORY_FRACTION_DENOMINATOR: u64 = 128;
 const DEFAULT_CACHE_BYTE_CAP_CEILING: u64 = 2 * 1024 * 1024 * 1024;
 const S3_FIFO_GHOST_CAP_MULTIPLIER: usize = 2;
 const S3_FIFO_LARGE_ENTRY_FRACTION_DENOMINATOR: usize = 4;
+const PREWARM_ENTRY_PRESSURE_NUMERATOR: usize = 9;
+const PREWARM_ENTRY_PRESSURE_DENOMINATOR: usize = 10;
+const PREWARM_BYTE_PRESSURE_NUMERATOR: usize = 4;
+const PREWARM_BYTE_PRESSURE_DENOMINATOR: usize = 5;
 
 const CACHE_KEY_VERSION: &str = "1";
 
@@ -2854,6 +2864,23 @@ impl CacheShards {
     fn admission_rejects(&self) -> u64 {
         self.admission_rejects
     }
+
+    fn prewarm_pressure(&self) -> bool {
+        let entry_pressure = self
+            .total_cost
+            .saturating_mul(PREWARM_ENTRY_PRESSURE_DENOMINATOR)
+            >= self
+                .total_cap
+                .saturating_mul(PREWARM_ENTRY_PRESSURE_NUMERATOR);
+        let byte_pressure = self.byte_cap > 0
+            && self
+                .total_bytes
+                .saturating_mul(PREWARM_BYTE_PRESSURE_DENOMINATOR)
+                >= self
+                    .byte_cap
+                    .saturating_mul(PREWARM_BYTE_PRESSURE_NUMERATOR);
+        entry_pressure || byte_pressure
+    }
 }
 
 fn shard_cached_bytes(shard: &LruCache<Arc<str>, Vec<CachedHit>>) -> usize {
@@ -2866,7 +2893,15 @@ fn shard_cached_bytes(shard: &LruCache<Arc<str>, Vec<CachedHit>>) -> usize {
 #[derive(Clone)]
 struct WarmJob {
     query: String,
-    _filters: SearchFilters,
+    filters_fingerprint: String,
+    shard_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdaptivePrewarmDecision {
+    Schedule,
+    SkipCold,
+    SkipPressure,
 }
 
 #[derive(Clone)]
@@ -3365,16 +3400,6 @@ impl SearchClient {
         let can_use_cache =
             field_mask.allows_cache() && (field_mask.needs_content() || field_mask.wants_snippet());
 
-        // Schedule warmup for likely prefixes when user pauses typing.
-        if offset == 0
-            && let Some(tx) = &self.warm_tx
-        {
-            let _ = tx.send(WarmJob {
-                query: sanitized.clone(),
-                _filters: filters.clone(),
-            });
-        }
-
         // Invalidate prefix cache if the index has been updated since last search.
         // This must happen BEFORE the cache check below to avoid serving stale results.
         if let Some((reader, _)) = &self.reader {
@@ -3396,6 +3421,7 @@ impl SearchClient {
             && !query.contains('*')
             && !fs_cass_has_boolean_operators(query)
         {
+            self.maybe_schedule_adaptive_query_prewarm(&sanitized, &filters);
             if let Some(cached) = self.cached_prefix_hits(&sanitized, &filters) {
                 // Opt 2.4: Pre-compute lowercase query terms once, reuse for all hits
                 let query_terms = QueryTermsLower::from_query(&sanitized);
@@ -6814,6 +6840,8 @@ struct Metrics {
     cache_shortfall: Arc<AtomicU64>,
     reloads: Arc<AtomicU64>,
     reload_ms_total: Arc<AtomicU64>,
+    prewarm_scheduled: Arc<AtomicU64>,
+    prewarm_skipped_pressure: Arc<AtomicU64>,
 }
 
 impl Metrics {
@@ -6825,6 +6853,13 @@ impl Metrics {
     }
     fn inc_cache_shortfall(&self) {
         self.cache_shortfall.fetch_add(1, Ordering::Relaxed);
+    }
+    fn inc_prewarm_scheduled(&self) {
+        self.prewarm_scheduled.fetch_add(1, Ordering::Relaxed);
+    }
+    fn inc_prewarm_skipped_pressure(&self) {
+        self.prewarm_skipped_pressure
+            .fetch_add(1, Ordering::Relaxed);
     }
     fn inc_reload(&self) {
         self.reloads.fetch_add(1, Ordering::Relaxed);
@@ -6845,6 +6880,13 @@ impl Metrics {
         )
     }
 
+    fn snapshot_prewarm(&self) -> (u64, u64) {
+        (
+            self.prewarm_scheduled.load(Ordering::Relaxed),
+            self.prewarm_skipped_pressure.load(Ordering::Relaxed),
+        )
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     fn reset(&self) {
@@ -6853,6 +6895,8 @@ impl Metrics {
         self.cache_shortfall.store(0, Ordering::Relaxed);
         self.reloads.store(0, Ordering::Relaxed);
         self.reload_ms_total.store(0, Ordering::Relaxed);
+        self.prewarm_scheduled.store(0, Ordering::Relaxed);
+        self.prewarm_skipped_pressure.store(0, Ordering::Relaxed);
     }
 }
 
@@ -6885,6 +6929,8 @@ fn maybe_spawn_warm_worker(
                 tracing::debug!(
                     duration_ms = elapsed.as_millis() as u64,
                     reload_epoch = epoch,
+                    filters = %job.filters_fingerprint,
+                    shard = %job.shard_name,
                     "warm_worker_reload"
                 );
                 // Run a tiny warm search to prefill OS cache and hit the Tantivy reader
@@ -7331,14 +7377,92 @@ impl SearchClient {
 
     fn shard_name(&self, filters: &SearchFilters) -> String {
         if filters.agents.len() == 1 {
-            filters
-                .agents
-                .iter()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| "global".into())
+            format!(
+                "agent:{}",
+                filters
+                    .agents
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "global".into())
+            )
+        } else if filters.workspaces.len() == 1 {
+            format!(
+                "workspace:{}",
+                filters
+                    .workspaces
+                    .iter()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "global".into())
+            )
         } else {
             "global".into()
+        }
+    }
+    fn cached_prefix_key_exists_in_shard(
+        &self,
+        shard: &LruCache<Arc<str>, Vec<CachedHit>>,
+        query: &str,
+        filters: &SearchFilters,
+    ) -> bool {
+        let mut byte_indices: Vec<usize> = query.char_indices().map(|(i, _)| i).collect();
+        byte_indices.push(query.len());
+        let query_len = query.len();
+        for &end in byte_indices.iter().rev() {
+            if end == 0 || end == query_len {
+                continue;
+            }
+            let key = self.cache_key(&query[..end], filters);
+            if shard.contains(&key) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn maybe_schedule_adaptive_query_prewarm(&self, query: &str, filters: &SearchFilters) {
+        if query.is_empty() {
+            return;
+        }
+        let Some(tx) = &self.warm_tx else {
+            return;
+        };
+
+        let shard_name = self.shard_name(filters);
+        let decision = match self.prefix_cache.lock() {
+            Ok(cache) => {
+                let hot_prefix = cache.shard_opt(&shard_name).is_some_and(|shard| {
+                    self.cached_prefix_key_exists_in_shard(shard, query, filters)
+                });
+                if !hot_prefix {
+                    AdaptivePrewarmDecision::SkipCold
+                } else if cache.prewarm_pressure() {
+                    AdaptivePrewarmDecision::SkipPressure
+                } else {
+                    AdaptivePrewarmDecision::Schedule
+                }
+            }
+            Err(_) => return,
+        };
+
+        if decision == AdaptivePrewarmDecision::SkipPressure {
+            self.metrics.inc_prewarm_skipped_pressure();
+            return;
+        }
+        if decision == AdaptivePrewarmDecision::SkipCold {
+            return;
+        }
+
+        if tx
+            .send(WarmJob {
+                query: query.to_string(),
+                filters_fingerprint: filters_fingerprint(filters),
+                shard_name,
+            })
+            .is_ok()
+        {
+            self.metrics.inc_prewarm_scheduled();
         }
     }
 
@@ -7379,6 +7503,7 @@ impl SearchClient {
 
     pub fn cache_stats(&self) -> CacheStats {
         let (hits, miss, shortfall, reloads, reload_ms_total) = self.metrics.snapshot_all();
+        let (prewarm_scheduled, prewarm_skipped_pressure) = self.metrics.snapshot_prewarm();
         let reader_generation = self.last_generation.lock().ok().and_then(|guard| *guard);
         let (
             total_cap,
@@ -7417,6 +7542,8 @@ impl SearchClient {
             eviction_policy,
             ghost_entries,
             admission_rejects,
+            prewarm_scheduled,
+            prewarm_skipped_pressure,
             reader_generation,
         }
     }
@@ -12439,7 +12566,113 @@ mod tests {
         assert_eq!(stats.reload_ms_total, 10);
         assert_eq!(stats.total_cap, *CACHE_TOTAL_CAP);
         assert_eq!(stats.eviction_policy, "lru");
+        assert_eq!(stats.prewarm_scheduled, 0);
+        assert_eq!(stats.prewarm_skipped_pressure, 0);
         assert_eq!(CacheStats::default().eviction_policy, "unknown");
+    }
+
+    #[test]
+    fn adaptive_query_prewarm_schedules_only_after_hot_prefix_cache_entry() {
+        let (tx, rx) = mpsc::unbounded();
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(10, 0)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: Some(tx),
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+        let mut filters = SearchFilters::default();
+        filters.workspaces.insert("/tmp/cass-workspace".into());
+
+        client.maybe_schedule_adaptive_query_prewarm("hel", &filters);
+        assert!(
+            rx.try_recv().is_err(),
+            "cold prefixes should not schedule adaptive prewarm"
+        );
+
+        let mut hit = projected_minimal_fields_search_hit("hello title", "p");
+        hit.snippet = "hello".into();
+        hit.content = "hello world".into();
+        hit.content_hash = stable_content_hash(&hit.content);
+        client.put_cache("hel", &filters, std::slice::from_ref(&hit));
+
+        let total_cost_before = client.cache_stats().total_cost;
+        client.maybe_schedule_adaptive_query_prewarm("hel", &filters);
+        assert!(
+            rx.try_recv().is_err(),
+            "an exact cached query should not schedule redundant prewarm"
+        );
+        client.maybe_schedule_adaptive_query_prewarm("hello", &filters);
+
+        let job = rx
+            .try_recv()
+            .expect("hot prefix should schedule adaptive prewarm");
+        assert_eq!(job.query, "hello");
+        assert_eq!(job.shard_name, "workspace:/tmp/cass-workspace");
+        assert_eq!(job.filters_fingerprint, filters_fingerprint(&filters));
+        let stats = client.cache_stats();
+        assert_eq!(stats.prewarm_scheduled, 1);
+        assert_eq!(stats.prewarm_skipped_pressure, 0);
+        assert_eq!(
+            stats.total_cost, total_cost_before,
+            "prewarm scheduling should not mutate result-cache contents"
+        );
+    }
+
+    #[test]
+    fn adaptive_query_prewarm_skips_when_cache_byte_cap_is_under_pressure() {
+        let mut hit = projected_minimal_fields_search_hit("hello title", "p");
+        hit.snippet = "hello".into();
+        hit.content = "hello world with enough content to consume the small byte budget".into();
+        hit.content_hash = stable_content_hash(&hit.content);
+        let byte_cap = cached_hit_from(&hit).approx_bytes();
+
+        let (tx, rx) = mpsc::unbounded();
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(None),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(10, byte_cap)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: Some(tx),
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+        let filters = SearchFilters::default();
+
+        client.put_cache("hel", &filters, std::slice::from_ref(&hit));
+        client.maybe_schedule_adaptive_query_prewarm("zebra", &filters);
+        assert_eq!(
+            client.cache_stats().prewarm_skipped_pressure,
+            0,
+            "cold queries should not be counted as pressure-skipped prewarm jobs"
+        );
+
+        client.maybe_schedule_adaptive_query_prewarm("hello", &filters);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "prewarm should be disabled while cache byte pressure is high"
+        );
+        let stats = client.cache_stats();
+        assert_eq!(stats.prewarm_scheduled, 0);
+        assert_eq!(stats.prewarm_skipped_pressure, 1);
+        assert!(stats.approx_bytes <= stats.byte_cap);
     }
 
     #[test]
@@ -16256,6 +16489,8 @@ mod tests {
         let filters1 = SearchFilters::default();
         let mut filters2 = SearchFilters::default();
         filters2.agents.insert("codex".into());
+        let mut filters3 = SearchFilters::default();
+        filters3.workspaces.insert("/tmp/cass-workspace".into());
 
         // Same filters should always produce same shard name
         let shard1_first = client.shard_name(&filters1);
@@ -16274,6 +16509,10 @@ mod tests {
 
         // Shard name is deterministic
         assert_eq!(shard2, client.shard_name(&filters2));
+        assert_eq!(
+            client.shard_name(&filters3),
+            "workspace:/tmp/cass-workspace"
+        );
     }
 
     // =========================================================================

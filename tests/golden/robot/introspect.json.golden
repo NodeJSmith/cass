@@ -4075,6 +4075,12 @@
                 },
                 "shortfall": {
                   "type": "integer"
+                },
+                "prewarm_scheduled": {
+                  "type": "integer"
+                },
+                "prewarm_skipped_pressure": {
+                  "type": "integer"
                 }
               }
             },

@@ -1411,8 +1411,10 @@ fn search_robot_meta_includes_fallback_and_cache_stats() {
     assert!(
         cache.contains_key("hits")
             && cache.contains_key("misses")
-            && cache.contains_key("shortfall"),
-        "cache_stats should expose hits, misses, shortfall"
+            && cache.contains_key("shortfall")
+            && cache.contains_key("prewarm_scheduled")
+            && cache.contains_key("prewarm_skipped_pressure"),
+        "cache_stats should expose cache and adaptive prewarm counters"
     );
 
     let query_plan = meta
