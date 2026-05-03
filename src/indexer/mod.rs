@@ -10814,12 +10814,105 @@ pub fn run_index(
 }
 
 fn close_storage_after_index(storage: FrankenStorage, db_path: &Path, context: &str) -> Result<()> {
-    storage.close_without_checkpoint().with_context(|| {
+    prepare_storage_for_final_checkpoint(&storage, db_path, context);
+    storage.close().with_context(|| {
         format!(
-            "closing canonical db after {context}: {}",
+            "closing canonical db before final WAL checkpoint after {context}: {}",
             db_path.display()
         )
-    })
+    })?;
+    run_final_wal_checkpoint(db_path, context)
+}
+
+fn prepare_storage_for_final_checkpoint(storage: &FrankenStorage, db_path: &Path, context: &str) {
+    let previous_pages = storage.index_writer_checkpoint_pages();
+    persist::apply_index_writer_checkpoint_policy(storage, false);
+    let restored_pages = storage.index_writer_checkpoint_pages();
+    if previous_pages == Some(0) {
+        tracing::info!(
+            db_path = %db_path.display(),
+            context,
+            restored_wal_autocheckpoint_pages = ?restored_pages,
+            "restored checkpoint policy before final index close"
+        );
+    }
+}
+
+fn run_final_wal_checkpoint(db_path: &Path, context: &str) -> Result<()> {
+    // Run this after closing the indexing storage handle: frankensqlite flushes
+    // retained autocommit writes during close, and TRUNCATE avoids leaving the
+    // completed bulk-ingest WAL for the next opener to replay.
+    let checkpoint_db_path = db_path.to_string_lossy().into_owned();
+    let conn = frankensqlite::Connection::open(checkpoint_db_path).with_context(|| {
+        format!(
+            "opening canonical db for final WAL checkpoint after {context}: {}",
+            db_path.display()
+        )
+    })?;
+
+    let checkpoint_result = query_final_wal_checkpoint(&conn, db_path, context);
+    let close_result = conn.close().with_context(|| {
+        format!(
+            "closing final WAL checkpoint handle after {context}: {}",
+            db_path.display()
+        )
+    });
+    checkpoint_result?;
+    close_result?;
+    Ok(())
+}
+
+fn query_final_wal_checkpoint(
+    conn: &frankensqlite::Connection,
+    db_path: &Path,
+    context: &str,
+) -> Result<()> {
+    let rows = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE);")
+        .with_context(|| {
+            format!(
+                "running final WAL checkpoint after {context}: {}",
+                db_path.display()
+            )
+        })?;
+    let row = rows.first().ok_or_else(|| {
+        anyhow::anyhow!(
+            "final WAL checkpoint returned no status row after {context}: {}",
+            db_path.display()
+        )
+    })?;
+    let busy: i64 = row
+        .get_typed(0)
+        .with_context(|| "reading final WAL checkpoint busy flag")?;
+    let log_frames: i64 = row
+        .get_typed(1)
+        .with_context(|| "reading final WAL checkpoint log frame count")?;
+    let checkpointed_frames: i64 = row
+        .get_typed(2)
+        .with_context(|| "reading final WAL checkpoint backfilled frame count")?;
+
+    if log_frames >= 0 {
+        if busy > 0 {
+            tracing::warn!(
+                db_path = %db_path.display(),
+                context,
+                busy,
+                log_frames,
+                checkpointed_frames,
+                "final WAL checkpoint was blocked by active readers"
+            );
+        } else {
+            tracing::info!(
+                db_path = %db_path.display(),
+                context,
+                log_frames,
+                checkpointed_frames,
+                "final WAL checkpoint completed after index run"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn restore_watch_steady_state_checkpoint_policy(storage: &FrankenStorage, watch_enabled: bool) {
@@ -25536,6 +25629,62 @@ mod tests {
         let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+    }
+
+    #[test]
+    #[serial]
+    fn final_index_close_restores_checkpoint_policy_after_deferred_bulk_ingest() {
+        let _guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("final-checkpoint-policy.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        ensure_fts_schema(&storage);
+
+        persist::apply_index_writer_checkpoint_policy(&storage, true);
+        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &SqliteValue::Integer(0));
+
+        prepare_storage_for_final_checkpoint(&storage, &db_path, "test index close");
+
+        let rows = storage.raw().query("PRAGMA wal_autocheckpoint;").unwrap();
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &SqliteValue::Integer(1000),
+            "final close should restore bounded auto-checkpoint policy after deferred bulk ingest"
+        );
+        assert_eq!(storage.index_writer_checkpoint_pages(), Some(1000));
+    }
+
+    #[test]
+    #[serial]
+    fn close_storage_after_index_checkpointing_close_does_not_leave_backfillable_wal_frames() {
+        let _guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("final-close-checkpoints.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        storage.raw().execute("PRAGMA journal_mode = WAL;").unwrap();
+        storage
+            .raw()
+            .execute("CREATE TABLE checkpoint_probe (x INTEGER);")
+            .unwrap();
+        persist::apply_index_writer_checkpoint_policy(&storage, true);
+        storage
+            .raw()
+            .execute("INSERT INTO checkpoint_probe VALUES (42);")
+            .unwrap();
+
+        close_storage_after_index(storage, &db_path, "test index run").unwrap();
+
+        let conn = frankensqlite::Connection::open(db_path_str).unwrap();
+        let rows = conn.query("PRAGMA wal_checkpoint(FULL);").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].get(2).unwrap(),
+            &SqliteValue::Integer(0),
+            "normal index close should already have checkpointed deferred WAL frames"
+        );
+        conn.close().unwrap();
     }
 
     // -----------------------------------------------------------------
