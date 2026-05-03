@@ -35,13 +35,13 @@
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use super::{
     config::DiscoveredHost, host_key_verification_error, is_host_key_verification_failure,
-    strict_ssh_cli_tokens,
+    strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
 
 /// Default connection timeout in seconds.
@@ -363,6 +363,8 @@ echo "===PROBE_END==="
 /// A `HostProbeResult` with all gathered information, or error details if probe failed.
 pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
     let start = Instant::now();
+    let timeout_secs = timeout_secs.max(1);
+    let command_timeout = Duration::from_secs(timeout_secs);
 
     // Build SSH command with strict host key verification.
     // Security-first: do not auto-trust unknown hosts during probing.
@@ -389,19 +391,22 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
 
     // Write probe script to stdin
     let probe_script = build_probe_script();
-    if let Some(mut stdin) = child.stdin.take() {
+    let write_error = if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        if let Err(e) = stdin.write_all(probe_script.as_bytes()) {
-            return HostProbeResult::unreachable(
-                &host.name,
-                format!("Failed to write probe script: {}", e),
-            );
-        }
-    }
+        stdin.write_all(probe_script.as_bytes()).err()
+    } else {
+        None
+    };
 
     // Wait for completion
-    let output = match child.wait_with_output() {
-        Ok(o) => o,
+    let output = match wait_for_child_output_with_timeout(child, command_timeout) {
+        Ok(Some(o)) => o,
+        Ok(None) => {
+            return HostProbeResult::unreachable(
+                &host.name,
+                format!("Connection timed out after {timeout_secs} seconds"),
+            );
+        }
         Err(e) => {
             return HostProbeResult::unreachable(&host.name, format!("SSH command failed: {}", e));
         }
@@ -427,6 +432,12 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
         };
 
         return HostProbeResult::unreachable(&host.name, error_msg);
+    }
+    if let Some(e) = write_error {
+        return HostProbeResult::unreachable(
+            &host.name,
+            format!("Failed to write probe script: {}", e),
+        );
     }
 
     // Parse successful output

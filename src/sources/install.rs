@@ -34,7 +34,7 @@ use thiserror::Error;
 use super::{
     host_key_verification_error, is_host_key_verification_failure,
     probe::{ResourceInfo, SystemInfo},
-    strict_ssh_cli_tokens,
+    strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
 
 // =============================================================================
@@ -937,7 +937,7 @@ cass --version 2>&1 || echo "VERIFY_FAILED"
 
     /// Run an SSH command on the remote host.
     fn run_ssh_command(&self, script: &str, timeout: Duration) -> Result<String, InstallError> {
-        let timeout_secs = timeout.as_secs();
+        let timeout_secs = timeout.as_secs().max(1);
 
         let mut cmd = Command::new("ssh");
         cmd.args(strict_ssh_cli_tokens(timeout_secs.min(30)))
@@ -954,11 +954,14 @@ cass --version 2>&1 || echo "VERIFY_FAILED"
 
         let mut child = cmd.spawn()?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(script.as_bytes())?;
-        }
+        let write_error = if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes()).err()
+        } else {
+            None
+        };
 
-        let output = child.wait_with_output()?;
+        let output = wait_for_child_output_with_timeout(child, timeout)?
+            .ok_or(InstallError::Timeout(timeout_secs))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -980,6 +983,9 @@ cass --version 2>&1 || echo "VERIFY_FAILED"
                 "Remote script exited with code {code}: {}",
                 stderr.trim()
             )));
+        }
+        if let Some(err) = write_error {
+            return Err(InstallError::Io(err));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())

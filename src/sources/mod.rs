@@ -77,6 +77,13 @@ pub mod provenance;
 pub mod setup;
 pub mod sync;
 
+use std::io::Read as IoRead;
+use std::process::{Child, Output};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use wait_timeout::ChildExt;
+
 /// Canonical SSH stderr marker for host-key verification failures.
 pub(crate) const HOST_KEY_VERIFICATION_FAILED: &str = "Host key verification failed";
 
@@ -104,6 +111,79 @@ pub(crate) fn strict_ssh_command_for_rsync(connect_timeout_secs: u64) -> String 
     format!(
         "ssh -o BatchMode=yes -o ConnectTimeout={connect_timeout_secs} -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes"
     )
+}
+
+fn drain_child_pipe<R>(mut pipe: R) -> Receiver<std::io::Result<Vec<u8>>>
+where
+    R: IoRead + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = pipe.read_to_end(&mut output).map(|_| output);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn finish_child_pipe(
+    pipe_reader: Option<Receiver<std::io::Result<Vec<u8>>>>,
+    deadline: Instant,
+) -> std::io::Result<Option<Vec<u8>>> {
+    match pipe_reader {
+        Some(reader) => {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            match reader.recv_timeout(remaining) {
+                Ok(result) => result.map(Some),
+                Err(RecvTimeoutError::Timeout) => Ok(None),
+                Err(RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "child pipe reader disconnected before sending output",
+                )),
+            }
+        }
+        None => Ok(Some(Vec::new())),
+    }
+}
+
+/// Wait for a child process while draining stdout/stderr without letting either
+/// process execution or pipe collection outlive the same wall-clock deadline.
+pub(crate) fn wait_for_child_output_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    let timeout = if timeout.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        timeout
+    };
+    let start = Instant::now();
+    let deadline = start.checked_add(timeout).unwrap_or(start);
+    let stdout_reader = child.stdout.take().map(drain_child_pipe);
+    let stderr_reader = child.stderr.take().map(drain_child_pipe);
+
+    match child.wait_timeout(timeout)? {
+        Some(status) => {
+            let Some(stdout) = finish_child_pipe(stdout_reader, deadline)? else {
+                return Ok(None);
+            };
+            let Some(stderr) = finish_child_pipe(stderr_reader, deadline)? else {
+                return Ok(None);
+            };
+            Ok(Some(Output {
+                status,
+                stdout,
+                stderr,
+            }))
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(None)
+        }
+    }
 }
 
 /// Whether stderr indicates SSH host-key verification failure.

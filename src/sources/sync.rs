@@ -25,16 +25,16 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 use super::{
     config::{SourceDefinition, SyncSchedule, discover_ssh_hosts},
     host_key_verification_error, is_host_key_verification_failure, strict_ssh_cli_tokens,
-    strict_ssh_command_for_rsync,
+    strict_ssh_command_for_rsync, wait_for_child_output_with_timeout,
 };
 use ssh2::{FileStat, Session, Sftp};
 use std::io::{Read as IoRead, Write as IoWrite};
@@ -408,13 +408,21 @@ impl SyncEngine {
             )));
         }
 
-        let output = Command::new("ssh")
-            .args(strict_ssh_cli_tokens(self.connection_timeout))
+        let timeout_secs = self.connection_timeout.max(1);
+        let mut cmd = Command::new("ssh");
+        cmd.args(strict_ssh_cli_tokens(timeout_secs))
             .arg("--")
             .arg(host)
             .arg("echo $HOME")
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let child = cmd
+            .spawn()
             .map_err(|e| SyncError::SshFailed(format!("Failed to execute ssh: {}", e)))?;
+        let output = wait_for_child_output_with_timeout(child, Duration::from_secs(timeout_secs))
+            .map_err(|e| SyncError::SshFailed(format!("SSH command failed: {}", e)))?
+            .ok_or(SyncError::Timeout(timeout_secs))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -992,14 +1000,31 @@ impl SyncEngine {
             "listing regular files for scp sync"
         );
 
-        let output = match Command::new("ssh")
-            .args(strict_ssh_cli_tokens(self.connection_timeout))
+        let timeout_secs = self.connection_timeout.max(1);
+        let mut cmd = Command::new("ssh");
+        cmd.args(strict_ssh_cli_tokens(timeout_secs))
             .arg("--")
             .arg(host)
             .arg(&find_command)
-            .output()
-        {
-            Ok(o) => o,
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = match cmd.spawn().and_then(|child| {
+            wait_for_child_output_with_timeout(child, Duration::from_secs(timeout_secs))
+        }) {
+            Ok(Some(o)) => o,
+            Ok(None) => {
+                return PathSyncResult {
+                    remote_path: remote_path.to_string(),
+                    local_path,
+                    success: false,
+                    error: Some(format!(
+                        "SSH file listing timed out after {timeout_secs} seconds"
+                    )),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                };
+            }
             Err(e) => {
                 return PathSyncResult {
                     remote_path: remote_path.to_string(),

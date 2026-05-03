@@ -25,19 +25,17 @@
 //! }
 //! ```
 
-use std::io::{Read as IoRead, Write as IoWrite};
+use std::io::Write as IoWrite;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use wait_timeout::ChildExt;
 
 use super::{
     host_key_verification_error, is_host_key_verification_failure,
     probe::{CassStatus, HostProbeResult},
-    strict_ssh_cli_tokens,
+    strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
 
 // =============================================================================
@@ -352,67 +350,12 @@ fn effective_ssh_command_timeout(requested: Duration, configured_secs: u64) -> D
     }
 }
 
-fn drain_child_pipe<R>(mut pipe: R) -> Receiver<std::io::Result<Vec<u8>>>
-where
-    R: IoRead + Send + 'static,
-{
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = pipe.read_to_end(&mut output).map(|_| output);
-        let _ = sender.send(result);
-    });
-    receiver
-}
-
-fn finish_child_pipe(
-    pipe_reader: Option<Receiver<std::io::Result<Vec<u8>>>>,
-    deadline: Instant,
-    timeout_secs: u64,
-) -> Result<Vec<u8>, IndexError> {
-    match pipe_reader {
-        Some(reader) => {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            match reader.recv_timeout(remaining) {
-                Ok(result) => result.map_err(IndexError::Io),
-                Err(RecvTimeoutError::Timeout) => Err(IndexError::Timeout(timeout_secs)),
-                Err(RecvTimeoutError::Disconnected) => Err(IndexError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "child pipe reader disconnected before sending output",
-                ))),
-            }
-        }
-        None => Ok(Vec::new()),
-    }
-}
-
 fn wait_for_command_output_with_timeout(
-    mut child: Child,
+    child: Child,
     timeout: Duration,
 ) -> Result<Output, IndexError> {
     let timeout_secs = timeout.as_secs().max(1);
-    let deadline = Instant::now() + timeout;
-    let stdout_reader = child.stdout.take().map(drain_child_pipe);
-    let stderr_reader = child.stderr.take().map(drain_child_pipe);
-
-    match child.wait_timeout(timeout)? {
-        Some(status) => {
-            let stdout = finish_child_pipe(stdout_reader, deadline, timeout_secs)?;
-            let stderr = finish_child_pipe(stderr_reader, deadline, timeout_secs)?;
-            Ok(Output {
-                status,
-                stdout,
-                stderr,
-            })
-        }
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(IndexError::Timeout(timeout_secs))
-        }
-    }
+    wait_for_child_output_with_timeout(child, timeout)?.ok_or(IndexError::Timeout(timeout_secs))
 }
 
 /// Indexer for triggering cass index on remote machines.
