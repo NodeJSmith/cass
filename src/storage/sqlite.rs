@@ -2966,49 +2966,10 @@ pub struct LexicalRebuildConversationFootprintRow {
     pub message_bytes: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LexicalRebuildConversationSummaryRow {
-    conversation_id: i64,
-    last_message_idx: Option<i64>,
-    user_message_count: Option<i64>,
-    assistant_message_count: Option<i64>,
-}
-
 pub(crate) const LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE: usize = 4 * 1024;
-const LEXICAL_REBUILD_FOOTPRINT_CONVERSATION_BATCH_SIZE: i64 = 4_096;
-const LEXICAL_REBUILD_FOOTPRINT_EXACT_FALLBACK_MAX_UNKNOWN_CONVERSATIONS: usize = 4_096;
 
 fn lexical_rebuild_nonnegative_count_to_usize(count: i64) -> usize {
     usize::try_from(count.max(0)).unwrap_or(usize::MAX)
-}
-
-fn lexical_rebuild_estimated_message_bytes(message_count: usize) -> usize {
-    message_count.saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE)
-}
-
-fn lexical_rebuild_estimated_message_count_from_conversation_summary(
-    last_message_idx: Option<i64>,
-    user_message_count: Option<i64>,
-    assistant_message_count: Option<i64>,
-) -> Option<usize> {
-    let tail_count = last_message_idx
-        .map(|idx| lexical_rebuild_nonnegative_count_to_usize(idx.saturating_add(1)));
-    let role_count = match (user_message_count, assistant_message_count) {
-        (Some(user), Some(assistant)) => {
-            let count = user.max(0).saturating_add(assistant.max(0));
-            if count > 0 {
-                Some(lexical_rebuild_nonnegative_count_to_usize(count))
-            } else {
-                None
-            }
-        }
-        (Some(user), None) if user > 0 => Some(lexical_rebuild_nonnegative_count_to_usize(user)),
-        (None, Some(assistant)) if assistant > 0 => {
-            Some(lexical_rebuild_nonnegative_count_to_usize(assistant))
-        }
-        _ => None,
-    };
-    tail_count.into_iter().chain(role_count).max()
 }
 
 /// Lightweight message projection used by the streaming lexical rebuild path.
@@ -6228,121 +6189,20 @@ impl FrankenStorage {
 
     /// List per-conversation message footprints in primary-key order.
     ///
+    /// This deliberately avoids a conversations/messages JOIN because
+    /// frankensqlite can fall back to full materialization on multi-table
+    /// rebuild-path queries. Instead we merge two ordered single-table scans:
+    /// one over conversation ids and one grouped count over the covering
+    /// messages(conversation_id, idx) autoindex.
+    ///
     /// The planner only needs a sizing heuristic; exact byte accounting is
     /// performed later by the rebuild packet pipeline as it reads message
-    /// content for indexing. Prefer cached conversation summaries because a
-    /// full grouped `messages` scan is a large fixed cost on fresh rebuilds.
-    /// Rows without any usable summary fall back to exact indexed point counts;
-    /// fully legacy databases fall back to the old grouped scan.
+    /// content for indexing. Avoiding `SUM(LENGTH(content))` here prevents a
+    /// second full payload read before the actual rebuild starts.
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
-        let mut last_conversation_id = 0_i64;
-        let mut footprints = Vec::new();
-        let mut unknown_conversation_ids = Vec::new();
-
-        loop {
-            let summary_rows: Vec<LexicalRebuildConversationSummaryRow> = self
-                .conn
-                .query_map_collect(
-                    "SELECT id, last_message_idx, user_message_count, assistant_message_count
-                     FROM conversations
-                     WHERE id > ?1
-                     ORDER BY id ASC
-                     LIMIT ?2",
-                    fparams![
-                        last_conversation_id,
-                        LEXICAL_REBUILD_FOOTPRINT_CONVERSATION_BATCH_SIZE
-                    ],
-                    |row| {
-                        Ok(LexicalRebuildConversationSummaryRow {
-                            conversation_id: row.get_typed(0)?,
-                            last_message_idx: row.get_typed(1)?,
-                            user_message_count: row.get_typed(2)?,
-                            assistant_message_count: row.get_typed(3)?,
-                        })
-                    },
-                )
-                .with_context(|| "listing lexical rebuild conversation summary footprints")?;
-            if summary_rows.is_empty() {
-                break;
-            }
-
-            footprints.reserve(summary_rows.len());
-            for summary_row in summary_rows {
-                let conversation_id = summary_row.conversation_id;
-                last_conversation_id = conversation_id;
-                match lexical_rebuild_estimated_message_count_from_conversation_summary(
-                    summary_row.last_message_idx,
-                    summary_row.user_message_count,
-                    summary_row.assistant_message_count,
-                ) {
-                    Some(message_count) => {
-                        footprints.push(LexicalRebuildConversationFootprintRow {
-                            conversation_id,
-                            message_count,
-                            message_bytes: lexical_rebuild_estimated_message_bytes(message_count),
-                        })
-                    }
-                    None => {
-                        unknown_conversation_ids.push(conversation_id);
-                        footprints.push(LexicalRebuildConversationFootprintRow {
-                            conversation_id,
-                            message_count: 0,
-                            message_bytes: 0,
-                        });
-                    }
-                }
-            }
-        }
-
-        if unknown_conversation_ids.is_empty() || footprints.is_empty() {
-            return Ok(footprints);
-        }
-
-        if unknown_conversation_ids.len() == footprints.len()
-            || unknown_conversation_ids.len()
-                > LEXICAL_REBUILD_FOOTPRINT_EXACT_FALLBACK_MAX_UNKNOWN_CONVERSATIONS
-        {
-            return self.list_conversation_footprints_from_messages_for_lexical_rebuild();
-        }
-
-        let mut footprint_index = 0usize;
-        for conversation_id in unknown_conversation_ids {
-            let message_count = self
-                .count_messages_for_lexical_rebuild_conversation(conversation_id)
-                .with_context(|| {
-                    format!(
-                        "counting lexical rebuild messages for summary-missing conversation {conversation_id}"
-                    )
-                })?;
-            while footprints
-                .get(footprint_index)
-                .is_some_and(|footprint| footprint.conversation_id < conversation_id)
-            {
-                footprint_index += 1;
-            }
-            if let Some(footprint) = footprints.get_mut(footprint_index)
-                && footprint.conversation_id == conversation_id
-            {
-                footprint.message_count = message_count;
-                footprint.message_bytes = lexical_rebuild_estimated_message_bytes(message_count);
-            }
-        }
-
-        Ok(footprints)
-    }
-
-    fn count_messages_for_lexical_rebuild_conversation(
-        &self,
-        conversation_id: i64,
-    ) -> Result<usize> {
-        let count: i64 = self.conn.query_row_map(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
-            fparams![conversation_id],
-            |row| row.get_typed(0),
-        )?;
-        Ok(lexical_rebuild_nonnegative_count_to_usize(count))
+        self.list_conversation_footprints_from_messages_for_lexical_rebuild()
     }
 
     fn list_conversation_footprints_from_messages_for_lexical_rebuild(
@@ -18813,65 +18673,6 @@ mod tests {
                     message_bytes: LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
             ]
-        );
-
-        storage
-            .conn
-            .execute_compat(
-                "UPDATE conversations
-                 SET last_message_idx = NULL,
-                     user_message_count = ?1,
-                     assistant_message_count = ?2
-                 WHERE id = ?3",
-                fparams![4_i64, 5_i64, ascii_id],
-            )
-            .unwrap();
-        let summary_estimated = storage
-            .list_conversation_footprints_for_lexical_rebuild()
-            .unwrap();
-        assert_eq!(
-            summary_estimated[0],
-            LexicalRebuildConversationFootprintRow {
-                conversation_id: ascii_id,
-                message_count: 9,
-                message_bytes: 9 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
-            },
-            "conversation summaries should be trusted as the fast sizing estimate"
-        );
-
-        storage
-            .conn
-            .execute_compat(
-                "UPDATE conversations
-                 SET last_message_idx = NULL,
-                     user_message_count = NULL,
-                     assistant_message_count = NULL",
-                fparams![],
-            )
-            .unwrap();
-        let exact_fallback = storage
-            .list_conversation_footprints_for_lexical_rebuild()
-            .unwrap();
-        assert_eq!(
-            exact_fallback,
-            vec![
-                LexicalRebuildConversationFootprintRow {
-                    conversation_id: ascii_id,
-                    message_count: 2,
-                    message_bytes: 2 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
-                },
-                LexicalRebuildConversationFootprintRow {
-                    conversation_id: empty_id,
-                    message_count: 0,
-                    message_bytes: 0,
-                },
-                LexicalRebuildConversationFootprintRow {
-                    conversation_id: utf8_id,
-                    message_count: 1,
-                    message_bytes: LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
-                },
-            ],
-            "fully legacy rows should retain the exact grouped-count fallback"
         );
     }
 
