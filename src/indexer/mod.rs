@@ -2958,7 +2958,7 @@ struct LexicalRebuildShardMergeCoordinator {
 }
 
 impl LexicalRebuildShardMergeCoordinator {
-    const EAGER_MERGE_FAN_IN: usize = 16;
+    const EAGER_MERGE_FAN_IN: usize = 8;
 
     fn new(stage_root: PathBuf) -> Self {
         Self {
@@ -3291,12 +3291,27 @@ impl LexicalRebuildStagedMergeController {
             } else if runtime.page_prep_workers > 0
                 && runtime.active_page_prep_jobs >= runtime.page_prep_workers
             {
+                let saturated_budget = ready_groups
+                    .min(self.max_workers.div_ceil(2))
+                    .max(1)
+                    .max(active_jobs.min(self.max_workers));
                 (
-                    1.min(self.max_workers),
-                    format!(
-                        "page_prep_workers_saturated_{}_of_{}",
-                        runtime.active_page_prep_jobs, runtime.page_prep_workers
-                    ),
+                    saturated_budget,
+                    if saturated_budget == 1 {
+                        format!(
+                            "page_prep_workers_saturated_{}_of_{}",
+                            runtime.active_page_prep_jobs, runtime.page_prep_workers
+                        )
+                    } else {
+                        format!(
+                            "page_prep_workers_saturated_{}_of_{}_merge_budget_{}_active_jobs_{}_ready_groups_{}",
+                            runtime.active_page_prep_jobs,
+                            runtime.page_prep_workers,
+                            saturated_budget,
+                            active_jobs,
+                            ready_groups
+                        )
+                    },
                 )
             } else if runtime.active_page_prep_jobs > 0
                 || runtime.pending_batch_conversations > 0
@@ -22519,6 +22534,44 @@ mod tests {
         assert_eq!(
             decision.controller_reason,
             "builder_handoff_pressure_scaling_staged_merge_budget_1_active_jobs_0_ready_groups_1_debt_budget_1_buffered_pages_1_queue_depth_2"
+        );
+    }
+
+    #[test]
+    fn lexical_rebuild_staged_merge_controller_spends_debt_budget_under_page_prep_saturation() {
+        let controller = LexicalRebuildStagedMergeController::new(8, Some(7_000));
+        let merge_coordinator = LexicalRebuildShardMergeCoordinator {
+            stage_root: PathBuf::from("/tmp/eager-merge"),
+            ready_levels: vec![
+                (0..LexicalRebuildShardMergeCoordinator::EAGER_MERGE_FAN_IN * 3)
+                    .map(|idx| LexicalRebuildShardMergeArtifact {
+                        first_shard_index: idx,
+                        last_shard_index: idx,
+                        index_path: PathBuf::from(format!("/tmp/shard-{idx}")),
+                        docs: 0,
+                        segments: 0,
+                    })
+                    .collect(),
+            ],
+            next_output_seq_by_level: vec![0, 0],
+            pending_merge_jobs: 0,
+            allowed_pending_merge_jobs: 0,
+        };
+        let saturated_runtime = LexicalRebuildPipelineRuntimeSnapshot {
+            page_prep_workers: 6,
+            active_page_prep_jobs: 6,
+            ..LexicalRebuildPipelineRuntimeSnapshot::default()
+        };
+
+        let decision = controller.decide(false, &saturated_runtime, &merge_coordinator);
+
+        assert_eq!(decision.workers_max, 8);
+        assert_eq!(decision.allowed_jobs, 3);
+        assert_eq!(decision.ready_artifacts, 24);
+        assert_eq!(decision.ready_groups, 3);
+        assert_eq!(
+            decision.controller_reason,
+            "page_prep_workers_saturated_6_of_6_merge_budget_3_active_jobs_0_ready_groups_3"
         );
     }
 
