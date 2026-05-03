@@ -51,6 +51,12 @@ pub const INDEX_POLL_INTERVAL_SECS: u64 = 5;
 /// Maximum wait time for indexing (30 minutes for large histories).
 pub const MAX_INDEX_WAIT_SECS: u64 = 1800;
 
+/// Remote load-per-core ceiling before offloaded indexing defers.
+const REMOTE_INDEX_MAX_LOAD_PER_CPU: f64 = 1.50;
+
+/// Minimum remote MemAvailable before offloaded indexing defers (512 MiB).
+const REMOTE_INDEX_MIN_AVAILABLE_MEM_KIB: u64 = 512 * 1024;
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -80,6 +86,9 @@ pub enum IndexError {
     #[error("Permission denied accessing agent data directories")]
     PermissionDenied,
 
+    #[error("Remote host pressure guard deferred indexing: {0}")]
+    HostPressure(String),
+
     #[error("Indexing cancelled")]
     Cancelled,
 
@@ -98,7 +107,88 @@ impl IndexError {
             IndexError::PermissionDenied => "Check file permissions in agent data directories.",
             IndexError::CassNotFound => "cass is not installed. Run installation first.",
             IndexError::SshFailed(_) => "Check SSH connection and credentials.",
+            IndexError::HostPressure(_) => {
+                "Remote host is currently busy. Retry later or run indexing manually when idle."
+            }
             _ => "See error details above.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RemoteHostPressureSnapshot {
+    cpus: Option<u64>,
+    load1: Option<f64>,
+    mem_available_kib: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RemoteHostPressureDecision {
+    defer_index: bool,
+    reason: String,
+    snapshot: RemoteHostPressureSnapshot,
+}
+
+impl RemoteHostPressureSnapshot {
+    fn from_command_output(output: &str) -> Self {
+        let mut snapshot = Self {
+            cpus: None,
+            load1: None,
+            mem_available_kib: None,
+        };
+
+        for line in output.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "CPUS" => snapshot.cpus = value.trim().parse::<u64>().ok().filter(|v| *v > 0),
+                "LOAD1" => {
+                    snapshot.load1 = value.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+                }
+                "MEM_AVAILABLE_KIB" => {
+                    snapshot.mem_available_kib = value.trim().parse::<u64>().ok()
+                }
+                _ => {}
+            }
+        }
+
+        snapshot
+    }
+
+    fn decide(self) -> RemoteHostPressureDecision {
+        let mut reasons = Vec::new();
+
+        if let (Some(load1), Some(cpus)) = (self.load1, self.cpus) {
+            let load_per_cpu = load1 / cpus as f64;
+            if load_per_cpu > REMOTE_INDEX_MAX_LOAD_PER_CPU {
+                reasons.push(format!(
+                    "load_per_cpu={load_per_cpu:.2} exceeds ceiling {REMOTE_INDEX_MAX_LOAD_PER_CPU:.2}"
+                ));
+            }
+        }
+
+        if let Some(mem_available_kib) = self.mem_available_kib
+            && mem_available_kib < REMOTE_INDEX_MIN_AVAILABLE_MEM_KIB
+        {
+            reasons.push(format!(
+                "mem_available_kib={mem_available_kib} below floor {REMOTE_INDEX_MIN_AVAILABLE_MEM_KIB}"
+            ));
+        }
+
+        let defer_index = !reasons.is_empty();
+        let reason = if defer_index {
+            reasons.join("; ")
+        } else if self.cpus.is_none() || self.load1.is_none() || self.mem_available_kib.is_none() {
+            "remote pressure metrics incomplete; allowing conservative fallback path".to_string()
+        } else {
+            "remote host pressure is within indexing budget".to_string()
+        };
+
+        RemoteHostPressureDecision {
+            defer_index,
+            reason,
+            snapshot: self,
         }
     }
 }
@@ -317,6 +407,7 @@ impl RemoteIndexer {
 
         // First check if cass is available
         self.verify_cass_installed()?;
+        self.verify_remote_host_pressure()?;
 
         // Run indexing in background with log file for progress tracking
         let mut result = self.run_index_with_polling(&on_progress, start)?;
@@ -373,6 +464,27 @@ command -v cass >/dev/null 2>&1 && echo "CASS_FOUND" || echo "CASS_NOT_FOUND"
         }
 
         Ok(())
+    }
+
+    fn host_pressure_script() -> &'static str {
+        r#"
+CPUS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo "")
+LOAD1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo "")
+MEM_AVAILABLE_KIB=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || echo "")
+printf 'CPUS=%s\n' "$CPUS"
+printf 'LOAD1=%s\n' "$LOAD1"
+printf 'MEM_AVAILABLE_KIB=%s\n' "$MEM_AVAILABLE_KIB"
+"#
+    }
+
+    fn verify_remote_host_pressure(&self) -> Result<(), IndexError> {
+        let output = self.run_ssh_command(Self::host_pressure_script(), Duration::from_secs(15))?;
+        let decision = RemoteHostPressureSnapshot::from_command_output(&output).decide();
+        if decision.defer_index {
+            Err(IndexError::HostPressure(decision.reason))
+        } else {
+            Ok(())
+        }
     }
 
     fn artifact_manifest_script() -> &'static str {
@@ -817,6 +929,11 @@ mod tests {
                 .help_message()
                 .contains("installed")
         );
+        assert!(
+            IndexError::HostPressure("load".into())
+                .help_message()
+                .contains("busy")
+        );
     }
 
     #[test]
@@ -833,6 +950,50 @@ mod tests {
         let script = RemoteIndexer::artifact_manifest_script();
         assert!(script.contains("cass sources artifact-manifest --write --json"));
         assert!(!script.contains("cass sources artifact-manifest --write\n"));
+    }
+
+    #[test]
+    fn test_host_pressure_script_reads_cheap_linux_metrics() {
+        let script = RemoteIndexer::host_pressure_script();
+        assert!(script.contains("_NPROCESSORS_ONLN"));
+        assert!(script.contains("/proc/loadavg"));
+        assert!(script.contains("MemAvailable"));
+    }
+
+    #[test]
+    fn test_remote_host_pressure_allows_incomplete_metrics() {
+        let decision = RemoteHostPressureSnapshot::from_command_output("CPUS=\nLOAD1=\n").decide();
+
+        assert!(!decision.defer_index);
+        assert!(
+            decision.reason.contains("metrics incomplete"),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn test_remote_host_pressure_defers_high_load() {
+        let decision = RemoteHostPressureSnapshot::from_command_output(
+            "CPUS=4\nLOAD1=7.20\nMEM_AVAILABLE_KIB=1048576\n",
+        )
+        .decide();
+
+        assert!(decision.defer_index);
+        assert!(decision.reason.contains("load_per_cpu"), "{decision:?}");
+    }
+
+    #[test]
+    fn test_remote_host_pressure_defers_low_memory() {
+        let decision = RemoteHostPressureSnapshot::from_command_output(
+            "CPUS=64\nLOAD1=12.00\nMEM_AVAILABLE_KIB=131072\n",
+        )
+        .decide();
+
+        assert!(decision.defer_index);
+        assert!(
+            decision.reason.contains("mem_available_kib"),
+            "{decision:?}"
+        );
     }
 
     #[test]
