@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "1";
 
@@ -437,6 +441,753 @@ fn quantile_order_violated(lower: Option<u64>, upper: Option<u64>) -> bool {
     matches!((lower, upper), (Some(lower), Some(upper)) if lower > upper)
 }
 
+#[derive(Debug)]
+pub enum PerfEvidenceIoError {
+    Io(io::Error),
+    Json(serde_json::Error),
+    Validation(PerfEvidenceValidationError),
+}
+
+impl fmt::Display for PerfEvidenceIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "perf evidence I/O failed: {err}"),
+            Self::Json(err) => write!(f, "perf evidence JSON failed: {err}"),
+            Self::Validation(err) => write!(f, "perf evidence validation failed: {err}"),
+        }
+    }
+}
+
+impl Error for PerfEvidenceIoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Json(err) => Some(err),
+            Self::Validation(err) => Some(err),
+        }
+    }
+}
+
+impl From<io::Error> for PerfEvidenceIoError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<serde_json::Error> for PerfEvidenceIoError {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Json(err)
+    }
+}
+
+impl From<PerfEvidenceValidationError> for PerfEvidenceIoError {
+    fn from(err: PerfEvidenceValidationError) -> Self {
+        Self::Validation(err)
+    }
+}
+
+pub fn read_perf_evidence_ledger(
+    path: impl AsRef<Path>,
+) -> Result<PerfEvidenceLedger, PerfEvidenceIoError> {
+    let bytes = fs::read(path.as_ref())?;
+    let ledger: PerfEvidenceLedger = serde_json::from_slice(&bytes)?;
+    ledger.validate()?;
+    Ok(ledger)
+}
+
+pub fn write_perf_evidence_ledger(
+    ledger: &PerfEvidenceLedger,
+    path: impl AsRef<Path>,
+) -> Result<PerfArtifactRef, PerfEvidenceIoError> {
+    ledger.validate()?;
+    let path = path.as_ref();
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(ledger)?;
+    fs::write(path, &bytes)?;
+    Ok(PerfArtifactRef {
+        label: "perf-evidence-ledger".to_string(),
+        path: path.display().to_string(),
+        kind: "json".to_string(),
+        sha256: Some(sha256_hex(&bytes)),
+    })
+}
+
+#[derive(Debug)]
+pub enum PerfEvidenceRecorderError {
+    ActivePhaseAlreadyRunning { active_phase: String },
+    NoActivePhase,
+    Validation(PerfEvidenceValidationError),
+}
+
+impl fmt::Display for PerfEvidenceRecorderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ActivePhaseAlreadyRunning { active_phase } => {
+                write!(f, "perf evidence phase {active_phase:?} is already active")
+            }
+            Self::NoActivePhase => write!(f, "no perf evidence phase is active"),
+            Self::Validation(err) => {
+                write!(f, "perf evidence recorder produced invalid data: {err}")
+            }
+        }
+    }
+}
+
+impl Error for PerfEvidenceRecorderError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Validation(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<PerfEvidenceValidationError> for PerfEvidenceRecorderError {
+    fn from(err: PerfEvidenceValidationError) -> Self {
+        Self::Validation(err)
+    }
+}
+
+#[derive(Debug)]
+struct ActivePerfPhase {
+    name: String,
+    kind: PerfPhaseKind,
+    started_at: Instant,
+}
+
+/// Incrementally records a [`PerfEvidenceLedger`] without coupling callers to
+/// benchmark-only structs.
+///
+/// The recorder is intentionally small: callers provide workload identity and
+/// optional snapshots, then append explicit phases or time `begin_phase` /
+/// `finish_phase` spans. It never reads global process configuration.
+#[derive(Debug)]
+pub struct PerfEvidenceRecorder {
+    ledger: PerfEvidenceLedger,
+    active_phase: Option<ActivePerfPhase>,
+}
+
+impl PerfEvidenceRecorder {
+    pub fn new(run_id: impl Into<String>, workload: PerfWorkload, recorded_at_ms: i64) -> Self {
+        Self {
+            ledger: PerfEvidenceLedger::new(run_id, workload, recorded_at_ms),
+            active_phase: None,
+        }
+    }
+
+    pub fn start(run_id: impl Into<String>, workload: PerfWorkload) -> Self {
+        Self::new(run_id, workload, now_unix_ms())
+    }
+
+    pub fn ledger(&self) -> &PerfEvidenceLedger {
+        &self.ledger
+    }
+
+    pub fn machine(&mut self, machine: PerfMachineProfile) -> &mut Self {
+        self.ledger.machine = machine;
+        self
+    }
+
+    pub fn resource_snapshot(&mut self, resources: PerfResourceSnapshot) -> &mut Self {
+        self.ledger.resources = resources;
+        self
+    }
+
+    pub fn cache_snapshot(&mut self, cache: PerfCacheSnapshot) -> &mut Self {
+        self.ledger.cache = Some(cache);
+        self
+    }
+
+    pub fn search_snapshot(&mut self, search: PerfSearchSnapshot) -> &mut Self {
+        self.ledger.search = Some(search);
+        self
+    }
+
+    pub fn rebuild_snapshot(&mut self, rebuild: PerfRebuildSnapshot) -> &mut Self {
+        self.ledger.rebuild = Some(rebuild);
+        self
+    }
+
+    pub fn proof_summary(&mut self, proof: PerfProofSummary) -> &mut Self {
+        self.ledger.proof = proof;
+        self
+    }
+
+    pub fn env_kv(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+        self.ledger.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn artifact(&mut self, artifact: PerfArtifactRef) -> &mut Self {
+        self.ledger.artifacts.push(artifact);
+        self
+    }
+
+    pub fn record_phase(
+        &mut self,
+        phase: PerfPhaseTiming,
+    ) -> Result<&mut Self, PerfEvidenceRecorderError> {
+        validate_phase(&phase, self.ledger.phases.len())?;
+        self.ledger.phases.push(phase);
+        Ok(self)
+    }
+
+    pub fn begin_phase(
+        &mut self,
+        name: impl Into<String>,
+        kind: PerfPhaseKind,
+    ) -> Result<&mut Self, PerfEvidenceRecorderError> {
+        if let Some(active) = &self.active_phase {
+            return Err(PerfEvidenceRecorderError::ActivePhaseAlreadyRunning {
+                active_phase: active.name.clone(),
+            });
+        }
+        self.active_phase = Some(ActivePerfPhase {
+            name: name.into(),
+            kind,
+            started_at: Instant::now(),
+        });
+        Ok(self)
+    }
+
+    pub fn finish_phase(&mut self) -> Result<&mut Self, PerfEvidenceRecorderError> {
+        let Some(active) = self.active_phase.take() else {
+            return Err(PerfEvidenceRecorderError::NoActivePhase);
+        };
+        let elapsed_ms = active
+            .started_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.record_phase(PerfPhaseTiming::new(active.name, active.kind, elapsed_ms))
+    }
+
+    pub fn finish(mut self) -> Result<PerfEvidenceLedger, PerfEvidenceRecorderError> {
+        if self.active_phase.is_some() {
+            self.finish_phase()?;
+        }
+        self.ledger.validate()?;
+        Ok(self.ledger)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfReplayVerdict {
+    Clean,
+    Warning,
+    Failure,
+}
+
+impl PerfReplayVerdict {
+    pub fn should_fail_build(self) -> bool {
+        matches!(self, Self::Failure)
+    }
+
+    fn max(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Failure, _) | (_, Self::Failure) => Self::Failure,
+            (Self::Warning, _) | (_, Self::Warning) => Self::Warning,
+            _ => Self::Clean,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfReplayMetric {
+    Validation,
+    ProofStatus,
+    ProofP99Regression,
+    ComposedP99,
+    TotalElapsed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfReplayFinding {
+    pub verdict: PerfReplayVerdict,
+    pub metric: PerfReplayMetric,
+    pub message: String,
+    #[serde(default)]
+    pub baseline_value: Option<i64>,
+    #[serde(default)]
+    pub current_value: Option<i64>,
+    #[serde(default)]
+    pub delta_basis_points: Option<i64>,
+    #[serde(default)]
+    pub threshold_basis_points: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfReplayLogEvent {
+    pub level: String,
+    pub message: String,
+    #[serde(default)]
+    pub artifact_path: Option<String>,
+    pub run_id: String,
+    #[serde(default)]
+    pub command_args: Vec<String>,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfReplayReport {
+    pub current_run_id: String,
+    #[serde(default)]
+    pub baseline_run_id: Option<String>,
+    pub verdict: PerfReplayVerdict,
+    #[serde(default)]
+    pub findings: Vec<PerfReplayFinding>,
+    #[serde(default)]
+    pub logs: Vec<PerfReplayLogEvent>,
+}
+
+impl PerfReplayReport {
+    pub fn should_fail_build(&self) -> bool {
+        self.verdict.should_fail_build()
+    }
+
+    fn new(current: &PerfEvidenceLedger, baseline: Option<&PerfEvidenceLedger>) -> Self {
+        Self {
+            current_run_id: current.run_id.clone(),
+            baseline_run_id: baseline.map(|ledger| ledger.run_id.clone()),
+            verdict: PerfReplayVerdict::Clean,
+            findings: Vec::new(),
+            logs: Vec::new(),
+        }
+    }
+
+    fn add_finding(&mut self, finding: PerfReplayFinding) {
+        self.verdict = self.verdict.max(finding.verdict);
+        self.findings.push(finding);
+    }
+
+    fn log(
+        &mut self,
+        level: &str,
+        message: &str,
+        current: &PerfEvidenceLedger,
+        artifact_path: Option<&Path>,
+        failure_reason: Option<String>,
+    ) {
+        self.logs.push(PerfReplayLogEvent {
+            level: level.to_string(),
+            message: message.to_string(),
+            artifact_path: artifact_path.map(|path| path.display().to_string()),
+            run_id: current.run_id.clone(),
+            command_args: current.workload.command_args.clone(),
+            failure_reason,
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfReplayThresholds {
+    pub warning_p99_regression_basis_points: i64,
+    pub failure_p99_regression_basis_points: i64,
+    pub warning_elapsed_regression_basis_points: i64,
+    pub failure_elapsed_regression_basis_points: i64,
+}
+
+impl PerfReplayThresholds {
+    pub fn defaults() -> Self {
+        Self {
+            warning_p99_regression_basis_points: 1_000,
+            failure_p99_regression_basis_points: 2_500,
+            warning_elapsed_regression_basis_points: 1_500,
+            failure_elapsed_regression_basis_points: 3_000,
+        }
+    }
+
+    pub fn try_new(
+        warning_p99_regression_basis_points: i64,
+        failure_p99_regression_basis_points: i64,
+        warning_elapsed_regression_basis_points: i64,
+        failure_elapsed_regression_basis_points: i64,
+    ) -> Result<Self, &'static str> {
+        validate_threshold_pair(
+            warning_p99_regression_basis_points,
+            failure_p99_regression_basis_points,
+            "p99",
+        )?;
+        validate_threshold_pair(
+            warning_elapsed_regression_basis_points,
+            failure_elapsed_regression_basis_points,
+            "elapsed",
+        )?;
+        Ok(Self {
+            warning_p99_regression_basis_points,
+            failure_p99_regression_basis_points,
+            warning_elapsed_regression_basis_points,
+            failure_elapsed_regression_basis_points,
+        })
+    }
+}
+
+impl Default for PerfReplayThresholds {
+    fn default() -> Self {
+        Self::defaults()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerfReplayGate {
+    thresholds: PerfReplayThresholds,
+}
+
+impl PerfReplayGate {
+    pub fn new(thresholds: PerfReplayThresholds) -> Self {
+        Self { thresholds }
+    }
+
+    pub fn replay(
+        &self,
+        current: &PerfEvidenceLedger,
+        baseline: Option<&PerfEvidenceLedger>,
+    ) -> PerfReplayReport {
+        self.replay_with_artifact(current, baseline, None)
+    }
+
+    pub fn replay_with_artifact(
+        &self,
+        current: &PerfEvidenceLedger,
+        baseline: Option<&PerfEvidenceLedger>,
+        current_artifact_path: Option<&Path>,
+    ) -> PerfReplayReport {
+        let mut report = PerfReplayReport::new(current, baseline);
+        report.log(
+            "info",
+            "perf evidence replay started",
+            current,
+            current_artifact_path,
+            None,
+        );
+
+        if let Err(err) = current.validate() {
+            let failure_reason = err.to_string();
+            report.add_finding(PerfReplayFinding {
+                verdict: PerfReplayVerdict::Failure,
+                metric: PerfReplayMetric::Validation,
+                message: "current perf evidence ledger failed validation".to_string(),
+                baseline_value: None,
+                current_value: None,
+                delta_basis_points: None,
+                threshold_basis_points: None,
+            });
+            report.log(
+                "error",
+                "perf evidence replay failed",
+                current,
+                current_artifact_path,
+                Some(failure_reason),
+            );
+            return report;
+        }
+
+        if let Some(baseline) = baseline
+            && let Err(err) = baseline.validate()
+        {
+            let failure_reason = err.to_string();
+            report.add_finding(PerfReplayFinding {
+                verdict: PerfReplayVerdict::Failure,
+                metric: PerfReplayMetric::Validation,
+                message: "baseline perf evidence ledger failed validation".to_string(),
+                baseline_value: None,
+                current_value: None,
+                delta_basis_points: None,
+                threshold_basis_points: None,
+            });
+            report.log(
+                "error",
+                "perf evidence replay failed",
+                current,
+                current_artifact_path,
+                Some(failure_reason),
+            );
+            return report;
+        }
+
+        self.evaluate_proof_status(current, &mut report);
+        self.evaluate_proof_p99(current, &mut report);
+        if let Some(baseline) = baseline {
+            self.evaluate_composed_p99(current, baseline, &mut report);
+            self.evaluate_total_elapsed(current, baseline, &mut report);
+        } else {
+            report.log(
+                "info",
+                "perf evidence replay had no baseline; validated current ledger only",
+                current,
+                current_artifact_path,
+                None,
+            );
+        }
+
+        if report.verdict.should_fail_build() {
+            let reason = report
+                .findings
+                .iter()
+                .find(|finding| finding.verdict == PerfReplayVerdict::Failure)
+                .map(|finding| finding.message.clone())
+                .unwrap_or_else(|| "perf evidence replay failed".to_string());
+            report.log(
+                "error",
+                "perf evidence replay failed",
+                current,
+                current_artifact_path,
+                Some(reason),
+            );
+        } else if report.verdict == PerfReplayVerdict::Warning {
+            report.log(
+                "warn",
+                "perf evidence replay produced warnings",
+                current,
+                current_artifact_path,
+                None,
+            );
+        } else {
+            report.log(
+                "info",
+                "perf evidence replay passed",
+                current,
+                current_artifact_path,
+                None,
+            );
+        }
+
+        report
+    }
+
+    pub fn replay_files<P>(
+        &self,
+        current_path: P,
+        baseline_path: Option<P>,
+    ) -> Result<PerfReplayReport, PerfEvidenceIoError>
+    where
+        P: AsRef<Path>,
+    {
+        let current_path = current_path.as_ref();
+        let current = read_perf_evidence_ledger(current_path)?;
+        let baseline = match baseline_path {
+            Some(path) => Some(read_perf_evidence_ledger(path.as_ref())?),
+            None => None,
+        };
+        Ok(self.replay_with_artifact(&current, baseline.as_ref(), Some(current_path)))
+    }
+
+    fn evaluate_proof_status(&self, current: &PerfEvidenceLedger, report: &mut PerfReplayReport) {
+        match current.proof.status {
+            PerfProofStatus::Failed => report.add_finding(PerfReplayFinding {
+                verdict: PerfReplayVerdict::Failure,
+                metric: PerfReplayMetric::ProofStatus,
+                message: "perf evidence proof status is failed".to_string(),
+                baseline_value: None,
+                current_value: None,
+                delta_basis_points: None,
+                threshold_basis_points: None,
+            }),
+            PerfProofStatus::Inconclusive => report.add_finding(PerfReplayFinding {
+                verdict: PerfReplayVerdict::Warning,
+                metric: PerfReplayMetric::ProofStatus,
+                message: "perf evidence proof status is inconclusive".to_string(),
+                baseline_value: None,
+                current_value: None,
+                delta_basis_points: None,
+                threshold_basis_points: None,
+            }),
+            PerfProofStatus::NotMeasured | PerfProofStatus::Passed => {}
+        }
+    }
+
+    fn evaluate_proof_p99(&self, current: &PerfEvidenceLedger, report: &mut PerfReplayReport) {
+        let Some(delta_basis_points) = current.proof.p99_regression_basis_points else {
+            return;
+        };
+        self.add_threshold_finding(
+            report,
+            PerfReplayMetric::ProofP99Regression,
+            "proof-reported p99 regression",
+            None,
+            None,
+            delta_basis_points,
+            self.thresholds.warning_p99_regression_basis_points,
+            self.thresholds.failure_p99_regression_basis_points,
+        );
+    }
+
+    fn evaluate_composed_p99(
+        &self,
+        current: &PerfEvidenceLedger,
+        baseline: &PerfEvidenceLedger,
+        report: &mut PerfReplayReport,
+    ) {
+        let Some(baseline_p99) = composed_p99_ms(baseline) else {
+            return;
+        };
+        let Some(current_p99) = composed_p99_ms(current) else {
+            return;
+        };
+        let Some(delta_basis_points) = basis_points_delta(baseline_p99, current_p99) else {
+            return;
+        };
+        self.add_threshold_finding(
+            report,
+            PerfReplayMetric::ComposedP99,
+            "composed phase p99 regression",
+            Some(baseline_p99),
+            Some(current_p99),
+            delta_basis_points,
+            self.thresholds.warning_p99_regression_basis_points,
+            self.thresholds.failure_p99_regression_basis_points,
+        );
+    }
+
+    fn evaluate_total_elapsed(
+        &self,
+        current: &PerfEvidenceLedger,
+        baseline: &PerfEvidenceLedger,
+        report: &mut PerfReplayReport,
+    ) {
+        let baseline_elapsed = total_elapsed_ms(baseline);
+        let current_elapsed = total_elapsed_ms(current);
+        let Some(delta_basis_points) = basis_points_delta(baseline_elapsed, current_elapsed) else {
+            return;
+        };
+        self.add_threshold_finding(
+            report,
+            PerfReplayMetric::TotalElapsed,
+            "total elapsed phase time regression",
+            Some(baseline_elapsed),
+            Some(current_elapsed),
+            delta_basis_points,
+            self.thresholds.warning_elapsed_regression_basis_points,
+            self.thresholds.failure_elapsed_regression_basis_points,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_threshold_finding(
+        &self,
+        report: &mut PerfReplayReport,
+        metric: PerfReplayMetric,
+        label: &str,
+        baseline_value: Option<i64>,
+        current_value: Option<i64>,
+        delta_basis_points: i64,
+        warning_basis_points: i64,
+        failure_basis_points: i64,
+    ) {
+        if delta_basis_points < warning_basis_points {
+            return;
+        }
+        let (verdict, threshold_basis_points) = if delta_basis_points >= failure_basis_points {
+            (PerfReplayVerdict::Failure, failure_basis_points)
+        } else {
+            (PerfReplayVerdict::Warning, warning_basis_points)
+        };
+        report.add_finding(PerfReplayFinding {
+            verdict,
+            metric,
+            message: format!("{label}: +{delta_basis_points} bps"),
+            baseline_value,
+            current_value,
+            delta_basis_points: Some(delta_basis_points),
+            threshold_basis_points: Some(threshold_basis_points),
+        });
+    }
+}
+
+fn validate_phase(
+    phase: &PerfPhaseTiming,
+    index: usize,
+) -> Result<(), PerfEvidenceValidationError> {
+    if phase.name.trim().is_empty() {
+        return Err(PerfEvidenceValidationError::EmptyPhaseName { index });
+    }
+    if quantile_order_violated(phase.p50_ms, phase.p95_ms)
+        || quantile_order_violated(phase.p95_ms, phase.p99_ms)
+        || quantile_order_violated(phase.p50_ms, phase.p99_ms)
+    {
+        return Err(PerfEvidenceValidationError::PhaseQuantilesOutOfOrder { index });
+    }
+    Ok(())
+}
+
+fn composed_p99_ms(ledger: &PerfEvidenceLedger) -> Option<i64> {
+    let mut total = 0u64;
+    let mut saw_phase = false;
+    for phase in &ledger.phases {
+        total = total.checked_add(phase.p99_ms?)?;
+        saw_phase = true;
+    }
+    saw_phase.then_some(total.min(i64::MAX as u64) as i64)
+}
+
+fn total_elapsed_ms(ledger: &PerfEvidenceLedger) -> i64 {
+    ledger
+        .phases
+        .iter()
+        .map(|phase| phase.elapsed_ms)
+        .fold(0u64, u64::saturating_add)
+        .min(i64::MAX as u64) as i64
+}
+
+fn basis_points_delta(baseline: i64, current: i64) -> Option<i64> {
+    if baseline <= 0 {
+        return None;
+    }
+    let delta = i128::from(current) - i128::from(baseline);
+    let scaled = delta.checked_mul(10_000)?;
+    let rounded = if delta >= 0 {
+        scaled.checked_add(i128::from(baseline / 2))?
+    } else {
+        scaled.checked_sub(i128::from(baseline / 2))?
+    };
+    let basis_points = rounded.checked_div(i128::from(baseline))?;
+    i64::try_from(basis_points).ok()
+}
+
+fn validate_threshold_pair(
+    warning_basis_points: i64,
+    failure_basis_points: i64,
+    metric: &'static str,
+) -> Result<(), &'static str> {
+    if warning_basis_points < 0 || failure_basis_points < 0 {
+        return Err("perf replay thresholds must be non-negative basis points");
+    }
+    if warning_basis_points >= failure_basis_points {
+        return match metric {
+            "p99" => Err(
+                "warning_p99_regression_basis_points must be less than failure_p99_regression_basis_points",
+            ),
+            "elapsed" => Err(
+                "warning_elapsed_regression_basis_points must be less than failure_elapsed_regression_basis_points",
+            ),
+            _ => Err("warning threshold must be less than failure threshold"),
+        };
+    }
+    Ok(())
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    format!("{digest:x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +1295,229 @@ mod tests {
                 precision: PerfCountPrecision::Exact,
             }),
         }
+    }
+
+    #[test]
+    fn recorder_accumulates_phases_snapshots_and_artifacts() {
+        let mut recorder = PerfEvidenceRecorder::new(
+            "recorder-run",
+            PerfWorkload {
+                kind: PerfWorkloadKind::WatchOnce,
+                name: "watch-once-ingest".to_string(),
+                description: None,
+                command_args: vec![
+                    "cass".to_string(),
+                    "index".to_string(),
+                    "--watch-once".to_string(),
+                    "/tmp/session.jsonl".to_string(),
+                    "--json".to_string(),
+                ],
+                input_count: Some(PerfCount {
+                    value: 64,
+                    precision: PerfCountPrecision::Exact,
+                }),
+            },
+            42,
+        );
+
+        recorder
+            .machine(PerfMachineProfile {
+                logical_cpus: Some(64),
+                reserved_cores: Some(4),
+                available_memory_bytes: Some(256 * 1024 * 1024 * 1024),
+                topology_class: Some("many_core".to_string()),
+            })
+            .env_kv("CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS", "64")
+            .cache_snapshot(PerfCacheSnapshot {
+                result_cache_hits: 7,
+                result_cache_misses: 2,
+                eviction_count: 1,
+                approx_bytes: Some(1_024),
+                byte_cap: Some(2_048),
+            })
+            .artifact(PerfArtifactRef {
+                label: "trace".to_string(),
+                path: "tests/artifacts/perf/trace.json".to_string(),
+                kind: "json".to_string(),
+                sha256: None,
+            });
+        recorder
+            .record_phase(phase("queue", PerfPhaseKind::Queueing, 3, 1, 2, 3))
+            .unwrap()
+            .begin_phase("emit-json", PerfPhaseKind::Output)
+            .unwrap()
+            .finish_phase()
+            .unwrap();
+
+        let ledger = recorder.finish().unwrap();
+
+        ledger.validate().unwrap();
+        assert_eq!(ledger.run_id, "recorder-run");
+        assert_eq!(
+            ledger.env["CASS_WATCH_ONCE_INGEST_CHUNK_CONVERSATIONS"],
+            "64"
+        );
+        assert_eq!(ledger.phases.len(), 2);
+        assert_eq!(ledger.phases[0].kind, PerfPhaseKind::Queueing);
+        assert_eq!(ledger.phases[1].name, "emit-json");
+        assert_eq!(ledger.artifacts[0].label, "trace");
+    }
+
+    #[test]
+    fn recorder_rejects_overlapping_or_missing_active_phase() {
+        let mut recorder = PerfEvidenceRecorder::new(
+            "active-phase-run",
+            PerfWorkload::new(PerfWorkloadKind::Search, "search"),
+            1,
+        );
+
+        assert_eq!(
+            recorder.finish_phase().unwrap_err().to_string(),
+            "no perf evidence phase is active"
+        );
+
+        recorder
+            .begin_phase("service", PerfPhaseKind::Service)
+            .unwrap();
+        let err = recorder
+            .begin_phase("io", PerfPhaseKind::Io)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service"), "{err}");
+    }
+
+    #[test]
+    fn replay_gate_detects_p99_and_elapsed_regressions() {
+        let baseline = representative_ledger();
+        let mut current = representative_ledger();
+        current.run_id = "current-regressed".to_string();
+        current.phases = vec![
+            phase("admission", PerfPhaseKind::Queueing, 4, 2, 3, 5),
+            phase("bm25", PerfPhaseKind::Service, 30, 20, 24, 30),
+            phase("semantic", PerfPhaseKind::Io, 45, 30, 40, 45),
+            phase("merge", PerfPhaseKind::Synchronization, 12, 7, 10, 12),
+            phase("retry-budget", PerfPhaseKind::Retries, 2, 1, 2, 2),
+            phase("hydrate", PerfPhaseKind::Hydration, 18, 10, 15, 18),
+            phase("emit-json", PerfPhaseKind::Output, 6, 3, 5, 6),
+        ];
+
+        let gate =
+            PerfReplayGate::new(PerfReplayThresholds::try_new(500, 1_000, 500, 1_000).unwrap());
+        let report = gate.replay(&current, Some(&baseline));
+
+        assert_eq!(report.verdict, PerfReplayVerdict::Failure);
+        assert!(report.should_fail_build());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.metric == PerfReplayMetric::ComposedP99
+                    && finding.verdict == PerfReplayVerdict::Failure),
+            "{report:#?}"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.metric == PerfReplayMetric::TotalElapsed),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn replay_gate_warns_on_inconclusive_proof_and_fails_on_failed_proof() {
+        let mut current = representative_ledger();
+        current.proof.status = PerfProofStatus::Inconclusive;
+
+        let gate = PerfReplayGate::new(PerfReplayThresholds::defaults());
+        let report = gate.replay(&current, None);
+
+        assert_eq!(report.verdict, PerfReplayVerdict::Warning);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.metric == PerfReplayMetric::ProofStatus)
+        );
+
+        current.proof.status = PerfProofStatus::Failed;
+        let report = gate.replay(&current, None);
+
+        assert_eq!(report.verdict, PerfReplayVerdict::Failure);
+        assert!(
+            report
+                .logs
+                .iter()
+                .any(|event| event.failure_reason.as_deref()
+                    == Some("perf evidence proof status is failed")),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn replay_gate_uses_proof_reported_p99_without_baseline() {
+        let mut current = representative_ledger();
+        current.proof.p99_regression_basis_points = Some(1_500);
+
+        let gate =
+            PerfReplayGate::new(PerfReplayThresholds::try_new(500, 1_000, 500, 1_000).unwrap());
+        let report = gate.replay(&current, None);
+
+        assert_eq!(report.verdict, PerfReplayVerdict::Failure);
+        assert!(
+            report.findings.iter().any(|finding| finding.metric
+                == PerfReplayMetric::ProofP99Regression
+                && finding.delta_basis_points == Some(1_500)),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn replay_thresholds_reject_unreachable_warning_bands() {
+        assert_eq!(
+            PerfReplayThresholds::try_new(1_000, 1_000, 500, 1_000),
+            Err(
+                "warning_p99_regression_basis_points must be less than failure_p99_regression_basis_points"
+            )
+        );
+        assert_eq!(
+            PerfReplayThresholds::try_new(500, 1_000, -1, 1_000),
+            Err("perf replay thresholds must be non-negative basis points")
+        );
+    }
+
+    #[test]
+    fn replay_log_events_include_command_shape_and_artifact_context() {
+        let baseline = representative_ledger();
+        let mut current = representative_ledger();
+        current.run_id = "artifact-context".to_string();
+        current.proof.status = PerfProofStatus::Failed;
+
+        let gate = PerfReplayGate::new(PerfReplayThresholds::defaults());
+        let report = gate.replay_with_artifact(
+            &current,
+            Some(&baseline),
+            Some(Path::new("tests/artifacts/perf/current.json")),
+        );
+
+        let failure_log = report
+            .logs
+            .iter()
+            .find(|event| event.level == "error")
+            .expect("error log");
+        assert_eq!(failure_log.run_id, "artifact-context");
+        assert_eq!(
+            failure_log.artifact_path.as_deref(),
+            Some("tests/artifacts/perf/current.json")
+        );
+        assert_eq!(
+            failure_log.command_args,
+            ["cass", "search", "wal conflict", "--json"]
+        );
+        assert_eq!(
+            failure_log.failure_reason.as_deref(),
+            Some("perf evidence proof status is failed")
+        );
     }
 
     #[test]
