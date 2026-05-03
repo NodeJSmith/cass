@@ -4654,7 +4654,7 @@ impl LexicalRebuildResponsivenessPolicy {
 }
 
 fn lexical_rebuild_responsiveness_policy() -> LexicalRebuildResponsivenessPolicy {
-    dotenvy::var("CASS_TANTIVY_REBUILD_CONTROLLER_MODE")
+    if let Some(policy) = dotenvy::var("CASS_TANTIVY_REBUILD_CONTROLLER_MODE")
         .ok()
         .map(|value| value.trim().to_ascii_lowercase())
         .as_deref()
@@ -4667,7 +4667,15 @@ fn lexical_rebuild_responsiveness_policy() -> LexicalRebuildResponsivenessPolicy
             }
             _ => LexicalRebuildResponsivenessPolicy::Auto,
         })
-        .unwrap_or(LexicalRebuildResponsivenessPolicy::Auto)
+    {
+        return policy;
+    }
+
+    if responsiveness::disabled_via_env() {
+        LexicalRebuildResponsivenessPolicy::Steady
+    } else {
+        LexicalRebuildResponsivenessPolicy::Auto
+    }
 }
 
 fn lexical_rebuild_controller_restore_clear_samples() -> usize {
@@ -4738,14 +4746,18 @@ fn lexical_rebuild_controller_loadavg_high_watermark_1m_milli_for_available_and_
     available_parallelism: usize,
     reserved_cores: usize,
 ) -> Option<u32> {
-    parse_lexical_rebuild_loadavg_override_milli(
+    let env_override = parse_lexical_rebuild_loadavg_override_milli(
         "CASS_TANTIVY_REBUILD_CONTROLLER_LOADAVG_HIGH_WATERMARK_1M",
-    )
-    .or_else(|| {
-        lexical_rebuild_default_controller_loadavg_high_watermark_1m_milli_for_available_and_reserved(
-            available_parallelism,
-            reserved_cores,
-        )
+    );
+    env_override.or_else(|| {
+        if responsiveness::disabled_via_env() {
+            None
+        } else {
+            lexical_rebuild_default_controller_loadavg_high_watermark_1m_milli_for_available_and_reserved(
+                available_parallelism,
+                reserved_cores,
+            )
+        }
     })
 }
 
@@ -22819,6 +22831,23 @@ mod tests {
         assert_eq!(snapshot.pipeline_channel_size, 5);
         assert_eq!(snapshot.page_prep_workers, 3);
         assert_eq!(snapshot.pipeline_max_message_bytes_in_flight, 777777);
+    }
+
+    #[test]
+    #[serial]
+    fn lexical_rebuild_pipeline_settings_snapshot_disables_global_controller() {
+        let _responsiveness = set_env("CASS_RESPONSIVENESS_DISABLE", "1");
+        let _controller_mode = unset_env_var("CASS_TANTIVY_REBUILD_CONTROLLER_MODE");
+        let _controller_loadavg_high =
+            unset_env_var("CASS_TANTIVY_REBUILD_CONTROLLER_LOADAVG_HIGH_WATERMARK_1M");
+        let _controller_loadavg_low =
+            unset_env_var("CASS_TANTIVY_REBUILD_CONTROLLER_LOADAVG_LOW_WATERMARK_1M");
+
+        let snapshot = lexical_rebuild_pipeline_settings_snapshot();
+
+        assert_eq!(snapshot.controller_mode, "steady");
+        assert_eq!(snapshot.controller_loadavg_high_watermark_1m_milli, None);
+        assert_eq!(snapshot.controller_loadavg_low_watermark_1m_milli, None);
     }
 
     #[test]

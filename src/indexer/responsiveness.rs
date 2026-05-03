@@ -1274,12 +1274,16 @@ static GOVERNOR: LazyLock<Arc<Governor>> = LazyLock::new(|| {
 /// static `GOVERNOR` is constructed at most once per process, but the
 /// disable signal is honored at every read site.
 pub(crate) fn current_capacity_pct() -> u32 {
-    if env_bool_truthy("CASS_RESPONSIVENESS_DISABLE") {
+    if disabled_via_env() {
         return 100;
     }
     let g = GOVERNOR.clone();
     g.ensure_started();
     g.current_capacity.load(Ordering::Relaxed)
+}
+
+pub(crate) fn disabled_via_env() -> bool {
+    env_bool_truthy("CASS_RESPONSIVENESS_DISABLE")
 }
 
 /// Scale a caller-requested worker count by the current governor capacity.
