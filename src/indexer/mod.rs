@@ -5673,9 +5673,9 @@ fn validate_lexical_rebuild_shard_build_result(
             observed_docs
         ));
     }
-    // [coding_agent_session_search-rx1ex] The shard plan's `message_count`
-    // is the raw row count from SQLite (per
-    // `list_conversation_footprints_for_lexical_rebuild`), while
+    // [coding_agent_session_search-rx1ex] When known, the shard plan's
+    // `message_count` is a SQLite-side planning estimate from
+    // `list_conversation_footprints_for_lexical_rebuild`, while
     // `observed_docs` is the post-filter Tantivy doc count. The
     // lexical sink legitimately drops messages via
     // `is_hard_message_noise` (empty content, hard-noise roles).

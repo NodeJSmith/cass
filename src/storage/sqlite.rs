@@ -6185,92 +6185,42 @@ impl FrankenStorage {
 
     /// List per-conversation message footprints in primary-key order.
     ///
-    /// This deliberately avoids a conversations/messages JOIN because
-    /// frankensqlite can fall back to full materialization on multi-table
-    /// rebuild-path queries. Instead we merge two ordered single-table scans:
-    /// one over conversation ids and one streaming message-count pass over the
-    /// covering messages(conversation_id, idx) autoindex.
+    /// This deliberately avoids a payload-heavy conversations/messages JOIN.
+    /// Instead we read the conversation tail high-water mark maintained in the
+    /// narrow `conversation_tail_state` cache and use `last_message_idx + 1`
+    /// as a planning estimate.
     ///
-    /// The planner only needs a sizing heuristic; exact byte accounting is
-    /// performed later by the rebuild packet pipeline as it reads message
-    /// content for indexing. Avoiding `SUM(LENGTH(content))` here prevents a
-    /// second full payload read before the actual rebuild starts.
+    /// The planner only needs a sizing heuristic; exact message and byte
+    /// accounting is performed later by the rebuild packet pipeline as it reads
+    /// message content for indexing. Avoiding a full `messages` scan here keeps
+    /// authoritative lexical repair startup proportional to conversations, not
+    /// retained message history.
     pub fn list_conversation_footprints_for_lexical_rebuild(
         &self,
     ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
-        self.list_conversation_footprints_from_messages_for_lexical_rebuild()
-    }
-
-    fn list_conversation_footprints_from_messages_for_lexical_rebuild(
-        &self,
-    ) -> Result<Vec<LexicalRebuildConversationFootprintRow>> {
-        let conversation_ids = self.list_conversation_ids_for_lexical_rebuild()?;
-        let mut message_counts = Vec::new();
-        let mut current_conversation_id = None;
-        let mut current_message_count = 0usize;
         self.conn
-            .query_with_params_for_each(
-                "SELECT conversation_id
-                 FROM messages
-                 ORDER BY conversation_id ASC, idx ASC",
-                &[] as &[SqliteValue],
+            .query_map_collect(
+                "SELECT c.id, COALESCE(ts.last_message_idx, c.last_message_idx)
+                 FROM conversations c
+                 LEFT JOIN conversation_tail_state ts ON ts.conversation_id = c.id
+                 ORDER BY c.id ASC",
+                fparams![],
                 |row| {
                     let conversation_id: i64 = row.get_typed(0)?;
-                    match current_conversation_id {
-                        Some(current_id) if current_id == conversation_id => {
-                            current_message_count = current_message_count.saturating_add(1);
-                        }
-                        Some(current_id) => {
-                            message_counts.push((current_id, current_message_count));
-                            current_conversation_id = Some(conversation_id);
-                            current_message_count = 1;
-                        }
-                        None => {
-                            current_conversation_id = Some(conversation_id);
-                            current_message_count = 1;
-                        }
-                    }
-                    Ok(())
+                    let last_message_idx: Option<i64> = row.get_typed(1)?;
+                    let message_count = last_message_idx
+                        .and_then(|idx| idx.checked_add(1))
+                        .and_then(|count| usize::try_from(count).ok())
+                        .unwrap_or(0);
+                    Ok(LexicalRebuildConversationFootprintRow {
+                        conversation_id,
+                        message_count,
+                        message_bytes: message_count
+                            .saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE),
+                    })
                 },
             )
-            .with_context(|| "streaming lexical rebuild conversation footprint counts")?;
-        if let Some(conversation_id) = current_conversation_id {
-            message_counts.push((conversation_id, current_message_count));
-        }
-
-        let mut message_counts = message_counts.into_iter().peekable();
-        let mut footprints = Vec::with_capacity(conversation_ids.len());
-        for conversation_id in conversation_ids {
-            while let Some((message_count_conversation_id, _)) = message_counts.peek() {
-                if *message_count_conversation_id < conversation_id {
-                    message_counts.next();
-                } else {
-                    break;
-                }
-            }
-
-            let (message_count, message_bytes) = match message_counts.peek() {
-                Some((message_count_conversation_id, _))
-                    if *message_count_conversation_id == conversation_id =>
-                {
-                    let (_, count) = message_counts
-                        .next()
-                        .expect("peeked lexical rebuild message-count row should exist");
-                    (
-                        count,
-                        count.saturating_mul(LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE),
-                    )
-                }
-                _ => (0, 0),
-            };
-            footprints.push(LexicalRebuildConversationFootprintRow {
-                conversation_id,
-                message_count,
-                message_bytes,
-            });
-        }
-
-        Ok(footprints)
+            .with_context(|| "listing lexical rebuild conversation footprint estimates")
     }
 
     /// List conversation ids in the stable order used by lexical rebuilds.
@@ -18663,6 +18613,20 @@ mod tests {
                 snippets: Vec::new(),
             }],
         );
+        let sparse_id = insert(
+            "footprint-sparse",
+            1_700_000_003_000,
+            vec![Message {
+                id: None,
+                idx: 10,
+                role: MessageRole::User,
+                author: None,
+                created_at: Some(1_700_000_003_010),
+                content: "sparse".into(),
+                extra_json: serde_json::Value::Null,
+                snippets: Vec::new(),
+            }],
+        );
 
         let footprints = storage
             .list_conversation_footprints_for_lexical_rebuild()
@@ -18684,6 +18648,11 @@ mod tests {
                     conversation_id: utf8_id,
                     message_count: 1,
                     message_bytes: LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
+                },
+                LexicalRebuildConversationFootprintRow {
+                    conversation_id: sparse_id,
+                    message_count: 11,
+                    message_bytes: 11 * LEXICAL_REBUILD_PLANNER_ESTIMATED_BYTES_PER_MESSAGE,
                 },
             ]
         );
