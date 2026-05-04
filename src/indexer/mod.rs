@@ -10574,12 +10574,6 @@ pub fn run_index(
             return close_storage_after_index(storage, &opts.db_path, "watch-once no-op index run");
         }
 
-        let additional_scan_roots = if opts.watch {
-            additional_scan_roots_for_scan_or_watch(&storage, &opts.data_dir)
-        } else {
-            Vec::new()
-        };
-
         // Startup watch ingest defers WAL auto-checkpoints for bulk import.
         // Before entering the long-lived watch loop, restore the steady-state
         // policy so idle watch sessions do not leave auto-checkpointing
