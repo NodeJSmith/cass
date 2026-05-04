@@ -1756,4 +1756,14 @@ mod tests {
             "crypto worker must inflate each independently-compressed payload chunk before concatenating plaintext"
         );
     }
+
+    #[test]
+    fn test_crypto_worker_allows_zero_chunk_archives_like_rust_validator() {
+        let crypto_worker_js = include_str!("../src/pages_assets/crypto_worker.js");
+        assert!(
+            crypto_worker_js.contains("payload.chunk_count < 0")
+                && !crypto_worker_js.contains("payload.chunk_count <= 0"),
+            "crypto worker payload metadata validation should match Rust and allow zero chunks with an empty file list"
+        );
+    }
 }

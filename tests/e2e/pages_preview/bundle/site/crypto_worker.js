@@ -345,7 +345,7 @@ function validateSupportedPayloadFormat(cfg) {
         throw new Error(`Invalid archive chunk_size: ${payload.chunk_size ?? 'missing'}`);
     }
 
-    if (!Number.isSafeInteger(payload.chunk_count) || payload.chunk_count <= 0) {
+    if (!Number.isSafeInteger(payload.chunk_count) || payload.chunk_count < 0) {
         throw new Error(`Invalid archive chunk_count: ${payload.chunk_count ?? 'missing'}`);
     }
 
