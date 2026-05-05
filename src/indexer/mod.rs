@@ -8421,6 +8421,7 @@ fn spawn_connector_producer(
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
                 inject_provenance(&mut conversation, &local_origin);
                 compact_large_connector_extras(name, &mut conversation);
+                attach_raw_mirror_capture(&config.data_dir, &mut conversation);
                 batch_sender.push(conversation)
             }) {
                 Ok(()) => {
@@ -8452,6 +8453,10 @@ fn spawn_connector_producer(
                         );
                         return;
                     }
+                    for root_path in &detect.root_paths {
+                        let root = ScanRoot::local(root_path.clone());
+                        capture_scan_root_file_after_parse_failure(&config.data_dir, name, &root);
+                    }
                     tracing::warn!(connector = name, "local scan failed: {}", e);
                     let _ = tx.send(IndexMessage::ScanError {
                         connector_name: name,
@@ -8475,6 +8480,7 @@ fn spawn_connector_producer(
                 inject_provenance(&mut conversation, &root.origin);
                 apply_workspace_rewrite(&mut conversation, root);
                 compact_large_connector_extras(name, &mut conversation);
+                attach_raw_mirror_capture(&config.data_dir, &mut conversation);
 
                 if !was_detected && !is_discovered {
                     if let Some(p) = &config.progress {
@@ -8529,6 +8535,7 @@ fn spawn_connector_producer(
                         );
                         return;
                     }
+                    capture_scan_root_file_after_parse_failure(&config.data_dir, name, root);
                     tracing::warn!(
                         connector = name,
                         root = %root.path.display(),
@@ -9250,12 +9257,17 @@ fn run_batch_index_with_connector_factories(
                             let local_origin = Origin::local();
                             for conv in &mut local_convs {
                                 inject_provenance(conv, &local_origin);
+                                attach_raw_mirror_capture(&data_dir, conv);
                             }
                             convs.extend(local_convs);
                         }
                         Err(e) => {
                             // Note: agent was counted as discovered but scan failed
                             // This is acceptable as detection succeeded (agent exists)
+                            for root_path in &detect.root_paths {
+                                let root = ScanRoot::local(root_path.clone());
+                                capture_scan_root_file_after_parse_failure(&data_dir, name, &root);
+                            }
                             tracing::warn!("scan failed for {}: {}", name, e);
                         }
                     }
@@ -9273,10 +9285,12 @@ fn run_batch_index_with_connector_factories(
                                 for conv in &mut remote_convs {
                                     inject_provenance(conv, &root.origin);
                                     apply_workspace_rewrite(conv, root);
+                                    attach_raw_mirror_capture(&data_dir, conv);
                                 }
                                 convs.extend(remote_convs);
                             }
                             Err(e) => {
+                                capture_scan_root_file_after_parse_failure(&data_dir, name, root);
                                 tracing::warn!(
                                     connector = name,
                                     root = %root.path.display(),
@@ -15337,6 +15351,29 @@ impl ConnectorKind {
         }
     }
 
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Cline => "cline",
+            Self::Gemini => "gemini",
+            Self::Claude => "claude",
+            Self::Clawdbot => "clawdbot",
+            Self::Vibe => "vibe",
+            Self::Amp => "amp",
+            Self::OpenCode => "opencode",
+            Self::Aider => "aider",
+            Self::Cursor => "cursor",
+            Self::ChatGpt => "chatgpt",
+            Self::PiAgent => "pi_agent",
+            Self::Factory => "factory",
+            Self::OpenClaw => "openclaw",
+            Self::Copilot => "copilot",
+            Self::Kimi => "kimi",
+            Self::CopilotCli => "copilot_cli",
+            Self::Qwen => "qwen",
+        }
+    }
+
     /// Create a boxed connector instance for this kind.
     /// Centralizes connector instantiation to avoid duplicate match arms.
     fn create_connector(&self) -> Box<dyn Connector + Send> {
@@ -15704,6 +15741,7 @@ fn reindex_paths_with_semantic_delta(
         let mut convs = match conn.scan(&ctx) {
             Ok(c) => c,
             Err(e) => {
+                capture_scan_root_file_after_parse_failure(&opts.data_dir, kind.slug(), &root);
                 tracing::debug!(
                     "watch scan failed for {:?} at {}: {}",
                     kind,
@@ -15720,6 +15758,7 @@ fn reindex_paths_with_semantic_delta(
             inject_provenance(conv, &root.origin);
             apply_workspace_rewrite(conv, &root);
             compact_large_connector_extras("", conv);
+            attach_raw_mirror_capture(&opts.data_dir, conv);
         }
 
         // Update total and phase to indexing
@@ -16583,6 +16622,152 @@ fn inject_provenance(conv: &mut NormalizedConversation, origin: &Origin) {
             );
         }
     }
+}
+
+fn capture_scan_root_file_after_parse_failure(data_dir: &Path, provider: &str, root: &ScanRoot) {
+    if !root.path.is_file() {
+        return;
+    }
+    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+        data_dir,
+        provider,
+        source_id: &root.origin.source_id,
+        origin_kind: root.origin.kind.as_str(),
+        origin_host: root.origin.host.as_deref(),
+        source_path: &root.path,
+        db_links: &[],
+    }) {
+        Ok(record) => {
+            tracing::debug!(
+                provider,
+                source_id = %root.origin.source_id,
+                manifest_id = %record.manifest_id,
+                blob_blake3 = %record.blob_blake3,
+                already_present = record.already_present,
+                "captured explicit scan-root source into raw mirror after connector parse failure"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                provider,
+                source_id = %root.origin.source_id,
+                path = %root.path.display(),
+                error = %error,
+                "failed to capture explicit scan-root source into raw mirror after connector parse failure"
+            );
+        }
+    }
+}
+
+fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
+    let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
+    let db_link = raw_mirror_db_link_for_conversation(conv);
+    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
+        data_dir,
+        provider: &conv.agent_slug,
+        source_id: &source_id,
+        origin_kind: &origin_kind,
+        origin_host: origin_host.as_deref(),
+        source_path: &conv.source_path,
+        db_links: std::slice::from_ref(&db_link),
+    }) {
+        Ok(record) => {
+            attach_raw_mirror_metadata(conv, &record);
+            tracing::debug!(
+                agent = %conv.agent_slug,
+                source_id = %source_id,
+                manifest_id = %record.manifest_id,
+                blob_blake3 = %record.blob_blake3,
+                already_present = record.already_present,
+                "captured parsed conversation source into raw mirror before archive upsert"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                agent = %conv.agent_slug,
+                source_id = %source_id,
+                source_path = %conv.source_path.display(),
+                error = %error,
+                "failed to capture parsed conversation source into raw mirror before archive upsert"
+            );
+        }
+    }
+}
+
+fn raw_mirror_db_link_for_conversation(
+    conv: &NormalizedConversation,
+) -> crate::raw_mirror::RawMirrorDbLink {
+    crate::raw_mirror::RawMirrorDbLink {
+        conversation_id: None,
+        message_count: Some(conv.messages.len()),
+        source_path: Some(conv.source_path.display().to_string()),
+        started_at_ms: conv.started_at,
+    }
+}
+
+fn raw_mirror_origin_from_metadata(
+    metadata: &serde_json::Value,
+) -> (String, String, Option<String>) {
+    let cass_origin = metadata.get("cass").and_then(|cass| cass.get("origin"));
+    let source_id = cass_origin
+        .and_then(|origin| origin.get("source_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(LOCAL_SOURCE_ID)
+        .to_string();
+    let origin_kind = cass_origin
+        .and_then(|origin| origin.get("kind"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(if source_id == LOCAL_SOURCE_ID {
+            "local"
+        } else {
+            "ssh"
+        })
+        .to_string();
+    let origin_host = cass_origin
+        .and_then(|origin| origin.get("host"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    (source_id, origin_kind, origin_host)
+}
+
+fn attach_raw_mirror_metadata(
+    conv: &mut NormalizedConversation,
+    record: &crate::raw_mirror::RawMirrorCaptureRecord,
+) {
+    if !conv.metadata.is_object() {
+        conv.metadata = serde_json::json!({});
+    }
+    let Some(metadata) = conv.metadata.as_object_mut() else {
+        return;
+    };
+    let cass = metadata
+        .entry("cass".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !cass.is_object() {
+        *cass = serde_json::json!({});
+    }
+    let Some(cass_obj) = cass.as_object_mut() else {
+        return;
+    };
+    cass_obj.insert(
+        "raw_mirror".to_string(),
+        serde_json::json!({
+            "schema_version": 1,
+            "manifest_id": record.manifest_id,
+            "manifest_relative_path": record.manifest_relative_path,
+            "blob_relative_path": record.blob_relative_path,
+            "blob_blake3": record.blob_blake3,
+            "blob_size_bytes": record.blob_size_bytes,
+            "captured_at_ms": record.captured_at_ms,
+            "source_mtime_ms": record.source_mtime_ms,
+        }),
+    );
 }
 
 fn compact_large_connector_extras(connector_name: &str, conv: &mut NormalizedConversation) {
@@ -20334,6 +20519,111 @@ mod tests {
     use fsqlite_types::value::SqliteValue;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    #[test]
+    fn raw_mirror_capture_attaches_conversation_metadata_before_persist() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("rollout-test.jsonl");
+        let source_bytes = b"{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}\n";
+        std::fs::write(&source_path, source_bytes).expect("write source");
+
+        let mut conv = NormalizedConversation {
+            agent_slug: "codex".to_string(),
+            external_id: Some("raw-mirror-metadata".to_string()),
+            title: Some("Raw mirror metadata".to_string()),
+            workspace: None,
+            source_path: source_path.clone(),
+            started_at: Some(1_733_000_000_000),
+            ended_at: Some(1_733_000_000_100),
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".to_string(),
+                author: None,
+                created_at: Some(1_733_000_000_000),
+                content: "hello".to_string(),
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        inject_provenance(&mut conv, &Origin::local());
+
+        attach_raw_mirror_capture(&data_dir, &mut conv);
+
+        let raw_mirror = &conv.metadata["cass"]["raw_mirror"];
+        let manifest_id = raw_mirror["manifest_id"]
+            .as_str()
+            .expect("manifest id metadata");
+        assert!(manifest_id.starts_with("doctor-raw-mirror-manifest-id-v1-"));
+        assert_eq!(
+            raw_mirror["blob_size_bytes"].as_u64(),
+            Some(source_bytes.len() as u64)
+        );
+        let manifest_relative = raw_mirror["manifest_relative_path"]
+            .as_str()
+            .expect("manifest relative path");
+        let blob_relative = raw_mirror["blob_relative_path"]
+            .as_str()
+            .expect("blob relative path");
+        assert!(
+            data_dir
+                .join("raw-mirror/v1")
+                .join(manifest_relative)
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(data_dir.join("raw-mirror/v1").join(blob_relative))
+                .expect("raw mirror blob"),
+            source_bytes
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(data_dir.join("raw-mirror/v1").join(manifest_relative))
+                .expect("raw mirror manifest"),
+        )
+        .expect("manifest json");
+        assert_eq!(manifest["db_links"][0]["message_count"].as_u64(), Some(1));
+        assert_eq!(
+            manifest["db_links"][0]["started_at_ms"].as_i64(),
+            Some(1_733_000_000_000)
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source bytes"),
+            source_bytes
+        );
+    }
+
+    #[test]
+    fn raw_mirror_capture_handles_explicit_file_root_after_parse_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("parse-failure-candidate.jsonl");
+        std::fs::write(&source_path, b"{not valid connector json\n").expect("write source");
+        let root = ScanRoot::local(source_path.clone());
+
+        capture_scan_root_file_after_parse_failure(&data_dir, "codex", &root);
+
+        let manifest_root = data_dir.join("raw-mirror/v1/manifests");
+        let manifests = std::fs::read_dir(&manifest_root)
+            .expect("manifest dir")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("manifest entries");
+        assert_eq!(manifests.len(), 1);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(manifests[0].path()).expect("manifest bytes"))
+                .expect("manifest json");
+        assert_eq!(manifest["provider"].as_str(), Some("codex"));
+        assert_eq!(manifest["source_id"].as_str(), Some("local"));
+        assert_eq!(
+            manifest["verification"]["status"].as_str(),
+            Some("captured")
+        );
+        assert_eq!(
+            std::fs::read(&source_path).expect("source remains untouched"),
+            b"{not valid connector json\n"
+        );
+    }
 
     /// Regression for issue #203: the direct `cass index --semantic`
     /// path must classify embedder ids onto the right manifest tier so

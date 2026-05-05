@@ -19,6 +19,7 @@ pub mod pages;
 pub mod perf_evidence;
 pub mod policy_registry;
 pub mod query_cost_planner;
+pub(crate) mod raw_mirror;
 pub mod search;
 pub mod sources;
 pub mod storage;
@@ -16539,10 +16540,12 @@ fn doctor_verify_raw_mirror_manifest(
 
 fn doctor_raw_mirror_count_interrupted_captures(root: &Path) -> usize {
     let tmp_dir = root.join("tmp");
-    std::fs::read_dir(tmp_dir)
-        .ok()
+    walkdir::WalkDir::new(tmp_dir)
+        .min_depth(1)
+        .follow_links(false)
         .into_iter()
-        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file() || entry.file_type().is_symlink())
         .count()
 }
 
@@ -26161,6 +26164,26 @@ mod doctor_asset_taxonomy_tests {
             layout
                 .case_insensitive_collision_behavior
                 .contains("path identity is hashed")
+        );
+    }
+
+    #[test]
+    fn raw_mirror_interrupted_capture_count_ignores_empty_temp_dirs() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let tmp_root = doctor_raw_mirror_root(&data_dir).join("tmp");
+        std::fs::create_dir_all(tmp_root.join("capture.empty")).expect("create empty temp dir");
+
+        assert_eq!(
+            doctor_raw_mirror_count_interrupted_captures(&doctor_raw_mirror_root(&data_dir)),
+            0
+        );
+
+        std::fs::write(tmp_root.join("capture.failed.tmp"), b"partial")
+            .expect("write interrupted temp file");
+        assert_eq!(
+            doctor_raw_mirror_count_interrupted_captures(&doctor_raw_mirror_root(&data_dir)),
+            1
         );
     }
 

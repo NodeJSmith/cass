@@ -138,7 +138,8 @@ fn cass_cmd(test_home: &Path) -> Command {
         .env("CASS_IGNORE_SOURCES_CONFIG", "1")
         .env("XDG_DATA_HOME", test_home)
         .env("XDG_CONFIG_HOME", test_home)
-        .env("HOME", test_home);
+        .env("HOME", test_home)
+        .current_dir(test_home);
     cmd
 }
 
