@@ -45,6 +45,17 @@ schemas: (auto-generated from contract)
       - approval_requirement: string
       - mode: string
       - operation_finished_at_ms: ?
+      - operation_outcome: object
+        - action_not_taken: string
+        - action_taken: string
+        - artifact_manifest_path: ?
+        - data_loss_risk: string
+        - exit_code_kind: string
+        - kind: string
+        - next_command: ?
+        - reason: string
+        - requires_override: boolean
+        - safe_to_retry: boolean
       - operation_started_at_ms: ?
       - outcome_kind: string
       - plan: object
@@ -110,6 +121,17 @@ schemas: (auto-generated from contract)
     - issues_fixed: integer
     - issues_found: integer
     - needs_rebuild: boolean
+    - operation_outcome: object
+      - action_not_taken: string
+      - action_taken: string
+      - artifact_manifest_path: ?
+      - data_loss_risk: string
+      - exit_code_kind: string
+      - kind: string
+      - next_command: ?
+      - reason: string
+      - requires_override: boolean
+      - safe_to_retry: boolean
     - quarantine: object
     - raw_mirror: object
       - exists: boolean

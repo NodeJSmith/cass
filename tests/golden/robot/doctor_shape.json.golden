@@ -43,6 +43,41 @@
         "type": "unknown"
       }
     },
+    "operation_outcome": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "action_taken": {
+          "type": "string"
+        },
+        "action_not_taken": {
+          "type": "string"
+        },
+        "safe_to_retry": {
+          "type": "boolean"
+        },
+        "requires_override": {
+          "type": "boolean"
+        },
+        "data_loss_risk": {
+          "type": "string"
+        },
+        "next_command": {
+          "type": "string"
+        },
+        "artifact_manifest_path": {
+          "type": "null"
+        },
+        "exit_code_kind": {
+          "type": "string"
+        }
+      }
+    },
     "asset_taxonomy": {
       "type": "array",
       "items": {
@@ -279,6 +314,50 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "operation_outcome_kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "operation_outcome_contract": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "action_taken": {
+                "type": "string"
+              },
+              "action_not_taken": {
+                "type": "string"
+              },
+              "safe_to_retry": {
+                "type": "boolean"
+              },
+              "requires_override": {
+                "type": "boolean"
+              },
+              "data_loss_risk": {
+                "type": "string"
+              },
+              "next_command": {
+                "type": "null"
+              },
+              "artifact_manifest_path": {
+                "type": "null"
+              },
+              "exit_code_kind": {
+                "type": "string"
+              }
+            }
           }
         },
         "retry_safety_kinds": {

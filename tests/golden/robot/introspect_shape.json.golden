@@ -569,6 +569,123 @@
                     }
                   }
                 },
+                "operation_outcome": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string"
+                    },
+                    "description": {
+                      "type": "string"
+                    },
+                    "properties": {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "reason": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "action_taken": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "action_not_taken": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "safe_to_retry": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "requires_override": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "data_loss_risk": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        },
+                        "next_command": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "artifact_manifest_path": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "exit_code_kind": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "required": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                },
                 "asset_taxonomy": {
                   "type": "object",
                   "properties": {
@@ -1704,6 +1821,123 @@
                           "properties": {
                             "type": {
                               "type": "string"
+                            }
+                          }
+                        },
+                        "operation_outcome": {
+                          "type": "object",
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "description": {
+                              "type": "string"
+                            },
+                            "properties": {
+                              "type": "object",
+                              "properties": {
+                                "kind": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "reason": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "action_taken": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "action_not_taken": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "safe_to_retry": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "requires_override": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "data_loss_risk": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                },
+                                "next_command": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "artifact_manifest_path": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "string"
+                                      }
+                                    }
+                                  }
+                                },
+                                "exit_code_kind": {
+                                  "type": "object",
+                                  "properties": {
+                                    "type": {
+                                      "type": "string"
+                                    },
+                                    "description": {
+                                      "type": "string"
+                                    }
+                                  }
+                                }
+                              }
+                            },
+                            "required": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
                             }
                           }
                         },

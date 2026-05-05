@@ -7,3 +7,4 @@ exit-codes:
        kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,
        ambiguous-source, timeout, config, lock-busy, network, model, download, io).
        Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.
+       For doctor JSON, prefer `operation_outcome.kind` and `operation_outcome.exit_code_kind` for no-op/partial/blocked/refused/incomplete repair decisions.

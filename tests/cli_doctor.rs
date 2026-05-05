@@ -525,6 +525,22 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
         Some(true)
     );
     assert_eq!(repair_contract["fail_closed"].as_bool(), Some(true));
+    let operation_outcome = &payload["operation_outcome"];
+    assert_eq!(
+        operation_outcome["kind"].as_str(),
+        Some("ok-read-only-diagnosed")
+    );
+    assert_eq!(
+        operation_outcome["exit_code_kind"].as_str(),
+        Some("health-failure")
+    );
+    assert!(
+        operation_outcome["action_not_taken"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--fix"),
+        "read-only doctor outcome should explain that repair was not attempted"
+    );
     let plan_receipt_schema = &repair_contract["plan_receipt_schema"];
     assert_eq!(plan_receipt_schema["plan_schema_version"].as_u64(), Some(1));
     assert!(
@@ -576,6 +592,54 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
     let mode_policies = repair_contract["mode_policies"]
         .as_array()
         .expect("doctor repair mode policy table");
+    let operation_outcome_kinds = repair_contract["operation_outcome_kinds"]
+        .as_array()
+        .expect("doctor operation outcome kind list");
+    for kind in [
+        "ok-no-action-needed",
+        "ok-read-only-diagnosed",
+        "fixed",
+        "partially-fixed",
+        "repair-blocked",
+        "repair-refused",
+        "repair-incomplete",
+        "verification-failed",
+        "cleanup-dry-run-only",
+        "cleanup-refused",
+        "auto-run-skipped",
+        "support-bundle-only",
+        "baseline-diff-only",
+        "requires-manual-review",
+    ] {
+        assert!(
+            operation_outcome_kinds
+                .iter()
+                .any(|entry| entry.as_str() == Some(kind)),
+            "doctor operation outcome kind list missing {kind}"
+        );
+    }
+    let operation_contract = repair_contract["operation_outcome_contract"]
+        .as_array()
+        .expect("doctor operation outcome contract");
+    assert!(
+        operation_contract.iter().any(|entry| {
+            entry["kind"].as_str() == Some("cleanup-refused")
+                && entry["action_not_taken"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("no cleanup target")
+                && entry["exit_code_kind"].as_str() == Some("repair-failure")
+        }),
+        "cleanup-refused outcome must be branchable without prose parsing"
+    );
+    assert!(
+        operation_contract.iter().any(|entry| {
+            entry["kind"].as_str() == Some("repair-refused")
+                && entry["requires_override"].as_bool() == Some(true)
+                && entry["data_loss_risk"].as_str() == Some("high")
+        }),
+        "repair-refused outcome should fail closed and advertise high risk"
+    );
     assert!(
         mode_policies.iter().any(|policy| {
             policy["mode"].as_str() == Some("cleanup_apply")
@@ -1218,6 +1282,15 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
         payload["issues_fixed"].as_u64().unwrap_or(0) >= 1,
         "doctor should count derivative cleanup as a fixed issue"
     );
+    assert_eq!(
+        payload["operation_outcome"]["kind"].as_str(),
+        Some("fixed"),
+        "top-level doctor outcome should report fixed when cleanup apply completes"
+    );
+    assert_eq!(
+        payload["operation_outcome"]["exit_code_kind"].as_str(),
+        Some("success")
+    );
     let derivative_cleanup = payload["checks"]
         .as_array()
         .expect("doctor checks")
@@ -1234,6 +1307,11 @@ fn doctor_fix_prunes_safe_derivative_cleanup_candidates() {
         Some("approval_fingerprint")
     );
     assert_eq!(cleanup["outcome_kind"].as_str(), Some("applied"));
+    assert_eq!(cleanup["operation_outcome"]["kind"].as_str(), Some("fixed"));
+    assert_eq!(
+        cleanup["operation_outcome"]["artifact_manifest_path"].as_str(),
+        Some("cleanup_apply.receipt.artifact_manifest")
+    );
     assert_eq!(cleanup["retry_safety"].as_str(), Some("safe_to_retry"));
     assert_eq!(cleanup["requested"].as_bool(), Some(true));
     assert_eq!(cleanup["applied"].as_bool(), Some(true));

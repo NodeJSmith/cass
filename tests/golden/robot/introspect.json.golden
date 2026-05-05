@@ -2388,6 +2388,63 @@
             "type": "string"
           }
         },
+        "operation_outcome": {
+          "type": "object",
+          "description": "Stable doctor operation outcome. Robots should branch on kind before consulting prose fields.",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "description": "Stable kebab-case outcome kind such as ok-no-action-needed, ok-read-only-diagnosed, fixed, partially-fixed, repair-blocked, repair-refused, repair-incomplete, verification-failed, cleanup-dry-run-only, cleanup-refused, auto-run-skipped, support-bundle-only, baseline-diff-only, or requires-manual-review."
+            },
+            "reason": {
+              "type": "string"
+            },
+            "action_taken": {
+              "type": "string"
+            },
+            "action_not_taken": {
+              "type": "string"
+            },
+            "safe_to_retry": {
+              "type": "boolean"
+            },
+            "requires_override": {
+              "type": "boolean"
+            },
+            "data_loss_risk": {
+              "type": "string",
+              "description": "none | low | medium | high | unknown"
+            },
+            "next_command": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "artifact_manifest_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "exit_code_kind": {
+              "type": "string",
+              "description": "success | health-failure | usage-error | lock-busy | repair-failure"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "action_taken",
+            "action_not_taken",
+            "safe_to_retry",
+            "requires_override",
+            "data_loss_risk",
+            "next_command",
+            "artifact_manifest_path",
+            "exit_code_kind"
+          ]
+        },
         "asset_taxonomy": {
           "type": "array",
           "items": {
@@ -2843,6 +2900,63 @@
             },
             "outcome_kind": {
               "type": "string"
+            },
+            "operation_outcome": {
+              "type": "object",
+              "description": "Stable doctor operation outcome. Robots should branch on kind before consulting prose fields.",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "description": "Stable kebab-case outcome kind such as ok-no-action-needed, ok-read-only-diagnosed, fixed, partially-fixed, repair-blocked, repair-refused, repair-incomplete, verification-failed, cleanup-dry-run-only, cleanup-refused, auto-run-skipped, support-bundle-only, baseline-diff-only, or requires-manual-review."
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "action_taken": {
+                  "type": "string"
+                },
+                "action_not_taken": {
+                  "type": "string"
+                },
+                "safe_to_retry": {
+                  "type": "boolean"
+                },
+                "requires_override": {
+                  "type": "boolean"
+                },
+                "data_loss_risk": {
+                  "type": "string",
+                  "description": "none | low | medium | high | unknown"
+                },
+                "next_command": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "artifact_manifest_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "exit_code_kind": {
+                  "type": "string",
+                  "description": "success | health-failure | usage-error | lock-busy | repair-failure"
+                }
+              },
+              "required": [
+                "kind",
+                "reason",
+                "action_taken",
+                "action_not_taken",
+                "safe_to_retry",
+                "requires_override",
+                "data_loss_risk",
+                "next_command",
+                "artifact_manifest_path",
+                "exit_code_kind"
+              ]
             },
             "retry_safety": {
               "type": "string"
@@ -3891,6 +4005,7 @@
         "health_class",
         "healthy",
         "initialized",
+        "operation_outcome",
         "checks"
       ]
     },

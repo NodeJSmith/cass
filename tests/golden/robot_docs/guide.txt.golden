@@ -5,6 +5,7 @@ guide:
   Search contract: SQLite is source of truth; lexical is the required self-healing fast path; semantic is opportunistic enrichment.
   Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.
   Readiness: cass health/status JSON recommended_action is authoritative; lexical-only fallback can be normal while semantic assets catch up.
+  Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.
   Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure
   Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions
   TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior

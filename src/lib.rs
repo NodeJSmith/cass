@@ -7385,6 +7385,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "  Search contract: SQLite is source of truth; lexical is the required self-healing fast path; semantic is opportunistic enrichment.".to_string(),
             "  Default search: hybrid-preferred. With --robot-meta, inspect requested_search_mode, search_mode, semantic_refinement, fallback_tier, and fallback_reason.".to_string(),
             "  Readiness: cass health/status JSON recommended_action is authoritative; lexical-only fallback can be normal while semantic assets catch up.".to_string(),
+            "  Doctor outcomes: branch on doctor.operation_outcome.kind (kebab-case) before prose; exit_code_kind says whether the outcome is success, health-failure, usage-error, lock-busy, or repair-failure.".to_string(),
             "  Args: accepts --robot-docs=topic and misplaced globals; detailed errors with examples on parse failure".to_string(),
             "  Source control: use `cass robot-docs sources` for remote sync/setup plus persistent agent-harness exclusions".to_string(),
             "  TUI drill-in contract: Enter on selected hit opens detail modal (Messages tab); Enter with no selected hit falls back to query submit behavior".to_string(),
@@ -7403,6 +7404,7 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             "       kebab-case (e.g. missing-index, missing-db, semantic-unavailable, embedder-unavailable,".to_string(),
             "       ambiguous-source, timeout, config, lock-busy, network, model, download, io).".to_string(),
             "       Agents should branch on `err.kind`, not on numeric code, when handling codes >= 10.".to_string(),
+            "       For doctor JSON, prefer `operation_outcome.kind` and `operation_outcome.exit_code_kind` for no-op/partial/blocked/refused/incomplete repair decisions.".to_string(),
         ],
         RobotTopic::Examples => vec![
             "examples:".to_string(),
@@ -12720,6 +12722,121 @@ fn doctor_health_class_for_checks(checks: &[DoctorCheckReport]) -> DoctorHealth 
     DoctorHealth::Healthy
 }
 
+fn doctor_data_loss_risk_rank(risk: DoctorDataLossRisk) -> u8 {
+    match risk {
+        DoctorDataLossRisk::None => 0,
+        DoctorDataLossRisk::Low => 1,
+        DoctorDataLossRisk::Medium => 2,
+        DoctorDataLossRisk::High => 3,
+        DoctorDataLossRisk::Unknown => 4,
+    }
+}
+
+fn doctor_highest_data_loss_risk(checks: &[DoctorCheckReport]) -> DoctorDataLossRisk {
+    checks
+        .iter()
+        .map(|check| check.data_loss_risk)
+        .max_by_key(|risk| doctor_data_loss_risk_rank(*risk))
+        .unwrap_or(DoctorDataLossRisk::None)
+}
+
+fn doctor_top_level_operation_outcome(
+    checks: &[DoctorCheckReport],
+    fix_requested: bool,
+    issues_found: usize,
+    issues_fixed: usize,
+    not_initialized: bool,
+    cleanup_apply_result: Option<&DiagCleanupApplyResult>,
+) -> DoctorOperationOutcomeReport {
+    if let Some(result) = cleanup_apply_result {
+        return result.operation_outcome.clone();
+    }
+
+    let data_loss_risk = doctor_highest_data_loss_risk(checks);
+    if fix_requested && issues_fixed > 0 {
+        let (kind, reason, action_taken, action_not_taken) = if issues_found == 0 {
+            (
+                DoctorOperationOutcomeKind::Fixed,
+                format!("doctor fixed {issues_fixed} issue(s)"),
+                "applied every safe repair that was selected".to_string(),
+                "no selected safe repair remained blocked".to_string(),
+            )
+        } else {
+            (
+                DoctorOperationOutcomeKind::PartiallyFixed,
+                format!(
+                    "doctor fixed {issues_fixed} issue(s) and left {issues_found} issue(s) for review"
+                ),
+                "applied the safe repairs that passed all gates".to_string(),
+                "left remaining blocked or unsafe issues for operator review".to_string(),
+            )
+        };
+        return doctor_operation_outcome_with_details(
+            kind,
+            reason,
+            action_taken,
+            action_not_taken,
+            data_loss_risk,
+            Some("cass doctor --json".to_string()),
+            None,
+        );
+    }
+
+    if issues_found == 0 {
+        return doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::OkNoActionNeeded,
+            "all doctor checks passed".to_string(),
+            "completed diagnostic checks".to_string(),
+            "no repair or cleanup was needed".to_string(),
+            DoctorDataLossRisk::None,
+            None,
+            None,
+        );
+    }
+
+    if !fix_requested {
+        let next_command = if not_initialized {
+            Some("cass index --full".to_string())
+        } else {
+            Some("cass doctor --fix --json".to_string())
+        };
+        return doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::OkReadOnlyDiagnosed,
+            format!("doctor diagnosed {issues_found} issue(s) in read-only mode"),
+            "completed diagnostic checks without mutation".to_string(),
+            "no repair was attempted because --fix was not requested".to_string(),
+            data_loss_risk,
+            next_command,
+            None,
+        );
+    }
+
+    if checks
+        .iter()
+        .any(|check| check.anomaly_class == DoctorAnomaly::RepairPreviouslyFailed)
+    {
+        return doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::VerificationFailed,
+            "previous repair verification failed and must be inspected first".to_string(),
+            "refused automatic repeat repair".to_string(),
+            "no repair was applied without reviewing the prior failure marker".to_string(),
+            data_loss_risk,
+            Some("cass doctor --json".to_string()),
+            None,
+        );
+    }
+
+    doctor_operation_outcome_with_details(
+        DoctorOperationOutcomeKind::AutoRunSkipped,
+        format!("doctor found {issues_found} issue(s), but none were eligible for safe auto-run"),
+        "evaluated automatic repair eligibility".to_string(),
+        "no repair was applied automatically".to_string(),
+        data_loss_risk,
+        Some("cass doctor --json".to_string()),
+        None,
+    )
+}
+
 #[cfg(test)]
 const DOCTOR_ASSET_ALL_OPERATIONS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Read,
@@ -14096,6 +14213,123 @@ fn doctor_repair_mode_policy_report() -> Vec<DoctorRepairModePolicyReport> {
         .collect()
 }
 
+fn doctor_operation_outcome_policy(
+    kind: DoctorOperationOutcomeKind,
+) -> &'static DoctorOperationOutcomePolicy {
+    DOCTOR_OPERATION_OUTCOME_POLICY_TABLE
+        .iter()
+        .find(|policy| policy.kind == kind)
+        .expect("doctor operation outcome policy table must cover every kind")
+}
+
+fn doctor_operation_outcome_contract_report() -> Vec<DoctorOperationOutcomePolicyReport> {
+    DOCTOR_OPERATION_OUTCOME_POLICY_TABLE
+        .iter()
+        .map(|policy| DoctorOperationOutcomePolicyReport {
+            kind: policy.kind,
+            reason: policy.reason,
+            action_taken: policy.action_taken,
+            action_not_taken: policy.action_not_taken,
+            safe_to_retry: policy.safe_to_retry,
+            requires_override: policy.requires_override,
+            data_loss_risk: policy.data_loss_risk,
+            next_command: policy.next_command,
+            artifact_manifest_path: policy.artifact_manifest_path,
+            exit_code_kind: policy.exit_code_kind,
+        })
+        .collect()
+}
+
+fn doctor_operation_outcome_from_policy(
+    kind: DoctorOperationOutcomeKind,
+) -> DoctorOperationOutcomeReport {
+    let policy = doctor_operation_outcome_policy(kind);
+    DoctorOperationOutcomeReport {
+        kind,
+        reason: policy.reason.to_string(),
+        action_taken: policy.action_taken.to_string(),
+        action_not_taken: policy.action_not_taken.to_string(),
+        safe_to_retry: policy.safe_to_retry,
+        requires_override: policy.requires_override,
+        data_loss_risk: policy.data_loss_risk,
+        next_command: policy.next_command.map(str::to_string),
+        artifact_manifest_path: policy.artifact_manifest_path.map(str::to_string),
+        exit_code_kind: policy.exit_code_kind,
+    }
+}
+
+fn doctor_operation_outcome_with_details(
+    kind: DoctorOperationOutcomeKind,
+    reason: String,
+    action_taken: String,
+    action_not_taken: String,
+    data_loss_risk: DoctorDataLossRisk,
+    next_command: Option<String>,
+    artifact_manifest_path: Option<String>,
+) -> DoctorOperationOutcomeReport {
+    let mut report = doctor_operation_outcome_from_policy(kind);
+    report.reason = reason;
+    report.action_taken = action_taken;
+    report.action_not_taken = action_not_taken;
+    report.data_loss_risk = data_loss_risk;
+    report.next_command = next_command;
+    report.artifact_manifest_path = artifact_manifest_path;
+    report
+}
+
+fn doctor_operation_outcome_kind_label(kind: DoctorOperationOutcomeKind) -> &'static str {
+    match kind {
+        DoctorOperationOutcomeKind::OkNoActionNeeded => "ok-no-action-needed",
+        DoctorOperationOutcomeKind::OkReadOnlyDiagnosed => "ok-read-only-diagnosed",
+        DoctorOperationOutcomeKind::Fixed => "fixed",
+        DoctorOperationOutcomeKind::PartiallyFixed => "partially-fixed",
+        DoctorOperationOutcomeKind::RepairBlocked => "repair-blocked",
+        DoctorOperationOutcomeKind::RepairRefused => "repair-refused",
+        DoctorOperationOutcomeKind::RepairIncomplete => "repair-incomplete",
+        DoctorOperationOutcomeKind::VerificationFailed => "verification-failed",
+        DoctorOperationOutcomeKind::CleanupDryRunOnly => "cleanup-dry-run-only",
+        DoctorOperationOutcomeKind::CleanupRefused => "cleanup-refused",
+        DoctorOperationOutcomeKind::AutoRunSkipped => "auto-run-skipped",
+        DoctorOperationOutcomeKind::SupportBundleOnly => "support-bundle-only",
+        DoctorOperationOutcomeKind::BaselineDiffOnly => "baseline-diff-only",
+        DoctorOperationOutcomeKind::RequiresManualReview => "requires-manual-review",
+    }
+}
+
+fn doctor_data_loss_risk_label(risk: DoctorDataLossRisk) -> &'static str {
+    match risk {
+        DoctorDataLossRisk::None => "none",
+        DoctorDataLossRisk::Low => "low",
+        DoctorDataLossRisk::Medium => "medium",
+        DoctorDataLossRisk::High => "high",
+        DoctorDataLossRisk::Unknown => "unknown",
+    }
+}
+
+fn print_doctor_operation_outcome_human(outcome: &DoctorOperationOutcomeReport) {
+    use colored::Colorize;
+
+    println!();
+    println!("{}", "Operation outcome:".bold());
+    println!(
+        "  kind: {}",
+        doctor_operation_outcome_kind_label(outcome.kind).bold()
+    );
+    println!("  reason: {}", outcome.reason);
+    println!("  action_taken: {}", outcome.action_taken);
+    println!("  action_not_taken: {}", outcome.action_not_taken);
+    println!(
+        "  data_loss_risk: {}",
+        doctor_data_loss_risk_label(outcome.data_loss_risk)
+    );
+    if let Some(next_command) = &outcome.next_command {
+        println!("  next_command: {next_command}");
+    }
+    if let Some(artifact_manifest_path) = &outcome.artifact_manifest_path {
+        println!("  artifact_manifest_path: {artifact_manifest_path}");
+    }
+}
+
 fn doctor_plan_receipt_schema_report() -> DoctorPlanReceiptSchemaReport {
     DoctorPlanReceiptSchemaReport {
         plan_schema_version: 1,
@@ -14293,6 +14527,8 @@ fn doctor_repair_contract_report() -> DoctorRepairContractReport {
         verification_contract: doctor_verification_contract_report(),
         approval_requirements: DOCTOR_REPAIR_APPROVAL_REQUIREMENT_VOCABULARY.to_vec(),
         outcome_kinds: DOCTOR_REPAIR_OUTCOME_KIND_VOCABULARY.to_vec(),
+        operation_outcome_kinds: DOCTOR_OPERATION_OUTCOME_KIND_VOCABULARY.to_vec(),
+        operation_outcome_contract: doctor_operation_outcome_contract_report(),
         retry_safety_kinds: DOCTOR_REPAIR_RETRY_SAFETY_VOCABULARY.to_vec(),
         mode_policies: doctor_repair_mode_policy_report(),
         legacy_aliases: vec![
@@ -16111,6 +16347,71 @@ fn cleanup_apply_retry_safety(result: &DiagCleanupApplyResult) -> DoctorRepairRe
     }
 }
 
+fn cleanup_apply_operation_outcome(
+    result: &DiagCleanupApplyResult,
+) -> DoctorOperationOutcomeReport {
+    match result.outcome_kind {
+        DoctorRepairOutcomeKind::Applied => doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::Fixed,
+            format!(
+                "cleanup applied {} derived artifact action(s) and reclaimed {} byte(s)",
+                result.pruned_asset_count, result.reclaimed_bytes
+            ),
+            "pruned only derived reclaimable cleanup targets".to_string(),
+            "no planned safe cleanup action remained blocked".to_string(),
+            DoctorDataLossRisk::None,
+            Some("cass doctor --json".to_string()),
+            Some("cleanup_apply.receipt.artifact_manifest".to_string()),
+        ),
+        DoctorRepairOutcomeKind::Partial => doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::PartiallyFixed,
+            format!(
+                "cleanup applied {} action(s) but left {} skipped/blocking condition(s)",
+                result.pruned_asset_count,
+                result.skipped_asset_count + result.blocked_reasons.len()
+            ),
+            "applied the cleanup actions that passed safety gates".to_string(),
+            "left skipped or blocked cleanup actions for review".to_string(),
+            DoctorDataLossRisk::Medium,
+            Some("cass diag --json --quarantine".to_string()),
+            Some("cleanup_apply.receipt.artifact_manifest".to_string()),
+        ),
+        DoctorRepairOutcomeKind::Blocked => doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::CleanupRefused,
+            if result.blocked_reasons.is_empty() {
+                "cleanup was refused by a safety gate".to_string()
+            } else {
+                format!("cleanup was refused: {}", result.blocked_reasons.join("; "))
+            },
+            "reported cleanup refusal without pruning".to_string(),
+            "no cleanup target was pruned".to_string(),
+            DoctorDataLossRisk::Medium,
+            Some("cass diag --json --quarantine".to_string()),
+            Some("cleanup_apply.receipt.artifact_manifest".to_string()),
+        ),
+        DoctorRepairOutcomeKind::Failed | DoctorRepairOutcomeKind::Planned => {
+            doctor_operation_outcome_with_details(
+                DoctorOperationOutcomeKind::RepairIncomplete,
+                "cleanup did not produce a verified final outcome".to_string(),
+                "preserved available cleanup plan and receipt evidence".to_string(),
+                "doctor did not claim cleanup success".to_string(),
+                DoctorDataLossRisk::Medium,
+                Some("cass doctor --json".to_string()),
+                Some("cleanup_apply.receipt.artifact_manifest".to_string()),
+            )
+        }
+        DoctorRepairOutcomeKind::NoOp => doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::OkNoActionNeeded,
+            "cleanup found no reclaimable derived artifacts".to_string(),
+            "completed cleanup eligibility check".to_string(),
+            "nothing was pruned because no safe cleanup target was eligible".to_string(),
+            DoctorDataLossRisk::None,
+            Some("cass doctor --json".to_string()),
+            Some("cleanup_apply.receipt.artifact_manifest".to_string()),
+        ),
+    }
+}
+
 fn finalize_cleanup_apply_contract(
     result: &mut DiagCleanupApplyResult,
     data_dir: &Path,
@@ -16121,6 +16422,7 @@ fn finalize_cleanup_apply_contract(
     result.approval_requirement = DoctorApprovalRequirement::ApprovalFingerprint;
     result.outcome_kind = cleanup_apply_outcome_kind(result);
     result.retry_safety = cleanup_apply_retry_safety(result);
+    result.operation_outcome = cleanup_apply_operation_outcome(result);
     result.planned_actions = result.actions.clone();
     if result.operation_finished_at_ms.is_none() {
         result.operation_finished_at_ms = Some(doctor_now_ms());
@@ -16309,6 +16611,7 @@ struct DiagCleanupApplyResult {
     mode: DoctorRepairMode,
     approval_requirement: DoctorApprovalRequirement,
     outcome_kind: DoctorRepairOutcomeKind,
+    operation_outcome: DoctorOperationOutcomeReport,
     retry_safety: DoctorRepairRetrySafety,
     requested: bool,
     applied: bool,
@@ -17291,6 +17594,23 @@ mod doctor_asset_taxonomy_tests {
         DoctorAnomaly::PrivacyRedactionRequired,
     ];
 
+    const ALL_DOCTOR_OPERATION_OUTCOMES: &[DoctorOperationOutcomeKind] = &[
+        DoctorOperationOutcomeKind::OkNoActionNeeded,
+        DoctorOperationOutcomeKind::OkReadOnlyDiagnosed,
+        DoctorOperationOutcomeKind::Fixed,
+        DoctorOperationOutcomeKind::PartiallyFixed,
+        DoctorOperationOutcomeKind::RepairBlocked,
+        DoctorOperationOutcomeKind::RepairRefused,
+        DoctorOperationOutcomeKind::RepairIncomplete,
+        DoctorOperationOutcomeKind::VerificationFailed,
+        DoctorOperationOutcomeKind::CleanupDryRunOnly,
+        DoctorOperationOutcomeKind::CleanupRefused,
+        DoctorOperationOutcomeKind::AutoRunSkipped,
+        DoctorOperationOutcomeKind::SupportBundleOnly,
+        DoctorOperationOutcomeKind::BaselineDiffOnly,
+        DoctorOperationOutcomeKind::RequiresManualReview,
+    ];
+
     #[test]
     fn doctor_asset_taxonomy_explicitly_covers_every_class_and_operation() {
         let policy_classes: HashSet<_> = DOCTOR_ASSET_POLICY_TABLE
@@ -17660,6 +17980,212 @@ mod doctor_asset_taxonomy_tests {
             doctor_health_class_for_checks(&[archive_risk, repair_failed]),
             DoctorHealth::RepairPreviouslyFailed,
             "a previous failed repair should be the top-level state until inspected"
+        );
+    }
+
+    #[test]
+    fn doctor_operation_outcome_contract_covers_every_kind() {
+        let policy_kinds: HashSet<_> = DOCTOR_OPERATION_OUTCOME_POLICY_TABLE
+            .iter()
+            .map(|policy| policy.kind)
+            .collect();
+        let expected_kinds: HashSet<_> = ALL_DOCTOR_OPERATION_OUTCOMES.iter().copied().collect();
+        assert_eq!(
+            policy_kinds, expected_kinds,
+            "every DoctorOperationOutcomeKind needs an explicit policy row"
+        );
+        assert_eq!(
+            DOCTOR_OPERATION_OUTCOME_POLICY_TABLE.len(),
+            expected_kinds.len(),
+            "DoctorOperationOutcome policy table must not contain duplicates"
+        );
+
+        for &kind in ALL_DOCTOR_OPERATION_OUTCOMES {
+            let value = serde_json::to_value(kind).expect("serialize operation outcome kind");
+            let serialized = value
+                .as_str()
+                .expect("DoctorOperationOutcomeKind serializes as a string");
+            assert!(
+                serialized
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == '-'),
+                "{kind:?} must serialize as stable kebab-case, got {serialized:?}"
+            );
+            assert!(
+                !serialized.contains('_'),
+                "{kind:?} must not use snake_case in robot contracts"
+            );
+            let policy = doctor_operation_outcome_policy(kind);
+            assert!(
+                !policy.reason.is_empty()
+                    && !policy.action_taken.is_empty()
+                    && !policy.action_not_taken.is_empty(),
+                "{kind:?} must be self-documenting for humans and robots"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_operation_outcome_report_serializes_branchable_fields() {
+        let report = doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::RepairBlocked,
+            "active doctor lock is still owned by pid 123".to_string(),
+            "recorded lock contention".to_string(),
+            "did not run repair while another owner is active".to_string(),
+            DoctorDataLossRisk::Unknown,
+            Some("cass doctor --json".to_string()),
+            Some("receipt.artifact_manifest".to_string()),
+        );
+        let value = serde_json::to_value(&report).expect("serialize operation outcome");
+        assert_eq!(value["kind"], "repair-blocked");
+        assert_eq!(value["safe_to_retry"], false);
+        assert_eq!(value["requires_override"], false);
+        assert_eq!(value["data_loss_risk"], "unknown");
+        assert_eq!(value["next_command"], "cass doctor --json");
+        assert_eq!(value["artifact_manifest_path"], "receipt.artifact_manifest");
+        assert_eq!(value["exit_code_kind"], "lock-busy");
+        assert!(
+            value["action_not_taken"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not run repair"),
+            "operation outcomes must explain the skipped action"
+        );
+    }
+
+    #[test]
+    fn doctor_top_level_operation_outcome_distinguishes_read_only_and_autorun() {
+        let archive_risk = doctor_check_report(
+            "database",
+            "fail",
+            "Cannot open database: simulated archive issue",
+            false,
+            false,
+        );
+        let read_only = doctor_top_level_operation_outcome(
+            std::slice::from_ref(&archive_risk),
+            false,
+            1,
+            0,
+            false,
+            None,
+        );
+        assert_eq!(
+            read_only.kind,
+            DoctorOperationOutcomeKind::OkReadOnlyDiagnosed
+        );
+        assert_eq!(read_only.data_loss_risk, DoctorDataLossRisk::High);
+        assert_eq!(
+            read_only.next_command.as_deref(),
+            Some("cass doctor --fix --json")
+        );
+
+        let fully_fixed = doctor_top_level_operation_outcome(&[], true, 0, 1, false, None);
+        assert_eq!(fully_fixed.kind, DoctorOperationOutcomeKind::Fixed);
+        assert_eq!(fully_fixed.exit_code_kind, DoctorExitCodeKind::Success);
+        assert_eq!(fully_fixed.data_loss_risk, DoctorDataLossRisk::None);
+
+        let partially_fixed = doctor_top_level_operation_outcome(
+            std::slice::from_ref(&archive_risk),
+            true,
+            1,
+            1,
+            false,
+            None,
+        );
+        assert_eq!(
+            partially_fixed.kind,
+            DoctorOperationOutcomeKind::PartiallyFixed
+        );
+        assert_eq!(
+            partially_fixed.exit_code_kind,
+            DoctorExitCodeKind::RepairFailure
+        );
+        assert_eq!(partially_fixed.data_loss_risk, DoctorDataLossRisk::High);
+
+        let auto_skipped = doctor_top_level_operation_outcome(
+            std::slice::from_ref(&archive_risk),
+            true,
+            1,
+            0,
+            false,
+            None,
+        );
+        assert_eq!(
+            auto_skipped.kind,
+            DoctorOperationOutcomeKind::AutoRunSkipped
+        );
+        assert_eq!(
+            auto_skipped.exit_code_kind,
+            DoctorExitCodeKind::HealthFailure
+        );
+
+        let previous_failure = doctor_check_report(
+            "rebuild",
+            "fail",
+            "Index rebuild failed: verification marker still present",
+            true,
+            false,
+        );
+        let verification_failed =
+            doctor_top_level_operation_outcome(&[previous_failure], true, 1, 0, false, None);
+        assert_eq!(
+            verification_failed.kind,
+            DoctorOperationOutcomeKind::VerificationFailed
+        );
+        assert_eq!(
+            verification_failed.exit_code_kind,
+            DoctorExitCodeKind::RepairFailure
+        );
+    }
+
+    #[test]
+    fn cleanup_apply_operation_outcome_distinguishes_fixed_partial_refused_and_noop() {
+        let applied = DiagCleanupApplyResult {
+            outcome_kind: DoctorRepairOutcomeKind::Applied,
+            pruned_asset_count: 2,
+            reclaimed_bytes: 100,
+            ..DiagCleanupApplyResult::default()
+        };
+        assert_eq!(
+            cleanup_apply_operation_outcome(&applied).kind,
+            DoctorOperationOutcomeKind::Fixed
+        );
+
+        let partial = DiagCleanupApplyResult {
+            outcome_kind: DoctorRepairOutcomeKind::Partial,
+            pruned_asset_count: 1,
+            skipped_asset_count: 1,
+            blocked_reasons: vec!["one generation still requires inspection".to_string()],
+            ..DiagCleanupApplyResult::default()
+        };
+        assert_eq!(
+            cleanup_apply_operation_outcome(&partial).kind,
+            DoctorOperationOutcomeKind::PartiallyFixed
+        );
+
+        let refused = DiagCleanupApplyResult {
+            outcome_kind: DoctorRepairOutcomeKind::Blocked,
+            blocked_reasons: vec!["cleanup target escaped approved root".to_string()],
+            ..DiagCleanupApplyResult::default()
+        };
+        let refused_report = cleanup_apply_operation_outcome(&refused);
+        assert_eq!(
+            refused_report.kind,
+            DoctorOperationOutcomeKind::CleanupRefused
+        );
+        assert_eq!(
+            refused_report.exit_code_kind,
+            DoctorExitCodeKind::RepairFailure
+        );
+
+        let noop = DiagCleanupApplyResult {
+            outcome_kind: DoctorRepairOutcomeKind::NoOp,
+            ..DiagCleanupApplyResult::default()
+        };
+        assert_eq!(
+            cleanup_apply_operation_outcome(&noop).kind,
+            DoctorOperationOutcomeKind::OkNoActionNeeded
         );
     }
 
@@ -22541,6 +23067,14 @@ fn run_doctor(
         })
         .collect();
     let health_class = doctor_health_class_for_checks(&check_reports);
+    let operation_outcome = doctor_top_level_operation_outcome(
+        &check_reports,
+        fix,
+        issues_found,
+        issues_fixed,
+        not_initialized,
+        cleanup_apply_result.as_ref(),
+    );
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let all_pass = checks.iter().all(|c| c.status == "pass");
@@ -22578,6 +23112,7 @@ fn run_doctor(
             "needs_rebuild": needs_rebuild,
             "auto_fix_applied": auto_fix_applied,
             "auto_fix_actions": auto_fix_actions,
+            "operation_outcome": operation_outcome,
             "asset_taxonomy": doctor_asset_taxonomy_report(),
             "anomaly_taxonomy": doctor_anomaly_taxonomy_report(),
             "repair_contract": doctor_repair_contract_report(),
@@ -22669,6 +23204,7 @@ fn run_doctor(
                 println!("{}", "Note: Your source session files are SAFE. Only derived data (index/db) will be rebuilt.".dimmed());
             }
         }
+        print_doctor_operation_outcome_human(&operation_outcome);
     }
 
     if fail_count == 0 {
@@ -24775,6 +25311,26 @@ fn response_schema_doctor_receipt() -> serde_json::Value {
     })
 }
 
+fn response_schema_doctor_operation_outcome() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Stable doctor operation outcome. Robots should branch on kind before consulting prose fields.",
+        "properties": {
+            "kind": { "type": "string", "description": "Stable kebab-case outcome kind such as ok-no-action-needed, ok-read-only-diagnosed, fixed, partially-fixed, repair-blocked, repair-refused, repair-incomplete, verification-failed, cleanup-dry-run-only, cleanup-refused, auto-run-skipped, support-bundle-only, baseline-diff-only, or requires-manual-review." },
+            "reason": { "type": "string" },
+            "action_taken": { "type": "string" },
+            "action_not_taken": { "type": "string" },
+            "safe_to_retry": { "type": "boolean" },
+            "requires_override": { "type": "boolean" },
+            "data_loss_risk": { "type": "string", "description": "none | low | medium | high | unknown" },
+            "next_command": { "type": ["string", "null"] },
+            "artifact_manifest_path": { "type": ["string", "null"] },
+            "exit_code_kind": { "type": "string", "description": "success | health-failure | usage-error | lock-busy | repair-failure" }
+        },
+        "required": ["kind", "reason", "action_taken", "action_not_taken", "safe_to_retry", "requires_override", "data_loss_risk", "next_command", "artifact_manifest_path", "exit_code_kind"]
+    })
+}
+
 fn response_schema_doctor_cleanup_apply() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -24782,6 +25338,7 @@ fn response_schema_doctor_cleanup_apply() -> serde_json::Value {
             "mode": { "type": "string" },
             "approval_requirement": { "type": "string" },
             "outcome_kind": { "type": "string" },
+            "operation_outcome": response_schema_doctor_operation_outcome(),
             "retry_safety": { "type": "string" },
             "approval_fingerprint": { "type": "string" },
             "operation_started_at_ms": { "type": ["integer", "null"] },
@@ -25882,6 +26439,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "needs_rebuild": { "type": "boolean" },
                 "auto_fix_applied": { "type": "boolean" },
                 "auto_fix_actions": { "type": "array", "items": { "type": "string" } },
+                "operation_outcome": response_schema_doctor_operation_outcome(),
                 "asset_taxonomy": response_schema_opaque_object_array(),
                 "anomaly_taxonomy": response_schema_opaque_object_array(),
                 "repair_contract": response_schema_opaque_object(),
@@ -25913,7 +26471,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     }
                 }
             },
-            "required": ["status", "health_class", "healthy", "initialized", "checks"]
+            "required": ["status", "health_class", "healthy", "initialized", "operation_outcome", "checks"]
         }),
     );
 
