@@ -1224,6 +1224,16 @@
           ]
         },
         {
+          "name": "allow-repeated-repair",
+          "description": "Permit a mutating repair even when a previous failure marker exists",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2387,6 +2397,135 @@
           "items": {
             "type": "string"
           }
+        },
+        "repair_previously_failed": {
+          "type": "boolean"
+        },
+        "failure_marker_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repeat_refusal_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "override_available": {
+          "type": "boolean"
+        },
+        "override_used": {
+          "type": "boolean"
+        },
+        "repair_failure_marker": {
+          "type": "object",
+          "description": "Durable marker summary for a previous failed mutating doctor repair. Mutating doctor runs refuse the same repair class by default when found=true.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "repair_class": {
+              "type": "string"
+            },
+            "found": {
+              "type": "boolean"
+            },
+            "parse_status": {
+              "type": "string",
+              "description": "absent | ok | corrupt"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "redacted_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "operation_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "plan_fingerprint": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failed_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "failed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "cass_version": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "platform": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "user_data_modified": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "failed_checks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "corrupt_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "schema_version",
+            "repair_class",
+            "found",
+            "parse_status",
+            "path",
+            "redacted_path",
+            "operation_id",
+            "plan_fingerprint",
+            "failed_at_ms",
+            "failed_at",
+            "cass_version",
+            "platform",
+            "user_data_modified",
+            "failed_checks",
+            "corrupt_reason"
+          ]
+        },
+        "failure_marker_write_error": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "operation_outcome": {
           "type": "object",
@@ -4705,6 +4844,12 @@
         "health_class",
         "healthy",
         "initialized",
+        "repair_previously_failed",
+        "failure_marker_path",
+        "repeat_refusal_reason",
+        "override_available",
+        "override_used",
+        "repair_failure_marker",
         "operation_outcome",
         "operation_state",
         "event_log",

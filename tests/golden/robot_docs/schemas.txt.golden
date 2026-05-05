@@ -121,6 +121,8 @@ schemas: (auto-generated from contract)
       - path: ?
       - status: string
     - explanation: ?
+    - failure_marker_path: ?
+    - failure_marker_write_error: ?
     - failures: integer
     - health_class: string
     - healthy: boolean
@@ -155,6 +157,8 @@ schemas: (auto-generated from contract)
       - read_only_check_allowed: boolean
       - schema_version: integer
       - stale_owner_count: integer
+    - override_available: boolean
+    - override_used: boolean
     - quarantine: object
     - raw_mirror: object
       - exists: boolean
@@ -206,6 +210,24 @@ schemas: (auto-generated from contract)
       - warnings: array
     - recommended_action: ?
     - repair_contract: object
+    - repair_failure_marker: object
+      - cass_version: ?
+      - corrupt_reason: ?
+      - failed_at: ?
+      - failed_at_ms: ?
+      - failed_checks: array
+      - found: boolean
+      - operation_id: ?
+      - parse_status: string
+      - path: ?
+      - plan_fingerprint: ?
+      - platform: ?
+      - redacted_path: ?
+      - repair_class: string
+      - schema_version: integer
+      - user_data_modified: ?
+    - repair_previously_failed: boolean
+    - repeat_refusal_reason: ?
     - source_authority: object
       - checksum_evidence: object
         - raw_mirror_checksum_mismatch_count: integer

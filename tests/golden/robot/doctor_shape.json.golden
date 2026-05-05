@@ -43,6 +43,77 @@
         "type": "unknown"
       }
     },
+    "repair_previously_failed": {
+      "type": "boolean"
+    },
+    "failure_marker_path": {
+      "type": "null"
+    },
+    "repeat_refusal_reason": {
+      "type": "null"
+    },
+    "override_available": {
+      "type": "boolean"
+    },
+    "override_used": {
+      "type": "boolean"
+    },
+    "repair_failure_marker": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "repair_class": {
+          "type": "string"
+        },
+        "found": {
+          "type": "boolean"
+        },
+        "parse_status": {
+          "type": "string"
+        },
+        "path": {
+          "type": "null"
+        },
+        "redacted_path": {
+          "type": "null"
+        },
+        "operation_id": {
+          "type": "null"
+        },
+        "plan_fingerprint": {
+          "type": "null"
+        },
+        "failed_at_ms": {
+          "type": "null"
+        },
+        "failed_at": {
+          "type": "null"
+        },
+        "cass_version": {
+          "type": "null"
+        },
+        "platform": {
+          "type": "null"
+        },
+        "user_data_modified": {
+          "type": "null"
+        },
+        "failed_checks": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "corrupt_reason": {
+          "type": "null"
+        }
+      }
+    },
+    "failure_marker_write_error": {
+      "type": "null"
+    },
     "operation_outcome": {
       "type": "object",
       "properties": {
@@ -1388,6 +1459,9 @@
           "type": "string"
         },
         "fix_mode": {
+          "type": "boolean"
+        },
+        "allow_repeated_repair": {
           "type": "boolean"
         }
       }

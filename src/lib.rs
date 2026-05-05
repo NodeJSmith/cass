@@ -640,6 +640,9 @@ pub enum Commands {
         /// Force index rebuild even if index appears healthy
         #[arg(long, visible_alias = "force")]
         force_rebuild: bool,
+        /// Permit a mutating repair even when a previous failure marker exists
+        #[arg(long)]
+        allow_repeated_repair: bool,
     },
     /// Find related sessions for a given source path
     Context {
@@ -3988,6 +3991,7 @@ async fn execute_cli(
                     fix,
                     verbose,
                     force_rebuild,
+                    allow_repeated_repair,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_doctor(
@@ -3997,6 +4001,7 @@ async fn execute_cli(
                         fix,
                         verbose,
                         force_rebuild,
+                        allow_repeated_repair,
                     )?;
                 }
                 Commands::Context {
@@ -12645,6 +12650,7 @@ fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAn
         "database_backup" => DoctorAnomaly::BackupUnverified,
         "fts_table" | "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
         "rebuild" => DoctorAnomaly::RepairPreviouslyFailed,
+        "repair_failure_marker" => DoctorAnomaly::RepairPreviouslyFailed,
         "derivative_cleanup" => DoctorAnomaly::DegradedDerivedAssets,
         "config" | "sources_config" => DoctorAnomaly::ConfigExclusionRisk,
         "sessions" => DoctorAnomaly::SourceAuthorityUnsafe,
@@ -12794,6 +12800,22 @@ fn doctor_top_level_operation_outcome(
         );
     }
 
+    if fix_requested
+        && checks
+            .iter()
+            .any(|check| check.name == "repair_failure_marker" && check.status == "fail")
+    {
+        return doctor_operation_outcome_with_details(
+            DoctorOperationOutcomeKind::RepairRefused,
+            "previous doctor repair failure marker blocks repeated mutation".to_string(),
+            "reported the durable failure marker and preserved prior evidence".to_string(),
+            "no repair, rebuild, promotion, restore, or cleanup action was attempted".to_string(),
+            data_loss_risk,
+            Some("cass doctor --json".to_string()),
+            None,
+        );
+    }
+
     if fix_requested && issues_fixed > 0 {
         let (kind, reason, action_taken, action_not_taken) = if issues_found == 0 {
             (
@@ -12852,10 +12874,9 @@ fn doctor_top_level_operation_outcome(
         );
     }
 
-    if checks
-        .iter()
-        .any(|check| check.anomaly_class == DoctorAnomaly::RepairPreviouslyFailed)
-    {
+    if checks.iter().any(|check| {
+        check.anomaly_class == DoctorAnomaly::RepairPreviouslyFailed && check.status == "fail"
+    }) {
         return doctor_operation_outcome_with_details(
             DoctorOperationOutcomeKind::VerificationFailed,
             "previous repair verification failed and must be inspected first".to_string(),
@@ -13505,6 +13526,61 @@ struct DoctorRepairReceipt {
     actions: Vec<DoctorAction>,
     action_status_counts: BTreeMap<String, usize>,
     blocked_reasons: Vec<String>,
+}
+
+const DOCTOR_REPAIR_FAILURE_MARKER_SCHEMA_VERSION: u32 = 1;
+const DOCTOR_REPAIR_FAILURE_MARKER_KIND: &str = "cass_doctor_repair_failure_marker_v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DoctorRepairFailureMarkerArtifact {
+    artifact_kind: String,
+    asset_class: String,
+    path: String,
+    redacted_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DoctorRepairFailureMarker {
+    marker_kind: String,
+    schema_version: u32,
+    repair_class: String,
+    operation_id: String,
+    command_line_mode: String,
+    plan_fingerprint: String,
+    affected_artifacts: Vec<DoctorRepairFailureMarkerArtifact>,
+    selected_authorities: Vec<String>,
+    rejected_authorities: Vec<String>,
+    preflight_checks: Vec<String>,
+    applied_actions: Vec<String>,
+    verification_checks: Vec<String>,
+    failed_checks: Vec<String>,
+    forensic_bundle_path: Option<String>,
+    candidate_path: Option<String>,
+    started_at_ms: Option<i64>,
+    failed_at_ms: i64,
+    cass_version: String,
+    platform: String,
+    user_data_modified: bool,
+    operation_outcome_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorRepairFailureMarkerReport {
+    schema_version: u32,
+    repair_class: String,
+    found: bool,
+    parse_status: String,
+    path: Option<String>,
+    redacted_path: Option<String>,
+    operation_id: Option<String>,
+    plan_fingerprint: Option<String>,
+    failed_at_ms: Option<i64>,
+    failed_at: Option<String>,
+    cass_version: Option<String>,
+    platform: Option<String>,
+    user_data_modified: Option<bool>,
+    failed_checks: Vec<String>,
+    corrupt_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize)]
@@ -17337,6 +17413,442 @@ fn doctor_serde_label<T: Serialize>(value: T) -> String {
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn doctor_repair_failure_marker_dir(data_dir: &Path, repair_class: &str) -> PathBuf {
+    data_dir
+        .join("doctor")
+        .join("failure-markers")
+        .join(repair_class)
+}
+
+fn doctor_current_repair_class() -> String {
+    doctor_serde_label(DoctorRepairMode::RepairApply)
+}
+
+fn doctor_command_line_mode(
+    fix: bool,
+    output_format: Option<RobotFormat>,
+    force_rebuild: bool,
+    allow_repeated_repair: bool,
+) -> String {
+    let mut parts = vec!["cass".to_string(), "doctor".to_string()];
+    if output_format.is_some() {
+        parts.push("--json".to_string());
+    }
+    if fix {
+        parts.push("--fix".to_string());
+    }
+    if force_rebuild {
+        parts.push("--force-rebuild".to_string());
+    }
+    if allow_repeated_repair {
+        parts.push("--allow-repeated-repair".to_string());
+    }
+    parts.join(" ")
+}
+
+fn doctor_failure_marker_absent_report(repair_class: &str) -> DoctorRepairFailureMarkerReport {
+    DoctorRepairFailureMarkerReport {
+        schema_version: DOCTOR_REPAIR_FAILURE_MARKER_SCHEMA_VERSION,
+        repair_class: repair_class.to_string(),
+        found: false,
+        parse_status: "absent".to_string(),
+        path: None,
+        redacted_path: None,
+        operation_id: None,
+        plan_fingerprint: None,
+        failed_at_ms: None,
+        failed_at: None,
+        cass_version: None,
+        platform: None,
+        user_data_modified: None,
+        failed_checks: Vec::new(),
+        corrupt_reason: None,
+    }
+}
+
+fn doctor_failure_marker_corrupt_report(
+    data_dir: &Path,
+    repair_class: &str,
+    path: &Path,
+    reason: impl Into<String>,
+) -> DoctorRepairFailureMarkerReport {
+    let path_text = path.display().to_string();
+    DoctorRepairFailureMarkerReport {
+        schema_version: DOCTOR_REPAIR_FAILURE_MARKER_SCHEMA_VERSION,
+        repair_class: repair_class.to_string(),
+        found: true,
+        parse_status: "corrupt".to_string(),
+        path: Some(path_text.clone()),
+        redacted_path: Some(doctor_redacted_path(&path_text, data_dir)),
+        operation_id: None,
+        plan_fingerprint: None,
+        failed_at_ms: None,
+        failed_at: None,
+        cass_version: None,
+        platform: None,
+        user_data_modified: None,
+        failed_checks: Vec::new(),
+        corrupt_reason: Some(reason.into()),
+    }
+}
+
+fn doctor_failure_marker_report_from_marker(
+    data_dir: &Path,
+    path: &Path,
+    marker: DoctorRepairFailureMarker,
+) -> DoctorRepairFailureMarkerReport {
+    let path_text = path.display().to_string();
+    DoctorRepairFailureMarkerReport {
+        schema_version: marker.schema_version,
+        repair_class: marker.repair_class,
+        found: true,
+        parse_status: "ok".to_string(),
+        path: Some(path_text.clone()),
+        redacted_path: Some(doctor_redacted_path(&path_text, data_dir)),
+        operation_id: Some(marker.operation_id),
+        plan_fingerprint: Some(marker.plan_fingerprint),
+        failed_at_ms: Some(marker.failed_at_ms),
+        failed_at: format_timestamp_millis_rfc3339(marker.failed_at_ms),
+        cass_version: Some(marker.cass_version),
+        platform: Some(marker.platform),
+        user_data_modified: Some(marker.user_data_modified),
+        failed_checks: marker.failed_checks,
+        corrupt_reason: None,
+    }
+}
+
+fn collect_doctor_repair_failure_marker(
+    data_dir: &Path,
+    repair_class: &str,
+) -> DoctorRepairFailureMarkerReport {
+    let marker_dir = doctor_repair_failure_marker_dir(data_dir, repair_class);
+    let entries = match std::fs::read_dir(&marker_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return doctor_failure_marker_absent_report(repair_class);
+        }
+        Err(err) => {
+            return doctor_failure_marker_corrupt_report(
+                data_dir,
+                repair_class,
+                &marker_dir,
+                format!("failed to read failure marker directory: {err}"),
+            );
+        }
+    };
+
+    let mut marker_paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    marker_paths.sort();
+
+    let Some(path) = marker_paths.pop() else {
+        return doctor_failure_marker_absent_report(repair_class);
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) => {
+            return doctor_failure_marker_corrupt_report(
+                data_dir,
+                repair_class,
+                &path,
+                format!("failed to read failure marker: {err}"),
+            );
+        }
+    };
+    let marker = match serde_json::from_str::<DoctorRepairFailureMarker>(&content) {
+        Ok(marker) => marker,
+        Err(err) => {
+            return doctor_failure_marker_corrupt_report(
+                data_dir,
+                repair_class,
+                &path,
+                format!("failed to parse failure marker JSON: {err}"),
+            );
+        }
+    };
+    if marker.marker_kind != DOCTOR_REPAIR_FAILURE_MARKER_KIND {
+        return doctor_failure_marker_corrupt_report(
+            data_dir,
+            repair_class,
+            &path,
+            format!("unexpected marker_kind {}", marker.marker_kind),
+        );
+    }
+    if marker.schema_version != DOCTOR_REPAIR_FAILURE_MARKER_SCHEMA_VERSION {
+        return doctor_failure_marker_corrupt_report(
+            data_dir,
+            repair_class,
+            &path,
+            format!("unsupported schema_version {}", marker.schema_version),
+        );
+    }
+    if marker.repair_class != repair_class {
+        return doctor_failure_marker_corrupt_report(
+            data_dir,
+            repair_class,
+            &path,
+            format!(
+                "marker repair_class {} did not match {repair_class}",
+                marker.repair_class
+            ),
+        );
+    }
+
+    doctor_failure_marker_report_from_marker(data_dir, &path, marker)
+}
+
+fn doctor_repair_failure_marker_refusal_reason(
+    report: &DoctorRepairFailureMarkerReport,
+) -> Option<String> {
+    if !report.found {
+        return None;
+    }
+    let path = report
+        .redacted_path
+        .as_deref()
+        .or(report.path.as_deref())
+        .unwrap_or("[unknown-marker]");
+    Some(format!(
+        "previous {} repair failure marker at {path} blocks repeated mutation until --allow-repeated-repair is supplied",
+        report.repair_class
+    ))
+}
+
+fn doctor_failure_marker_file_stem(operation_id: &str, failed_at_ms: i64) -> String {
+    let safe_operation_id = operation_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("{failed_at_ms}-{safe_operation_id}")
+}
+
+fn write_doctor_repair_failure_marker(
+    data_dir: &Path,
+    marker: &DoctorRepairFailureMarker,
+) -> Result<PathBuf, String> {
+    let marker_dir = doctor_repair_failure_marker_dir(data_dir, &marker.repair_class);
+    std::fs::create_dir_all(&marker_dir).map_err(|err| {
+        format!(
+            "failed to create doctor repair failure marker directory {}: {err}",
+            marker_dir.display()
+        )
+    })?;
+    if existing_path_has_symlink_below_root(&marker_dir, data_dir) {
+        return Err(format!(
+            "refusing to write doctor repair failure marker through symlinked path {}",
+            marker_dir.display()
+        ));
+    }
+
+    let stem = doctor_failure_marker_file_stem(&marker.operation_id, marker.failed_at_ms);
+    let payload = serde_json::to_vec_pretty(marker)
+        .map_err(|err| format!("failed to serialize doctor repair failure marker: {err}"))?;
+    for attempt in 0..100 {
+        let file_name = if attempt == 0 {
+            format!("{stem}.json")
+        } else {
+            format!("{stem}~{attempt}.json")
+        };
+        let path = marker_dir.join(file_name);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(&payload).map_err(|err| {
+                    format!(
+                        "failed to write doctor repair failure marker {}: {err}",
+                        path.display()
+                    )
+                })?;
+                file.sync_all().map_err(|err| {
+                    format!(
+                        "failed to sync doctor repair failure marker {}: {err}",
+                        path.display()
+                    )
+                })?;
+                sync_directory(&marker_dir)?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "failed to create doctor repair failure marker {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "failed to create unique doctor repair failure marker under {}",
+        marker_dir.display()
+    ))
+}
+
+fn doctor_failure_marker_artifact_for_class(
+    data_dir: &Path,
+    db_path: &Path,
+    index_path: &Path,
+    asset_class: DoctorAssetClass,
+) -> DoctorRepairFailureMarkerArtifact {
+    let owned_path;
+    let path = match asset_class {
+        DoctorAssetClass::CanonicalArchiveDb | DoctorAssetClass::ArchiveDbSidecar => db_path,
+        DoctorAssetClass::DerivedLexicalIndex | DoctorAssetClass::ReclaimableDerivedCache => {
+            index_path
+        }
+        DoctorAssetClass::OperationReceipt
+        | DoctorAssetClass::EventLog
+        | DoctorAssetClass::ForensicBundle => {
+            owned_path = data_dir.join("doctor");
+            &owned_path
+        }
+        DoctorAssetClass::RawMirrorBlob => {
+            owned_path = data_dir.join("raw-mirror").join("v1");
+            &owned_path
+        }
+        _ => data_dir,
+    };
+    let path_text = path.display().to_string();
+    DoctorRepairFailureMarkerArtifact {
+        artifact_kind: "doctor_affected_asset".to_string(),
+        asset_class: doctor_serde_label(asset_class),
+        redacted_path: doctor_redacted_path(&path_text, data_dir),
+        path: path_text,
+    }
+}
+
+struct DoctorRepairFailureMarkerBuildContext<'a> {
+    data_dir: &'a Path,
+    db_path: &'a Path,
+    index_path: &'a Path,
+    repair_class: &'a str,
+    operation_id: &'a str,
+    plan_fingerprint: &'a str,
+    command_line_mode: &'a str,
+    check_reports: &'a [DoctorCheckReport],
+    auto_fix_actions: &'a [String],
+    fs_mutation_receipts: &'a [DoctorFsMutationReceipt],
+    operation_outcome: &'a DoctorOperationOutcomeReport,
+    cleanup_apply_result: Option<&'a DiagCleanupApplyResult>,
+}
+
+fn build_doctor_repair_failure_marker(
+    context: DoctorRepairFailureMarkerBuildContext<'_>,
+) -> DoctorRepairFailureMarker {
+    let mut affected_classes = context
+        .check_reports
+        .iter()
+        .filter(|check| check.status != "pass")
+        .map(|check| check.affected_asset_class)
+        .collect::<Vec<_>>();
+    affected_classes.sort_by_key(|class| doctor_serde_label(*class));
+    affected_classes.dedup();
+    let affected_artifacts = affected_classes
+        .into_iter()
+        .map(|asset_class| {
+            doctor_failure_marker_artifact_for_class(
+                context.data_dir,
+                context.db_path,
+                context.index_path,
+                asset_class,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let failed_checks = context
+        .check_reports
+        .iter()
+        .filter(|check| check.status == "fail")
+        .map(|check| format!("{}:{}", check.name, check.anomaly_class_label()))
+        .collect::<Vec<_>>();
+    let verification_checks = context
+        .check_reports
+        .iter()
+        .map(|check| format!("{}:{}", check.name, check.status))
+        .collect::<Vec<_>>();
+    let applied_actions = context
+        .auto_fix_actions
+        .iter()
+        .cloned()
+        .chain(
+            context
+                .fs_mutation_receipts
+                .iter()
+                .filter(|receipt| receipt.status == DoctorActionStatus::Applied)
+                .map(|receipt| {
+                    format!(
+                        "{}:{}",
+                        doctor_serde_label(receipt.mutation_kind),
+                        receipt.redacted_target_path
+                    )
+                }),
+        )
+        .collect::<Vec<_>>();
+    let selected_authorities = context
+        .cleanup_apply_result
+        .and_then(|result| result.plan.as_ref())
+        .map(|plan| plan.selected_authorities.clone())
+        .unwrap_or_else(|| {
+            vec![
+                "doctor_anomaly_taxonomy_v1".to_string(),
+                "doctor_repair_mode_policy_v1".to_string(),
+                "doctor_check_report_v1".to_string(),
+            ]
+        });
+    let rejected_authorities = context
+        .cleanup_apply_result
+        .and_then(|result| result.plan.as_ref())
+        .map(|plan| plan.rejected_authorities.clone())
+        .unwrap_or_default();
+    let user_data_modified = context
+        .auto_fix_actions
+        .iter()
+        .any(|action| action.contains("Backed up corrupted database bundle"));
+
+    DoctorRepairFailureMarker {
+        marker_kind: DOCTOR_REPAIR_FAILURE_MARKER_KIND.to_string(),
+        schema_version: DOCTOR_REPAIR_FAILURE_MARKER_SCHEMA_VERSION,
+        repair_class: context.repair_class.to_string(),
+        operation_id: context.operation_id.to_string(),
+        command_line_mode: context.command_line_mode.to_string(),
+        plan_fingerprint: context.plan_fingerprint.to_string(),
+        affected_artifacts,
+        selected_authorities,
+        rejected_authorities,
+        preflight_checks: verification_checks.clone(),
+        applied_actions,
+        verification_checks,
+        failed_checks,
+        forensic_bundle_path: context
+            .cleanup_apply_result
+            .and_then(|result| result.plan.as_ref())
+            .and_then(|plan| plan.forensic_bundle.path.clone()),
+        candidate_path: None,
+        started_at_ms: context
+            .cleanup_apply_result
+            .and_then(|result| result.operation_started_at_ms),
+        failed_at_ms: doctor_now_ms(),
+        cass_version: env!("CARGO_PKG_VERSION").to_string(),
+        platform: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+        user_data_modified,
+        operation_outcome_kind: doctor_serde_label(context.operation_outcome.kind),
+    }
+}
+
+impl DoctorCheckReport {
+    fn anomaly_class_label(&self) -> String {
+        doctor_serde_label(self.anomaly_class)
+    }
 }
 
 fn doctor_artifact_descriptor_blake3(
@@ -21776,6 +22288,131 @@ mod doctor_asset_taxonomy_tests {
             verification_failed.exit_code_kind,
             DoctorExitCodeKind::RepairFailure
         );
+    }
+
+    fn test_failure_marker(
+        repair_class: &str,
+        operation_id: &str,
+        failed_at_ms: i64,
+    ) -> DoctorRepairFailureMarker {
+        DoctorRepairFailureMarker {
+            marker_kind: DOCTOR_REPAIR_FAILURE_MARKER_KIND.to_string(),
+            schema_version: DOCTOR_REPAIR_FAILURE_MARKER_SCHEMA_VERSION,
+            repair_class: repair_class.to_string(),
+            operation_id: operation_id.to_string(),
+            command_line_mode: "cass doctor --json --fix".to_string(),
+            plan_fingerprint: format!("plan-{operation_id}"),
+            affected_artifacts: Vec::new(),
+            selected_authorities: vec!["test-authority".to_string()],
+            rejected_authorities: Vec::new(),
+            preflight_checks: vec!["database:pass".to_string()],
+            applied_actions: Vec::new(),
+            verification_checks: vec!["rebuild:fail".to_string()],
+            failed_checks: vec!["rebuild:repair-previously-failed".to_string()],
+            forensic_bundle_path: Some("[cass-data]/doctor/forensics/test".to_string()),
+            candidate_path: Some("[cass-data]/doctor/tmp/candidate".to_string()),
+            started_at_ms: Some(failed_at_ms - 10),
+            failed_at_ms,
+            cass_version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: "test/test".to_string(),
+            user_data_modified: false,
+            operation_outcome_kind: "verification-failed".to_string(),
+        }
+    }
+
+    #[test]
+    fn doctor_failure_marker_round_trips_and_preserves_collision_evidence() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let repair_class = "repair_apply";
+        let marker = test_failure_marker(repair_class, "op-same", 1_733_001_111_000);
+
+        let first_path =
+            write_doctor_repair_failure_marker(data_dir, &marker).expect("write first marker");
+        let second_path =
+            write_doctor_repair_failure_marker(data_dir, &marker).expect("write second marker");
+
+        assert_ne!(
+            first_path, second_path,
+            "colliding marker writes must create a new evidence file"
+        );
+        assert!(first_path.exists(), "first marker must be preserved");
+        assert!(second_path.exists(), "second marker must be preserved");
+
+        let report = collect_doctor_repair_failure_marker(data_dir, repair_class);
+        assert!(report.found);
+        assert_eq!(report.parse_status, "ok");
+        assert_eq!(report.operation_id.as_deref(), Some("op-same"));
+        assert_eq!(
+            report.failed_checks,
+            vec!["rebuild:repair-previously-failed".to_string()]
+        );
+        assert_eq!(
+            report.path.as_deref(),
+            Some(second_path.to_string_lossy().as_ref()),
+            "newest marker should be the active repeat-repair blocker"
+        );
+    }
+
+    #[test]
+    fn doctor_failure_marker_corrupt_json_fails_closed() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let repair_class = "repair_apply";
+        let marker_dir = doctor_repair_failure_marker_dir(data_dir, repair_class);
+        std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+        let marker_path = marker_dir.join("1733001111000-corrupt.json");
+        std::fs::write(&marker_path, b"{not-json").expect("write corrupt marker");
+
+        let report = collect_doctor_repair_failure_marker(data_dir, repair_class);
+
+        assert!(report.found);
+        assert_eq!(report.parse_status, "corrupt");
+        assert!(
+            doctor_repair_failure_marker_refusal_reason(&report)
+                .expect("refusal reason")
+                .contains("--allow-repeated-repair"),
+            "corrupt markers should still block repeated mutation"
+        );
+    }
+
+    #[test]
+    fn doctor_failure_markers_are_scoped_by_repair_class() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path();
+        let repair_marker = test_failure_marker("repair_apply", "op-repair", 1_733_001_111_000);
+        let restore_marker = test_failure_marker("restore_apply", "op-restore", 1_733_001_112_000);
+        write_doctor_repair_failure_marker(data_dir, &repair_marker).expect("write repair marker");
+        write_doctor_repair_failure_marker(data_dir, &restore_marker)
+            .expect("write restore marker");
+
+        let repair = collect_doctor_repair_failure_marker(data_dir, "repair_apply");
+        let restore = collect_doctor_repair_failure_marker(data_dir, "restore_apply");
+        let cleanup = collect_doctor_repair_failure_marker(data_dir, "cleanup_apply");
+
+        assert_eq!(repair.operation_id.as_deref(), Some("op-repair"));
+        assert_eq!(restore.operation_id.as_deref(), Some("op-restore"));
+        assert!(
+            !cleanup.found,
+            "unrelated classes must not block each other"
+        );
+    }
+
+    #[test]
+    fn doctor_repeat_failure_marker_check_maps_to_repair_refused() {
+        let marker_check = doctor_check_report(
+            "repair_failure_marker",
+            "fail",
+            "previous repair failure marker at [cass-data]/doctor/failure-markers/repair_apply/x.json blocks repeated mutation",
+            true,
+            false,
+        );
+
+        let outcome = doctor_top_level_operation_outcome(&[marker_check], true, 1, 0, false, None);
+
+        assert_eq!(outcome.kind, DoctorOperationOutcomeKind::RepairRefused);
+        assert_eq!(outcome.exit_code_kind, DoctorExitCodeKind::UsageError);
+        assert!(outcome.requires_override);
     }
 
     #[test]
@@ -29661,6 +30298,7 @@ fn run_doctor(
     fix: bool,
     verbose: bool,
     force_rebuild: bool,
+    allow_repeated_repair: bool,
 ) -> CliResult<()> {
     use colored::*;
     use std::time::Instant;
@@ -29672,8 +30310,15 @@ fn run_doctor(
     let lock_path = data_dir.join(".index.lock");
     let maintenance_snapshot = probe_index_run_lock(&data_dir, &db_path);
     let rebuild_active = maintenance_snapshot.active;
+    let repair_class = doctor_current_repair_class();
+    let initial_failure_marker = collect_doctor_repair_failure_marker(&data_dir, &repair_class);
+    let repeat_refusal_reason =
+        doctor_repair_failure_marker_refusal_reason(&initial_failure_marker);
+    let repeat_repair_refused = fix && initial_failure_marker.found && !allow_repeated_repair;
+    let override_available = fix && initial_failure_marker.found;
+    let override_used = override_available && allow_repeated_repair;
     let mut _doctor_lock_guard: Option<DoctorMutationLockGuard> = None;
-    let doctor_lock_observation = if fix {
+    let doctor_lock_observation = if fix && !repeat_repair_refused {
         match doctor_acquire_mutation_lock(&data_dir, &db_path) {
             Ok((guard, observation)) => {
                 _doctor_lock_guard = Some(guard);
@@ -29695,7 +30340,10 @@ fn run_doctor(
         doctor_lock_observation,
         DoctorMutationLockObservation::Acquired { .. }
     );
-    let fix_can_mutate = fix && operation_state.mutating_doctor_allowed && mutating_lock_acquired;
+    let fix_can_mutate = fix
+        && operation_state.mutating_doctor_allowed
+        && mutating_lock_acquired
+        && !repeat_repair_refused;
     let not_initialized = !fix
         && cass_not_initialized(
             db_path.exists(),
@@ -29754,6 +30402,14 @@ fn run_doctor(
         );
     }
 
+    if let Some(reason) = repeat_refusal_reason.as_deref() {
+        if repeat_repair_refused {
+            add_check!("repair_failure_marker", "fail", reason.to_string(), true);
+        } else if !override_used {
+            add_check!("repair_failure_marker", "warn", reason.to_string(), true);
+        }
+    }
+
     // 1. Check data directory exists and is writable
     if !data_dir.exists() && not_initialized {
         add_check!(
@@ -29784,7 +30440,7 @@ fn run_doctor(
                 false
             );
         }
-    } else if fix {
+    } else if fix_can_mutate {
         if std::fs::create_dir_all(&data_dir).is_ok() {
             checks.push(Check {
                 name: "data_directory".to_string(),
@@ -29824,7 +30480,7 @@ fn run_doctor(
             .unwrap_or(true);
 
         if is_stale {
-            if fix {
+            if fix_can_mutate {
                 let planned_bytes = fs_dir_size(&lock_path);
                 let action_id = doctor_fs_mutation_action_id(
                     DoctorFsMutationKind::RemoveStaleLegacyIndexLock,
@@ -29875,6 +30531,13 @@ fn run_doctor(
                     );
                 }
                 fs_mutation_receipts.push(mutation_receipt);
+            } else if fix {
+                add_check!(
+                    "lock_file",
+                    "warn",
+                    "Stale lock file found (older than 1 hour) but mutating repair was not allowed",
+                    true
+                );
             } else {
                 add_check!(
                     "lock_file",
@@ -30566,12 +31229,16 @@ fn run_doctor(
     let operation_exit_code_kind = operation_outcome.exit_code_kind;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
+    let operation_id = cleanup_apply_result
+        .as_ref()
+        .map(|result| result.receipt.plan_fingerprint.clone())
+        .unwrap_or_else(|| {
+            doctor_check_operation_id(&check_reports, fix, &operation_outcome, not_initialized)
+        });
     let operation_event_log = cleanup_apply_result
         .as_ref()
         .map(|result| result.receipt.event_log.clone())
         .unwrap_or_else(|| {
-            let operation_id =
-                doctor_check_operation_id(&check_reports, fix, &operation_outcome, not_initialized);
             doctor_operation_event_log_for_checks(
                 &operation_id,
                 &check_reports,
@@ -30580,6 +31247,51 @@ fn run_doctor(
                 "embedded_operation_events",
             )
         });
+    let plan_fingerprint = cleanup_apply_result
+        .as_ref()
+        .and_then(|result| result.plan.as_ref())
+        .map(|plan| plan.plan_fingerprint.clone())
+        .unwrap_or_else(|| operation_id.clone());
+    let command_line_mode =
+        doctor_command_line_mode(fix, output_format, force_rebuild, allow_repeated_repair);
+    let should_write_failure_marker = fix
+        && !repeat_repair_refused
+        && matches!(
+            operation_outcome.kind,
+            DoctorOperationOutcomeKind::VerificationFailed
+                | DoctorOperationOutcomeKind::RepairIncomplete
+        );
+    let mut written_failure_marker_error: Option<String> = None;
+    let failure_marker_after_run = if should_write_failure_marker {
+        let marker = build_doctor_repair_failure_marker(DoctorRepairFailureMarkerBuildContext {
+            data_dir: &data_dir,
+            db_path: &db_path,
+            index_path: &index_path,
+            repair_class: &repair_class,
+            operation_id: &operation_id,
+            plan_fingerprint: &plan_fingerprint,
+            command_line_mode: &command_line_mode,
+            check_reports: &check_reports,
+            auto_fix_actions: &auto_fix_actions,
+            fs_mutation_receipts: &fs_mutation_receipts,
+            operation_outcome: &operation_outcome,
+            cleanup_apply_result: cleanup_apply_result.as_ref(),
+        });
+        match write_doctor_repair_failure_marker(&data_dir, &marker) {
+            Ok(path) => doctor_failure_marker_report_from_marker(&data_dir, &path, marker),
+            Err(err) => {
+                written_failure_marker_error = Some(err.clone());
+                doctor_failure_marker_corrupt_report(
+                    &data_dir,
+                    &repair_class,
+                    &doctor_repair_failure_marker_dir(&data_dir, &repair_class),
+                    err,
+                )
+            }
+        }
+    } else {
+        initial_failure_marker.clone()
+    };
     let all_pass = checks.iter().all(|c| c.status == "pass");
     let healthy = fail_count == 0 && !not_initialized;
     let doctor_status = if not_initialized {
@@ -30615,6 +31327,13 @@ fn run_doctor(
             "needs_rebuild": needs_rebuild,
             "auto_fix_applied": auto_fix_applied,
             "auto_fix_actions": auto_fix_actions,
+            "repair_previously_failed": initial_failure_marker.found,
+            "failure_marker_path": failure_marker_after_run.path.clone(),
+            "repeat_refusal_reason": if repeat_repair_refused { repeat_refusal_reason.clone() } else { None },
+            "override_available": override_available,
+            "override_used": override_used,
+            "repair_failure_marker": failure_marker_after_run.clone(),
+            "failure_marker_write_error": written_failure_marker_error.clone(),
             "operation_outcome": operation_outcome,
             "operation_state": operation_state,
             "event_log": operation_event_log,
@@ -30631,6 +31350,7 @@ fn run_doctor(
                 "data_dir": data_dir.display().to_string(),
                 "db_path": db_path.display().to_string(),
                 "fix_mode": fix,
+                "allow_repeated_repair": allow_repeated_repair,
             }
         });
         if let Some(result) = cleanup_apply_result.as_ref() {
@@ -32886,6 +33606,31 @@ fn response_schema_doctor_operation_outcome() -> serde_json::Value {
     })
 }
 
+fn response_schema_doctor_repair_failure_marker() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Durable marker summary for a previous failed mutating doctor repair. Mutating doctor runs refuse the same repair class by default when found=true.",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "repair_class": { "type": "string" },
+            "found": { "type": "boolean" },
+            "parse_status": { "type": "string", "description": "absent | ok | corrupt" },
+            "path": { "type": ["string", "null"] },
+            "redacted_path": { "type": ["string", "null"] },
+            "operation_id": { "type": ["string", "null"] },
+            "plan_fingerprint": { "type": ["string", "null"] },
+            "failed_at_ms": { "type": ["integer", "null"] },
+            "failed_at": { "type": ["string", "null"] },
+            "cass_version": { "type": ["string", "null"] },
+            "platform": { "type": ["string", "null"] },
+            "user_data_modified": { "type": ["boolean", "null"] },
+            "failed_checks": { "type": "array", "items": { "type": "string" } },
+            "corrupt_reason": { "type": ["string", "null"] }
+        },
+        "required": ["schema_version", "repair_class", "found", "parse_status", "path", "redacted_path", "operation_id", "plan_fingerprint", "failed_at_ms", "failed_at", "cass_version", "platform", "user_data_modified", "failed_checks", "corrupt_reason"]
+    })
+}
+
 fn response_schema_doctor_operation_state() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -34171,6 +34916,13 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "needs_rebuild": { "type": "boolean" },
                 "auto_fix_applied": { "type": "boolean" },
                 "auto_fix_actions": { "type": "array", "items": { "type": "string" } },
+                "repair_previously_failed": { "type": "boolean" },
+                "failure_marker_path": { "type": ["string", "null"] },
+                "repeat_refusal_reason": { "type": ["string", "null"] },
+                "override_available": { "type": "boolean" },
+                "override_used": { "type": "boolean" },
+                "repair_failure_marker": response_schema_doctor_repair_failure_marker(),
+                "failure_marker_write_error": { "type": ["string", "null"] },
                 "operation_outcome": response_schema_doctor_operation_outcome(),
                 "operation_state": response_schema_doctor_operation_state(),
                 "event_log": response_schema_doctor_event_log_metadata(),
@@ -34206,7 +34958,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                     }
                 }
             },
-            "required": ["status", "health_class", "healthy", "initialized", "operation_outcome", "operation_state", "event_log", "source_authority", "checks"]
+            "required": ["status", "health_class", "healthy", "initialized", "repair_previously_failed", "failure_marker_path", "repeat_refusal_reason", "override_available", "override_used", "repair_failure_marker", "operation_outcome", "operation_state", "event_log", "source_authority", "checks"]
         }),
     );
 

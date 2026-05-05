@@ -173,6 +173,56 @@ fn make_file_mtime_older_than(path: &Path, age: Duration) {
         .expect("set file mtime");
 }
 
+fn write_repair_failure_marker_fixture(
+    data_dir: &Path,
+    repair_class: &str,
+    operation_id: &str,
+    failed_at_ms: i64,
+) -> std::path::PathBuf {
+    let marker_dir = data_dir
+        .join("doctor")
+        .join("failure-markers")
+        .join(repair_class);
+    fs::create_dir_all(&marker_dir).expect("create repair failure marker dir");
+    let marker_path = marker_dir.join(format!("{failed_at_ms}-{operation_id}.json"));
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&json!({
+            "marker_kind": "cass_doctor_repair_failure_marker_v1",
+            "schema_version": 1,
+            "repair_class": repair_class,
+            "operation_id": operation_id,
+            "command_line_mode": "cass doctor --json --fix",
+            "plan_fingerprint": format!("plan-{operation_id}"),
+            "affected_artifacts": [
+                {
+                    "artifact_kind": "doctor_affected_asset",
+                    "asset_class": "derived_lexical_index",
+                    "path": data_dir.join("index").display().to_string(),
+                    "redacted_path": "[cass-data]/index"
+                }
+            ],
+            "selected_authorities": ["doctor_check_report_v1"],
+            "rejected_authorities": [],
+            "preflight_checks": ["database:pass", "index:pass"],
+            "applied_actions": [],
+            "verification_checks": ["rebuild:fail"],
+            "failed_checks": ["rebuild:repair-previously-failed"],
+            "forensic_bundle_path": "[cass-data]/doctor/forensics/failed-test",
+            "candidate_path": "[cass-data]/doctor/tmp/candidate-test",
+            "started_at_ms": failed_at_ms - 10,
+            "failed_at_ms": failed_at_ms,
+            "cass_version": env!("CARGO_PKG_VERSION"),
+            "platform": "test/test",
+            "user_data_modified": false,
+            "operation_outcome_kind": "verification-failed"
+        }))
+        .expect("serialize marker"),
+    )
+    .expect("write repair failure marker");
+    marker_path
+}
+
 fn write_quarantined_manifest(generation_dir: &Path) {
     fs::create_dir_all(generation_dir).expect("create generation dir");
     fs::write(
@@ -917,6 +967,131 @@ fn doctor_fix_reports_repair_blocked_when_doctor_lock_is_active() {
     assert_eq!(
         operation_check["anomaly_class"].as_str(),
         Some("lock-contention")
+    );
+}
+
+#[test]
+fn doctor_fix_refuses_repeated_repair_when_failure_marker_exists() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let marker_path = write_repair_failure_marker_fixture(
+        &data_dir,
+        "repair_apply",
+        "previous-failure",
+        1_733_001_111_000,
+    );
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "--json",
+            "--fix",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json --fix with previous failure marker");
+    assert!(
+        !out.status.success(),
+        "doctor --fix must fail closed when a previous failure marker exists"
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid doctor JSON");
+    assert_eq!(payload["repair_previously_failed"].as_bool(), Some(true));
+    assert_eq!(
+        payload["failure_marker_path"].as_str(),
+        Some(marker_path.to_string_lossy().as_ref())
+    );
+    assert_eq!(payload["override_available"].as_bool(), Some(true));
+    assert_eq!(payload["override_used"].as_bool(), Some(false));
+    assert!(
+        payload["repeat_refusal_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--allow-repeated-repair"),
+        "repeat refusal should name the explicit override: {payload:#}"
+    );
+    assert_eq!(
+        payload["operation_outcome"]["kind"].as_str(),
+        Some("repair-refused")
+    );
+    assert_eq!(
+        payload["operation_state"]["active_doctor_repair"].as_bool(),
+        Some(false),
+        "repeat refusal should not acquire the mutating doctor lock"
+    );
+    assert!(
+        payload.get("cleanup_apply").is_none(),
+        "doctor must not enter cleanup_apply after repeat-repair refusal: {payload:#}"
+    );
+    let marker_check = payload["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("repair_failure_marker"))
+        .expect("repair failure marker check");
+    assert_eq!(marker_check["status"].as_str(), Some("fail"));
+    assert_eq!(
+        marker_check["anomaly_class"].as_str(),
+        Some("repair-previously-failed")
+    );
+    assert!(
+        marker_path.exists(),
+        "repeat refusal must preserve the original failure marker"
+    );
+}
+
+#[test]
+fn doctor_fix_allow_repeated_repair_runs_without_deleting_existing_marker() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    seed_healthy_empty_index(test_home.path(), &data_dir);
+    let marker_path = write_repair_failure_marker_fixture(
+        &data_dir,
+        "repair_apply",
+        "previous-failure",
+        1_733_001_111_000,
+    );
+
+    let out = cass_cmd(test_home.path())
+        .args([
+            "doctor",
+            "--json",
+            "--fix",
+            "--allow-repeated-repair",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json --fix with override");
+    assert!(
+        out.status.success(),
+        "override should allow the mutating doctor run to proceed on a healthy fixture: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("valid doctor JSON");
+    assert_eq!(payload["repair_previously_failed"].as_bool(), Some(true));
+    assert_eq!(payload["override_available"].as_bool(), Some(true));
+    assert_eq!(payload["override_used"].as_bool(), Some(true));
+    assert_eq!(payload["repeat_refusal_reason"].as_str(), None);
+    assert_eq!(
+        payload["failure_marker_path"].as_str(),
+        Some(marker_path.to_string_lossy().as_ref())
+    );
+    assert!(
+        payload["checks"]
+            .as_array()
+            .expect("checks")
+            .iter()
+            .all(|check| check["name"].as_str() != Some("repair_failure_marker")),
+        "accepted override should not poison the current run's health checks: {payload:#}"
+    );
+    assert!(
+        marker_path.exists(),
+        "override must not remove or overwrite the previous failure marker"
     );
 }
 
