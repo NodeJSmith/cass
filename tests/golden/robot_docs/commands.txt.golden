@@ -40,6 +40,8 @@ commands:
   cass --robot-help
   cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).
   cass doctor [--json] [--fix]     Diagnostic checks + optional safe auto-fix (derivatives only).
+                    doctor JSON includes source_inventory; missing upstream provider files are
+                    source coverage/prune-risk warnings, not proof that archived cass rows are lost.
   cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).
   cass api-version [--json]        Show crate_version + api_version + contract_version.
   cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).

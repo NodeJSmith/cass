@@ -111,6 +111,21 @@ schemas: (auto-generated from contract)
     - quarantine: object
     - recommended_action: ?
     - repair_contract: object
+    - source_inventory: object
+      - db_available: boolean
+      - db_query_error: string
+      - detected_provider_root_count: integer
+      - detected_roots: array
+      - local_source_count: integer
+      - missing_current_source_count: integer
+      - notes: array
+      - provider_counts: object
+      - providers: array
+      - remote_source_count: integer
+      - schema_version: integer
+      - sources: array
+      - total_indexed_conversations: integer
+      - unknown_mapping_count: integer
     - status: string
     - warnings: integer
   health:

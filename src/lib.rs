@@ -7245,6 +7245,8 @@ fn print_robot_docs(topic: RobotTopic, wrap: WrapConfig) -> CliResult<()> {
             // full advertised surface instead of the ~10-command slice.
             "  cass health [--json]             Minimal readiness probe (<50ms, exit 0=healthy, 1=unhealthy).".to_string(),
             "  cass doctor [--json] [--fix]     Diagnostic checks + optional safe auto-fix (derivatives only).".to_string(),
+            "                    doctor JSON includes source_inventory; missing upstream provider files are".to_string(),
+            "                    source coverage/prune-risk warnings, not proof that archived cass rows are lost.".to_string(),
             "  cass introspect [--json]         Full API schema: commands, arguments, response_schemas (alphabetical).".to_string(),
             "  cass api-version [--json]        Show crate_version + api_version + contract_version.".to_string(),
             "  cass state [--json]              Alias of `cass status` (index/db/rebuild/semantic readiness).".to_string(),
@@ -13626,6 +13628,486 @@ fn doctor_redacted_path(path: &str, data_dir: &Path) -> String {
         .unwrap_or_else(|| "[external]".to_string())
 }
 
+#[derive(Debug, Clone)]
+struct DoctorSourceInventoryDbRow {
+    provider: String,
+    source_path: Option<String>,
+    source_id: String,
+    origin_host: Option<String>,
+    origin_kind: Option<String>,
+    conversation_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DoctorSourceInventoryReport {
+    schema_version: u32,
+    db_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    db_query_error: Option<String>,
+    total_indexed_conversations: usize,
+    provider_counts: BTreeMap<String, usize>,
+    missing_current_source_count: usize,
+    unknown_mapping_count: usize,
+    remote_source_count: usize,
+    local_source_count: usize,
+    detected_provider_root_count: usize,
+    providers: Vec<DoctorProviderSourceInventory>,
+    sources: Vec<DoctorSourceIdentityInventory>,
+    detected_roots: Vec<DoctorDetectedProviderRoot>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DoctorProviderSourceInventory {
+    provider: String,
+    stable_source_id: String,
+    indexed_conversation_count: usize,
+    missing_current_source_count: usize,
+    unknown_mapping_count: usize,
+    remote_source_count: usize,
+    local_source_count: usize,
+    detected_root_count: usize,
+    detected_roots: Vec<DoctorDetectedProviderRoot>,
+    prune_risk: DoctorProviderPruneRisk,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DoctorProviderPruneRisk {
+    level: &'static str,
+    note: &'static str,
+}
+
+impl Default for DoctorProviderPruneRisk {
+    fn default() -> Self {
+        doctor_provider_prune_risk("unknown")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DoctorSourceIdentityInventory {
+    stable_source_id: String,
+    source_id: String,
+    origin_kind: String,
+    origin_host: Option<String>,
+    is_remote: bool,
+    providers: Vec<String>,
+    conversation_count: usize,
+    missing_current_source_count: usize,
+    unknown_mapping_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct DoctorDetectedProviderRoot {
+    provider: String,
+    stable_source_id: String,
+    path: String,
+    redacted_path: String,
+    exists: bool,
+}
+
+#[derive(Debug, Default)]
+struct DoctorProviderInventoryBuilder {
+    indexed_conversation_count: usize,
+    missing_current_source_count: usize,
+    unknown_mapping_count: usize,
+    remote_source_count: usize,
+    local_source_count: usize,
+    detected_roots: Vec<DoctorDetectedProviderRoot>,
+}
+
+#[derive(Debug, Default)]
+struct DoctorSourceIdentityInventoryBuilder {
+    source_id: String,
+    origin_kind: String,
+    origin_host: Option<String>,
+    is_remote: bool,
+    providers: HashSet<String>,
+    conversation_count: usize,
+    missing_current_source_count: usize,
+    unknown_mapping_count: usize,
+}
+
+fn doctor_normalized_provider_slug(provider: &str) -> String {
+    let normalized = provider.trim().to_ascii_lowercase().replace('-', "_");
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        public_connector_slug(&normalized).to_string()
+    }
+}
+
+fn doctor_normalized_source_path(path: Option<&str>) -> Option<String> {
+    path.map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn doctor_provider_prune_risk(provider: &str) -> DoctorProviderPruneRisk {
+    match provider {
+        "claude_code" => DoctorProviderPruneRisk {
+            level: "high",
+            note: "Claude Code may prune local harness logs; cass archive rows can be the durable copy.",
+        },
+        "codex" => DoctorProviderPruneRisk {
+            level: "high",
+            note: "Codex may prune local harness logs; cass archive rows can be the durable copy.",
+        },
+        "cursor" | "chatgpt" | "gemini" | "opencode" => DoctorProviderPruneRisk {
+            level: "medium",
+            note: "Provider history can move, rotate, or live behind app-managed storage; treat missing upstream files as a coverage risk.",
+        },
+        "unknown" => DoctorProviderPruneRisk {
+            level: "unknown",
+            note: "Provider is unknown, so doctor cannot infer retention behavior.",
+        },
+        _ => DoctorProviderPruneRisk {
+            level: "normal",
+            note: "No provider-specific pruning behavior is encoded yet; monitor source coverage over time.",
+        },
+    }
+}
+
+fn doctor_source_inventory_stable_id(
+    provider: &str,
+    source_id: &str,
+    origin_kind: Option<&str>,
+    origin_host: Option<&str>,
+    source_path: Option<&str>,
+) -> String {
+    doctor_canonical_blake3(
+        "doctor-source-inventory-v1",
+        serde_json::json!({
+            "provider": provider,
+            "source_id": source_id,
+            "origin_kind": origin_kind,
+            "origin_host": origin_host,
+            "source_path": source_path,
+        }),
+    )
+}
+
+fn doctor_table_columns(conn: &frankensqlite::Connection, table: &str) -> HashSet<String> {
+    if !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return HashSet::new();
+    }
+    conn.query_map_collect(
+        &format!("PRAGMA table_info({table})"),
+        &[],
+        |row: &frankensqlite::Row| row.get_typed::<String>(1),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .collect()
+}
+
+fn query_doctor_source_inventory_db_rows(
+    conn: &frankensqlite::Connection,
+) -> std::result::Result<Vec<DoctorSourceInventoryDbRow>, frankensqlite::FrankenError> {
+    use frankensqlite::compat::ConnectionExt as _;
+
+    let conversation_columns = doctor_table_columns(conn, "conversations");
+    if conversation_columns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let agent_columns = doctor_table_columns(conn, "agents");
+    let source_columns = doctor_table_columns(conn, "sources");
+
+    let can_join_agents = conversation_columns.contains("agent_id")
+        && agent_columns.contains("id")
+        && agent_columns.contains("slug");
+    let can_join_sources = conversation_columns.contains("source_id")
+        && source_columns.contains("id")
+        && source_columns.contains("kind");
+
+    let provider_expr = if can_join_agents {
+        "COALESCE(a.slug, 'unknown')"
+    } else {
+        "'unknown'"
+    };
+    let source_path_expr = if conversation_columns.contains("source_path") {
+        "c.source_path"
+    } else {
+        "NULL"
+    };
+    let source_id_expr = if conversation_columns.contains("source_id") {
+        "COALESCE(c.source_id, 'local')"
+    } else {
+        "'local'"
+    };
+    let origin_host_expr = if conversation_columns.contains("origin_host") {
+        "c.origin_host"
+    } else {
+        "NULL"
+    };
+    let origin_kind_expr = if can_join_sources { "s.kind" } else { "NULL" };
+    let agent_join = if can_join_agents {
+        " LEFT JOIN agents a ON c.agent_id = a.id"
+    } else {
+        ""
+    };
+    let source_join = if can_join_sources {
+        " LEFT JOIN sources s ON c.source_id = s.id"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT {provider_expr}, {source_path_expr}, {source_id_expr}, {origin_host_expr}, {origin_kind_expr}, COUNT(*) \
+         FROM conversations c{agent_join}{source_join} \
+         GROUP BY 1, 2, 3, 4, 5 \
+         ORDER BY 1, 3, 4, 2"
+    );
+
+    conn.query_map_collect(&sql, &[], |row: &frankensqlite::Row| {
+        let count: i64 = row.get_typed(5)?;
+        Ok(DoctorSourceInventoryDbRow {
+            provider: row.get_typed(0)?,
+            source_path: row.get_typed(1)?,
+            source_id: row.get_typed(2)?,
+            origin_host: row.get_typed(3)?,
+            origin_kind: row.get_typed(4)?,
+            conversation_count: count.max(0) as usize,
+        })
+    })
+}
+
+fn build_doctor_source_inventory_report(
+    data_dir: &Path,
+    db_available: bool,
+    db_query_error: Option<String>,
+    db_rows: Vec<DoctorSourceInventoryDbRow>,
+    detected_roots: Vec<(String, PathBuf)>,
+) -> DoctorSourceInventoryReport {
+    let mut provider_builders: BTreeMap<String, DoctorProviderInventoryBuilder> = BTreeMap::new();
+    let mut source_builders: BTreeMap<String, DoctorSourceIdentityInventoryBuilder> =
+        BTreeMap::new();
+    let mut provider_counts = BTreeMap::new();
+    let mut report = DoctorSourceInventoryReport {
+        schema_version: 1,
+        db_available,
+        db_query_error,
+        notes: vec![
+            "missing_current_source_count means the original provider file is not visible now; indexed conversations remain in the cass archive database.".to_string(),
+            "Remote rows are not checked against the local filesystem; use source_id and origin_host to identify the origin machine when known.".to_string(),
+        ],
+        ..DoctorSourceInventoryReport::default()
+    };
+
+    for (provider, root) in detected_roots {
+        let provider = doctor_normalized_provider_slug(&provider);
+        let root_path = root.display().to_string();
+        let stable_source_id = doctor_source_inventory_stable_id(
+            &provider,
+            "detected-root",
+            None,
+            None,
+            Some(&root_path),
+        );
+        let detected_root = DoctorDetectedProviderRoot {
+            provider: provider.clone(),
+            stable_source_id,
+            redacted_path: doctor_redacted_path(&root_path, data_dir),
+            exists: root.exists(),
+            path: root_path,
+        };
+        report.detected_roots.push(detected_root.clone());
+        provider_builders
+            .entry(provider)
+            .or_default()
+            .detected_roots
+            .push(detected_root);
+    }
+
+    for row in db_rows {
+        let provider = doctor_normalized_provider_slug(&row.provider);
+        let source_path = doctor_normalized_source_path(row.source_path.as_deref());
+        let origin_host = normalized_provenance_origin_host(row.origin_host.as_deref());
+        let source_id = normalized_provenance_source_id(
+            row.source_id.as_str(),
+            row.origin_kind.as_deref(),
+            origin_host.as_deref(),
+        );
+        let origin_kind =
+            normalized_provenance_origin_kind(source_id.as_str(), row.origin_kind.as_deref());
+        let is_remote = source_id != crate::sources::provenance::LOCAL_SOURCE_ID
+            || origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID
+            || origin_host.is_some();
+        let local_path_missing = !is_remote
+            && source_path
+                .as_deref()
+                .map(|path| !Path::new(path).exists())
+                .unwrap_or(false);
+        let unknown_mapping = provider == "unknown" || source_path.is_none();
+        let count = row.conversation_count;
+
+        report.total_indexed_conversations += count;
+        *provider_counts.entry(provider.clone()).or_insert(0) += count;
+        if is_remote {
+            report.remote_source_count += count;
+        } else {
+            report.local_source_count += count;
+        }
+        if local_path_missing {
+            report.missing_current_source_count += count;
+        }
+        if unknown_mapping {
+            report.unknown_mapping_count += count;
+        }
+
+        let provider_builder = provider_builders.entry(provider.clone()).or_default();
+        provider_builder.indexed_conversation_count += count;
+        if is_remote {
+            provider_builder.remote_source_count += count;
+        } else {
+            provider_builder.local_source_count += count;
+        }
+        if local_path_missing {
+            provider_builder.missing_current_source_count += count;
+        }
+        if unknown_mapping {
+            provider_builder.unknown_mapping_count += count;
+        }
+
+        let source_stable_id = doctor_source_inventory_stable_id(
+            "source-identity",
+            &source_id,
+            Some(&origin_kind),
+            origin_host.as_deref(),
+            None,
+        );
+        let source_builder = source_builders.entry(source_stable_id).or_insert_with(|| {
+            DoctorSourceIdentityInventoryBuilder {
+                source_id: source_id.clone(),
+                origin_kind: origin_kind.clone(),
+                origin_host: origin_host.clone(),
+                is_remote,
+                ..DoctorSourceIdentityInventoryBuilder::default()
+            }
+        });
+        source_builder.providers.insert(provider);
+        source_builder.conversation_count += count;
+        if local_path_missing {
+            source_builder.missing_current_source_count += count;
+        }
+        if unknown_mapping {
+            source_builder.unknown_mapping_count += count;
+        }
+    }
+
+    report.provider_counts = provider_counts;
+    report.detected_provider_root_count = report.detected_roots.len();
+
+    report.providers = provider_builders
+        .into_iter()
+        .map(|(provider, builder)| {
+            let stable_source_id =
+                doctor_source_inventory_stable_id(&provider, "provider-rollup", None, None, None);
+            let detected_root_count = builder.detected_roots.len();
+            let mut notes = Vec::new();
+            if builder.missing_current_source_count > 0 {
+                notes.push(
+                    "Some indexed local conversations no longer have a visible upstream provider file; this is a source coverage warning, not archive data loss."
+                        .to_string(),
+                );
+            }
+            if builder.unknown_mapping_count > 0 {
+                notes.push(
+                    "Some indexed conversations lack enough provider/path metadata for precise source mapping."
+                        .to_string(),
+                );
+            }
+            DoctorProviderSourceInventory {
+                provider: provider.clone(),
+                stable_source_id,
+                indexed_conversation_count: builder.indexed_conversation_count,
+                missing_current_source_count: builder.missing_current_source_count,
+                unknown_mapping_count: builder.unknown_mapping_count,
+                remote_source_count: builder.remote_source_count,
+                local_source_count: builder.local_source_count,
+                detected_root_count,
+                detected_roots: builder.detected_roots,
+                prune_risk: doctor_provider_prune_risk(&provider),
+                notes,
+            }
+        })
+        .collect();
+
+    report.sources = source_builders
+        .into_iter()
+        .map(|(stable_source_id, builder)| {
+            let mut providers: Vec<String> = builder.providers.into_iter().collect();
+            providers.sort();
+            DoctorSourceIdentityInventory {
+                stable_source_id,
+                source_id: builder.source_id,
+                origin_kind: builder.origin_kind,
+                origin_host: builder.origin_host,
+                is_remote: builder.is_remote,
+                providers,
+                conversation_count: builder.conversation_count,
+                missing_current_source_count: builder.missing_current_source_count,
+                unknown_mapping_count: builder.unknown_mapping_count,
+            }
+        })
+        .collect();
+
+    report
+}
+
+fn collect_doctor_source_inventory(data_dir: &Path, db_path: &Path) -> DoctorSourceInventoryReport {
+    let home = dirs::home_dir().unwrap_or_default();
+    let config_dir = dirs::config_dir().unwrap_or_else(|| data_dir.to_path_buf());
+    let detected_roots: Vec<_> = diagnostics_connector_paths(&home, &config_dir)
+        .into_iter()
+        .filter(|(_, path)| {
+            let under = |base: &Path| !base.as_os_str().is_empty() && path.starts_with(base);
+            under(&home) || under(&config_dir) || under(data_dir)
+        })
+        .collect();
+    if !db_path.exists() {
+        return build_doctor_source_inventory_report(
+            data_dir,
+            false,
+            None,
+            Vec::new(),
+            detected_roots,
+        );
+    }
+
+    let query_result = open_franken_cli_read_db(
+        db_path.to_path_buf(),
+        "doctor source inventory",
+        Duration::from_secs(1),
+    )
+    .and_then(|conn| {
+        let query_result = query_doctor_source_inventory_db_rows(&conn).map_err(|e| CliError {
+            code: 9,
+            kind: CliErrorKind::DbQuery.kind_str(),
+            message: format!("Failed to query doctor source inventory: {e}"),
+            hint: None,
+            retryable: false,
+        });
+        let close_result = close_franken_cli_read_db(conn, db_path, "doctor source inventory");
+        match (query_result, close_result) {
+            (Ok(rows), Ok(())) => Ok(rows),
+            (Err(err), _) | (_, Err(err)) => Err(err),
+        }
+    });
+
+    match query_result {
+        Ok(rows) => {
+            build_doctor_source_inventory_report(data_dir, true, None, rows, detected_roots)
+        }
+        Err(err) => build_doctor_source_inventory_report(
+            data_dir,
+            true,
+            Some(err.message),
+            Vec::new(),
+            detected_roots,
+        ),
+    }
+}
+
 fn doctor_artifact_checksum_status(
     exists: bool,
     expected_content_blake3: Option<&str>,
@@ -15692,6 +16174,138 @@ mod doctor_asset_taxonomy_tests {
         assert_eq!(
             doctor_redacted_path("/var/tmp/external-session.jsonl", data_dir),
             "[external]/external-session.jsonl"
+        );
+    }
+
+    #[test]
+    fn doctor_source_inventory_counts_missing_sources_without_calling_them_lost() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let visible_root = data_dir.join("provider-roots/codex");
+        std::fs::create_dir_all(&visible_root).expect("create visible root");
+        let visible_source = data_dir.join("sessions/visible.jsonl");
+        std::fs::create_dir_all(visible_source.parent().unwrap()).expect("create sessions dir");
+        std::fs::write(&visible_source, "{}\n").expect("write visible source");
+        let missing_source = data_dir.join("sessions/pruned.jsonl");
+
+        let rows = vec![
+            DoctorSourceInventoryDbRow {
+                provider: "codex".to_string(),
+                source_path: Some(visible_source.display().to_string()),
+                source_id: "local".to_string(),
+                origin_host: None,
+                origin_kind: Some("local".to_string()),
+                conversation_count: 1,
+            },
+            DoctorSourceInventoryDbRow {
+                provider: "claude".to_string(),
+                source_path: Some(missing_source.display().to_string()),
+                source_id: "local".to_string(),
+                origin_host: None,
+                origin_kind: Some("local".to_string()),
+                conversation_count: 2,
+            },
+            DoctorSourceInventoryDbRow {
+                provider: "  ".to_string(),
+                source_path: None,
+                source_id: "local".to_string(),
+                origin_host: None,
+                origin_kind: Some("local".to_string()),
+                conversation_count: 1,
+            },
+            DoctorSourceInventoryDbRow {
+                provider: "codex".to_string(),
+                source_path: Some("/remote/codex/session.jsonl".to_string()),
+                source_id: "work-laptop".to_string(),
+                origin_host: Some("user@work-laptop".to_string()),
+                origin_kind: Some("ssh".to_string()),
+                conversation_count: 3,
+            },
+        ];
+
+        let first = build_doctor_source_inventory_report(
+            &data_dir,
+            true,
+            None,
+            rows.clone(),
+            vec![
+                ("codex".to_string(), visible_root.clone()),
+                ("Claude".to_string(), PathBuf::from("/outside/claude")),
+            ],
+        );
+        let second = build_doctor_source_inventory_report(
+            &data_dir,
+            true,
+            None,
+            rows,
+            vec![
+                ("codex".to_string(), visible_root),
+                ("Claude".to_string(), PathBuf::from("/outside/claude")),
+            ],
+        );
+
+        assert_eq!(first.total_indexed_conversations, 7);
+        assert_eq!(first.provider_counts.get("codex"), Some(&4));
+        assert_eq!(first.provider_counts.get("claude_code"), Some(&2));
+        assert_eq!(first.provider_counts.get("unknown"), Some(&1));
+        assert_eq!(first.missing_current_source_count, 2);
+        assert_eq!(first.unknown_mapping_count, 1);
+        assert_eq!(first.remote_source_count, 3);
+        assert_eq!(first.local_source_count, 4);
+
+        let codex_root = first
+            .detected_roots
+            .iter()
+            .find(|root| root.provider == "codex")
+            .expect("codex root");
+        assert!(codex_root.exists);
+        assert_eq!(codex_root.redacted_path, "[cass-data]/provider-roots/codex");
+
+        assert_eq!(
+            first.detected_roots[0].stable_source_id, second.detected_roots[0].stable_source_id,
+            "stable source identifiers must be deterministic across identical inventories"
+        );
+        assert!(
+            first.sources.iter().any(|source| {
+                source.is_remote
+                    && source.source_id == "work-laptop"
+                    && source.origin_kind == "remote"
+                    && source.origin_host.as_deref() == Some("user@work-laptop")
+            }),
+            "remote/source identity should be preserved when known: {:#?}",
+            first.sources
+        );
+        let local_source = first
+            .sources
+            .iter()
+            .find(|source| !source.is_remote && source.source_id == "local")
+            .expect("local source identity");
+        assert_eq!(local_source.conversation_count, 4);
+        assert_eq!(
+            local_source.providers,
+            vec![
+                "claude_code".to_string(),
+                "codex".to_string(),
+                "unknown".to_string(),
+            ],
+            "source identities should aggregate providers for the same origin"
+        );
+        assert!(
+            first
+                .notes
+                .iter()
+                .any(|note| note.contains("not proof") || note.contains("archive database")),
+            "source_inventory notes should explain that missing upstream files are not archive data loss"
+        );
+
+        let payload = serde_json::json!({ "source_inventory": first });
+        assert_eq!(
+            payload["source_inventory"]["missing_current_source_count"].as_u64(),
+            Some(2)
+        );
+        assert!(
+            payload["source_inventory"]["providers"].is_array(),
+            "source_inventory JSON should remain parseable and array-backed"
         );
     }
 
@@ -19368,6 +19982,47 @@ fn run_doctor(
         );
     }
 
+    let source_inventory = collect_doctor_source_inventory(&data_dir, &db_path);
+    if let Some(error) = source_inventory.db_query_error.as_deref() {
+        add_check!(
+            "source_inventory",
+            "warn",
+            format!("Source inventory could not query archive coverage: {error}"),
+            false
+        );
+    } else if !source_inventory.db_available {
+        add_check!(
+            "source_inventory",
+            "pass",
+            "Source inventory skipped until the cass archive database exists",
+            false
+        );
+    } else if source_inventory.missing_current_source_count > 0
+        || source_inventory.unknown_mapping_count > 0
+    {
+        add_check!(
+            "source_inventory",
+            "warn",
+            format!(
+                "Source coverage risk: {} indexed local conversation(s) no longer have a visible upstream file; {} indexed conversation(s) have incomplete source mapping",
+                source_inventory.missing_current_source_count,
+                source_inventory.unknown_mapping_count
+            ),
+            false
+        );
+    } else {
+        add_check!(
+            "source_inventory",
+            "pass",
+            format!(
+                "Source inventory OK ({} indexed conversation(s), {} provider root(s) detected)",
+                source_inventory.total_indexed_conversations,
+                source_inventory.detected_provider_root_count
+            ),
+            false
+        );
+    }
+
     // Apply fix: rebuild index if needed (only when --fix is passed)
     if needs_rebuild && fix {
         let stderr_is_tty = std::io::stderr().is_terminal();
@@ -19670,6 +20325,7 @@ fn run_doctor(
             "auto_fix_actions": auto_fix_actions,
             "asset_taxonomy": doctor_asset_taxonomy_report(),
             "repair_contract": doctor_repair_contract_report(),
+            "source_inventory": source_inventory,
             "checks": checks,
             "quarantine": quarantine_report,
             "_meta": {
@@ -21881,6 +22537,78 @@ fn response_schema_doctor_cleanup_apply() -> serde_json::Value {
     })
 }
 
+fn response_schema_doctor_source_inventory() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "Read-only source coverage inventory. Missing upstream provider files are reported as coverage/prune risk, not loss of conversations already archived in cass.",
+        "properties": {
+            "schema_version": { "type": "integer" },
+            "db_available": { "type": "boolean" },
+            "db_query_error": { "type": "string" },
+            "total_indexed_conversations": { "type": "integer" },
+            "provider_counts": { "type": "object", "additionalProperties": { "type": "integer" } },
+            "missing_current_source_count": {
+                "type": "integer",
+                "description": "Local indexed conversations whose original provider source_path is no longer visible on this machine."
+            },
+            "unknown_mapping_count": { "type": "integer" },
+            "remote_source_count": { "type": "integer" },
+            "local_source_count": { "type": "integer" },
+            "detected_provider_root_count": { "type": "integer" },
+            "providers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string" },
+                        "stable_source_id": { "type": "string" },
+                        "indexed_conversation_count": { "type": "integer" },
+                        "missing_current_source_count": { "type": "integer" },
+                        "unknown_mapping_count": { "type": "integer" },
+                        "remote_source_count": { "type": "integer" },
+                        "local_source_count": { "type": "integer" },
+                        "detected_root_count": { "type": "integer" },
+                        "detected_roots": { "type": "array", "items": response_schema_opaque_object() },
+                        "prune_risk": response_schema_opaque_object(),
+                        "notes": { "type": "array", "items": { "type": "string" } }
+                    }
+                }
+            },
+            "sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "stable_source_id": { "type": "string" },
+                        "source_id": { "type": "string" },
+                        "origin_kind": { "type": "string" },
+                        "origin_host": { "type": ["string", "null"] },
+                        "is_remote": { "type": "boolean" },
+                        "providers": { "type": "array", "items": { "type": "string" } },
+                        "conversation_count": { "type": "integer" },
+                        "missing_current_source_count": { "type": "integer" },
+                        "unknown_mapping_count": { "type": "integer" }
+                    }
+                }
+            },
+            "detected_roots": { "type": "array", "items": response_schema_opaque_object() },
+            "notes": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": [
+            "schema_version",
+            "db_available",
+            "total_indexed_conversations",
+            "provider_counts",
+            "missing_current_source_count",
+            "unknown_mapping_count",
+            "providers",
+            "sources",
+            "detected_roots",
+            "notes"
+        ]
+    })
+}
+
 fn response_schema_search_hit() -> serde_json::Value {
     response_schema_object([
         ("source_path", serde_json::json!({ "type": "string" })),
@@ -22784,6 +23512,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "auto_fix_actions": { "type": "array", "items": { "type": "string" } },
                 "asset_taxonomy": response_schema_opaque_object_array(),
                 "repair_contract": response_schema_opaque_object(),
+                "source_inventory": response_schema_doctor_source_inventory(),
                 "quarantine": response_schema_opaque_object(),
                 "cleanup_apply": response_schema_doctor_cleanup_apply(),
                 "_meta": response_schema_opaque_object(),

@@ -243,13 +243,18 @@ fn scrub_robot_json(input: &str, test_home: &std::path::Path) -> String {
             .unwrap();
     out = uuid_re.replace_all(&out, "[UUID]").to_string();
 
-    // 5. latency_ms (health --json) — wall-clock duration that varies run to
-    // run and by host. Keep the field in the golden to prove the shape but
-    // scrub the value so drift on it doesn't fail the contract test.
-    let latency_re = regex::Regex::new(r#""latency_ms"\s*:\s*\d+"#).unwrap();
-    out = latency_re
-        .replace_all(&out, r#""latency_ms": "[LATENCY_MS]""#)
-        .to_string();
+    // 5. Wall-clock durations vary run to run and by host. Keep the fields in
+    // the golden to prove the shape, but scrub the values so drift on them
+    // does not fail the contract test.
+    for (key, replacement) in [
+        ("latency_ms", "[LATENCY_MS]"),
+        ("elapsed_ms", "[ELAPSED_MS]"),
+    ] {
+        let re = regex::Regex::new(&format!(r#""{key}"\s*:\s*\d+"#)).unwrap();
+        out = re
+            .replace_all(&out, format!(r#""{key}": "{replacement}""#).as_str())
+            .to_string();
+    }
 
     // 6. Live-sampled kernel metrics in health --json (load average per
     // core and PSI CPU pressure). These float values change between runs

@@ -1091,6 +1091,24 @@
       }
     ]
   },
+  "source_inventory": {
+    "schema_version": 1,
+    "db_available": false,
+    "total_indexed_conversations": 0,
+    "provider_counts": {},
+    "missing_current_source_count": 0,
+    "unknown_mapping_count": 0,
+    "remote_source_count": 0,
+    "local_source_count": 0,
+    "detected_provider_root_count": 0,
+    "providers": [],
+    "sources": [],
+    "detected_roots": [],
+    "notes": [
+      "missing_current_source_count means the original provider file is not visible now; indexed conversations remain in the cass archive database.",
+      "Remote rows are not checked against the local filesystem; use source_id and origin_host to identify the origin machine when known."
+    ]
+  },
   "checks": [
     {
       "name": "data_directory",
@@ -1138,6 +1156,13 @@
       "name": "sessions",
       "status": "warn",
       "message": "No agent session directories found",
+      "fix_available": false,
+      "fix_applied": false
+    },
+    {
+      "name": "source_inventory",
+      "status": "pass",
+      "message": "Source inventory skipped until the cass archive database exists",
       "fix_available": false,
       "fix_applied": false
     }
@@ -1490,7 +1515,7 @@
     "warnings": []
   },
   "_meta": {
-    "elapsed_ms": 0,
+    "elapsed_ms": "[ELAPSED_MS]",
     "data_dir": "[TEST_HOME]/cass-data",
     "db_path": "[TEST_HOME]/cass-data/agent_search.db",
     "fix_mode": false

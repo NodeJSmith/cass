@@ -2395,6 +2395,161 @@
           "type": "object",
           "additionalProperties": true
         },
+        "source_inventory": {
+          "type": "object",
+          "description": "Read-only source coverage inventory. Missing upstream provider files are reported as coverage/prune risk, not loss of conversations already archived in cass.",
+          "properties": {
+            "schema_version": {
+              "type": "integer"
+            },
+            "db_available": {
+              "type": "boolean"
+            },
+            "db_query_error": {
+              "type": "string"
+            },
+            "total_indexed_conversations": {
+              "type": "integer"
+            },
+            "provider_counts": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer"
+              }
+            },
+            "missing_current_source_count": {
+              "type": "integer",
+              "description": "Local indexed conversations whose original provider source_path is no longer visible on this machine."
+            },
+            "unknown_mapping_count": {
+              "type": "integer"
+            },
+            "remote_source_count": {
+              "type": "integer"
+            },
+            "local_source_count": {
+              "type": "integer"
+            },
+            "detected_provider_root_count": {
+              "type": "integer"
+            },
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "type": "string"
+                  },
+                  "stable_source_id": {
+                    "type": "string"
+                  },
+                  "indexed_conversation_count": {
+                    "type": "integer"
+                  },
+                  "missing_current_source_count": {
+                    "type": "integer"
+                  },
+                  "unknown_mapping_count": {
+                    "type": "integer"
+                  },
+                  "remote_source_count": {
+                    "type": "integer"
+                  },
+                  "local_source_count": {
+                    "type": "integer"
+                  },
+                  "detected_root_count": {
+                    "type": "integer"
+                  },
+                  "detected_roots": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": true
+                    }
+                  },
+                  "prune_risk": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "notes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "sources": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "stable_source_id": {
+                    "type": "string"
+                  },
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "origin_kind": {
+                    "type": "string"
+                  },
+                  "origin_host": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "is_remote": {
+                    "type": "boolean"
+                  },
+                  "providers": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "conversation_count": {
+                    "type": "integer"
+                  },
+                  "missing_current_source_count": {
+                    "type": "integer"
+                  },
+                  "unknown_mapping_count": {
+                    "type": "integer"
+                  }
+                }
+              }
+            },
+            "detected_roots": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            },
+            "notes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "schema_version",
+            "db_available",
+            "total_indexed_conversations",
+            "provider_counts",
+            "missing_current_source_count",
+            "unknown_mapping_count",
+            "providers",
+            "sources",
+            "detected_roots",
+            "notes"
+          ]
+        },
         "quarantine": {
           "type": "object",
           "additionalProperties": true

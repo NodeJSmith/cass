@@ -318,6 +318,63 @@
         }
       }
     },
+    "source_inventory": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "db_available": {
+          "type": "boolean"
+        },
+        "total_indexed_conversations": {
+          "type": "integer"
+        },
+        "provider_counts": {
+          "type": "object",
+          "properties": {}
+        },
+        "missing_current_source_count": {
+          "type": "integer"
+        },
+        "unknown_mapping_count": {
+          "type": "integer"
+        },
+        "remote_source_count": {
+          "type": "integer"
+        },
+        "local_source_count": {
+          "type": "integer"
+        },
+        "detected_provider_root_count": {
+          "type": "integer"
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "detected_roots": {
+          "type": "array",
+          "items": {
+            "type": "unknown"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
     "checks": {
       "type": "array",
       "items": {

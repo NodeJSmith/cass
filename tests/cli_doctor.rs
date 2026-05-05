@@ -1,5 +1,7 @@
 use assert_cmd::Command;
 use coding_agent_search::search::tantivy::expected_index_dir;
+use frankensqlite::Connection as FrankenConnection;
+use frankensqlite::compat::{ConnectionExt, RowExt};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -576,6 +578,97 @@ fn doctor_json_surfaces_quarantine_gc_eligibility() {
     assert_eq!(
         apply_gate["inspection_required_generation_ids"][0].as_str(),
         Some("gen-quarantined")
+    );
+}
+
+#[test]
+fn doctor_json_reports_missing_upstream_source_as_coverage_risk_not_data_loss() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let test_home = temp.path();
+    let data_dir = test_home.join("cass-data");
+    seed_healthy_empty_index(test_home, &data_dir);
+
+    let missing_source = test_home.join(".codex/sessions/pruned-session.jsonl");
+    let db_path = data_dir.join("agent_search.db");
+    let conn = FrankenConnection::open(db_path.to_string_lossy().into_owned()).expect("open db");
+    let agent_id: i64 = match conn.query_row_map(
+        "SELECT id FROM agents WHERE slug = 'codex' LIMIT 1",
+        &[],
+        |row: &frankensqlite::Row| row.get_typed(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => {
+            let next_id: i64 = conn
+                .query_row_map("SELECT COALESCE(MAX(id), 0) + 1 FROM agents", &[], |row| {
+                    row.get_typed(0)
+                })
+                .expect("next agent id");
+            conn.execute_compat(
+                "INSERT INTO agents (id, slug, name, version, kind, created_at, updated_at)
+                 VALUES (?1, 'codex', 'Codex', 'test', 'agent', 0, 0)",
+                frankensqlite::params![next_id],
+            )
+            .expect("insert codex agent");
+            next_id
+        }
+    };
+    let missing_source_str = missing_source.to_string_lossy().into_owned();
+    conn.execute_compat(
+        "INSERT INTO conversations (agent_id, source_id, external_id, title, source_path, started_at)
+         VALUES (?1, 'local', 'missing-codex-session', 'missing upstream fixture', ?2, 1700000000000)",
+        frankensqlite::params![agent_id, missing_source_str.as_str()],
+    )
+    .expect("insert conversation");
+    drop(conn);
+
+    let out = cass_cmd(test_home)
+        .args([
+            "doctor",
+            "--json",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+        ])
+        .output()
+        .expect("run cass doctor --json");
+
+    assert!(
+        out.status.success(),
+        "cass doctor --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    let inventory = &payload["source_inventory"];
+
+    assert_eq!(
+        inventory["missing_current_source_count"].as_u64(),
+        Some(1),
+        "missing upstream local source should be reported as coverage risk: {inventory:#}"
+    );
+    assert_eq!(inventory["provider_counts"]["codex"].as_u64(), Some(1));
+    assert!(
+        inventory["notes"]
+            .as_array()
+            .expect("source_inventory notes")
+            .iter()
+            .any(|note| note
+                .as_str()
+                .is_some_and(|text| text.contains("archive database"))),
+        "doctor should explain that missing upstream files do not imply archive data loss: {inventory:#}"
+    );
+
+    let source_inventory_check = payload["checks"]
+        .as_array()
+        .expect("checks array")
+        .iter()
+        .find(|check| check["name"].as_str() == Some("source_inventory"))
+        .expect("source_inventory check");
+    assert_eq!(source_inventory_check["status"].as_str(), Some("warn"));
+    assert!(
+        source_inventory_check["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Source coverage risk")),
+        "source_inventory check should name this as coverage risk: {source_inventory_check:#}"
     );
 }
 
