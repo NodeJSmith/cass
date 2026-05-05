@@ -3,8 +3,9 @@ mod util;
 use std::collections::{BTreeMap, BTreeSet};
 use util::doctor_e2e_runner::{
     DoctorE2eArtifactManifest, DoctorE2eCliArgs, DoctorE2eRunner, DoctorE2eScenarioSpec,
-    default_doctor_e2e_run_root, default_doctor_e2e_scenarios, parse_doctor_json_stdout,
-    select_scenarios, validate_artifact_manifest, validate_artifact_manifest_value,
+    default_doctor_e2e_run_root, default_doctor_e2e_scenarios, doctor_e2e_scenarios_for_args,
+    parse_doctor_json_stdout, select_scenarios, validate_artifact_manifest,
+    validate_artifact_manifest_value,
 };
 use util::doctor_fixture::DoctorFixtureScenario;
 
@@ -42,6 +43,31 @@ fn doctor_e2e_label_filter_selects_matching_scenarios() {
 
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].scenario_id, "quick-mirror-missing");
+}
+
+#[test]
+fn doctor_e2e_include_failure_self_test_selects_intentional_failure() {
+    let parsed = DoctorE2eCliArgs::parse_from([
+        "doctor_v2",
+        "--label",
+        "quick",
+        "--include-failure-self-test",
+    ])
+    .expect("parse self-test flag");
+    let scenarios = doctor_e2e_scenarios_for_args(&parsed);
+    let selected = select_scenarios(&parsed, &scenarios);
+
+    assert!(
+        selected
+            .iter()
+            .any(|scenario| scenario.scenario_id == "intentional-failure-self-test"),
+        "include flag should add and select the failure self-test scenario"
+    );
+    let self_test = selected
+        .iter()
+        .find(|scenario| scenario.scenario_id == "intentional-failure-self-test")
+        .expect("selected self-test scenario");
+    assert_eq!(self_test.expected_runner_status(), "fail");
 }
 
 #[test]
@@ -187,8 +213,11 @@ fn doctor_e2e_scripted_scenarios() {
         args.push("--scenario".to_string());
         args.push(scenarios_arg);
     }
+    if std::env::var("CASS_DOCTOR_E2E_INCLUDE_FAILURE_SELF_TEST").is_ok() {
+        args.push("--include-failure-self-test".to_string());
+    }
     let parsed = DoctorE2eCliArgs::parse_from(args).expect("parse scripted args");
-    let scenarios = default_doctor_e2e_scenarios();
+    let scenarios = doctor_e2e_scenarios_for_args(&parsed);
     let selected = select_scenarios(&parsed, &scenarios);
     assert!(
         !selected.is_empty(),
@@ -205,9 +234,12 @@ fn doctor_e2e_scripted_scenarios() {
             .expect("run scripted scenario");
         assert_eq!(
             result.status,
-            "pass",
-            "scripted doctor scenario should pass with artifacts at {}",
+            scenario.expected_runner_status(),
+            "scripted doctor scenario should produce the expected status with artifacts at {}",
             result.artifact_dir.display()
         );
+        if parsed.fail_fast && result.status == "fail" {
+            break;
+        }
     }
 }

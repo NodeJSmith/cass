@@ -4450,6 +4450,57 @@ fn open_franken_cli_read_db(
     Ok(conn)
 }
 
+fn open_franken_cli_read_db_with_hard_timeout(
+    path: PathBuf,
+    reason: &str,
+    timeout: Duration,
+) -> CliResult<frankensqlite::Connection> {
+    let display_path = path.display().to_string();
+    let reason = reason.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _open_worker = std::thread::spawn({
+        let reason = reason.clone();
+        move || {
+            let result = open_franken_cli_read_db(path, &reason, timeout)
+                .map(crate::storage::sqlite::SendFrankenConnection::new);
+            let _ = tx.send(result);
+        }
+    });
+
+    receive_franken_cli_read_db_open_result_with_hard_timeout(rx, display_path, reason, timeout)
+}
+
+fn receive_franken_cli_read_db_open_result_with_hard_timeout(
+    rx: std::sync::mpsc::Receiver<CliResult<crate::storage::sqlite::SendFrankenConnection>>,
+    display_path: String,
+    reason: String,
+    timeout: Duration,
+) -> CliResult<frankensqlite::Connection> {
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(conn)) => Ok(conn.into_parts().0),
+        Ok(Err(err)) => Err(err),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CliError {
+            code: 9,
+            kind: CliErrorKind::DbOpen.kind_str(),
+            message: format!(
+                "Failed to open {reason} database at {display_path}: open timed out after {}s (possible corruption or lock contention)",
+                timeout.as_secs()
+            ),
+            hint: None,
+            retryable: true,
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CliError {
+            code: 9,
+            kind: CliErrorKind::DbOpen.kind_str(),
+            message: format!(
+                "Failed to open {reason} database at {display_path}: open worker disconnected"
+            ),
+            hint: None,
+            retryable: true,
+        }),
+    }
+}
+
 fn close_franken_cli_read_db(
     mut conn: frankensqlite::Connection,
     path: &Path,
@@ -12244,6 +12295,430 @@ struct DoctorAssetSafety {
     safe_to_gc_allowed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorHealth {
+    Healthy,
+    DegradedDerivedAssets,
+    DegradedArchiveRisk,
+    RepairBlocked,
+    RepairPreviouslyFailed,
+    SourceAuthorityUnsafe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorAnomaly {
+    Healthy,
+    DegradedDerivedAssets,
+    DegradedArchiveRisk,
+    RepairBlocked,
+    RepairPreviouslyFailed,
+    SourceAuthorityUnsafe,
+    ArchiveDbCorrupt,
+    ArchiveDbUnreadable,
+    RawMirrorMissing,
+    RawMirrorBehindSource,
+    UpstreamSourcePruned,
+    DerivedLexicalStale,
+    DerivedSemanticStale,
+    InterruptedRepair,
+    LockContention,
+    StoragePressure,
+    ConfigExclusionRisk,
+    BackupUnverified,
+    BackupStale,
+    PrivacyRedactionRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum DoctorDataLossRisk {
+    None,
+    Low,
+    Medium,
+    High,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoctorAnomalyPolicy {
+    anomaly_class: DoctorAnomaly,
+    health_class: DoctorHealth,
+    severity: DoctorSeverity,
+    affected_asset_class: DoctorAssetClass,
+    data_loss_risk: DoctorDataLossRisk,
+    default_outcome_kind: DoctorRepairOutcomeKind,
+    safe_for_auto_repair: bool,
+    recommended_action: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorAnomalyTaxonomyEntry {
+    anomaly_class: DoctorAnomaly,
+    health_class: DoctorHealth,
+    severity: DoctorSeverity,
+    affected_asset_class: DoctorAssetClass,
+    data_loss_risk: DoctorDataLossRisk,
+    default_outcome_kind: DoctorRepairOutcomeKind,
+    safe_for_auto_repair: bool,
+    recommended_action: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheckReport {
+    name: String,
+    status: String,
+    message: String,
+    anomaly_class: DoctorAnomaly,
+    health_class: DoctorHealth,
+    severity: DoctorSeverity,
+    affected_asset_class: DoctorAssetClass,
+    data_loss_risk: DoctorDataLossRisk,
+    recommended_action: &'static str,
+    safe_for_auto_repair: bool,
+    default_outcome_kind: DoctorRepairOutcomeKind,
+    fix_available: bool,
+    fix_applied: bool,
+}
+
+const DOCTOR_ANOMALY_POLICY_TABLE: &[DoctorAnomalyPolicy] = &[
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::Healthy,
+        health_class: DoctorHealth::Healthy,
+        severity: DoctorSeverity::Info,
+        affected_asset_class: DoctorAssetClass::Unknown,
+        data_loss_risk: DoctorDataLossRisk::None,
+        default_outcome_kind: DoctorRepairOutcomeKind::NoOp,
+        safe_for_auto_repair: false,
+        recommended_action: "none",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::DegradedDerivedAssets,
+        health_class: DoctorHealth::DegradedDerivedAssets,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::ReclaimableDerivedCache,
+        data_loss_risk: DoctorDataLossRisk::None,
+        default_outcome_kind: DoctorRepairOutcomeKind::Planned,
+        safe_for_auto_repair: true,
+        recommended_action: "rebuild-or-clean-derived-assets",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::DegradedArchiveRisk,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Error,
+        affected_asset_class: DoctorAssetClass::CanonicalArchiveDb,
+        data_loss_risk: DoctorDataLossRisk::High,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "preserve-evidence-and-plan-archive-recovery",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::RepairBlocked,
+        health_class: DoctorHealth::RepairBlocked,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::OperationReceipt,
+        data_loss_risk: DoctorDataLossRisk::Low,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "inspect-blocker-before-retrying",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::RepairPreviouslyFailed,
+        health_class: DoctorHealth::RepairPreviouslyFailed,
+        severity: DoctorSeverity::Error,
+        affected_asset_class: DoctorAssetClass::OperationReceipt,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Failed,
+        safe_for_auto_repair: false,
+        recommended_action: "inspect-failure-marker-before-repair",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::SourceAuthorityUnsafe,
+        health_class: DoctorHealth::SourceAuthorityUnsafe,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::ExternalUpstreamSource,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "verify-source-authority-before-rebuild",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::ArchiveDbCorrupt,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Error,
+        affected_asset_class: DoctorAssetClass::CanonicalArchiveDb,
+        data_loss_risk: DoctorDataLossRisk::High,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "capture-backup-and-reconstruct-from-verified-authority",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::ArchiveDbUnreadable,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Error,
+        affected_asset_class: DoctorAssetClass::CanonicalArchiveDb,
+        data_loss_risk: DoctorDataLossRisk::High,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "inspect-archive-db-and-preserve-sidecars",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::RawMirrorMissing,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::RawMirrorBlob,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "capture-or-backfill-raw-mirror-before-risky-repair",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::RawMirrorBehindSource,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::RawMirrorBlob,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Planned,
+        safe_for_auto_repair: false,
+        recommended_action: "refresh-raw-mirror-before-using-source-authority",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::UpstreamSourcePruned,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::ExternalUpstreamSource,
+        data_loss_risk: DoctorDataLossRisk::High,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "use-cass-archive-or-raw-mirror-as-authority",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::DerivedLexicalStale,
+        health_class: DoctorHealth::DegradedDerivedAssets,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::DerivedLexicalIndex,
+        data_loss_risk: DoctorDataLossRisk::None,
+        default_outcome_kind: DoctorRepairOutcomeKind::Planned,
+        safe_for_auto_repair: true,
+        recommended_action: "rebuild-derived-lexical-index",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::DerivedSemanticStale,
+        health_class: DoctorHealth::DegradedDerivedAssets,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::DerivedSemanticIndex,
+        data_loss_risk: DoctorDataLossRisk::None,
+        default_outcome_kind: DoctorRepairOutcomeKind::Planned,
+        safe_for_auto_repair: false,
+        recommended_action: "refresh-semantic-assets-when-model-is-available",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::InterruptedRepair,
+        health_class: DoctorHealth::RepairBlocked,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::OperationReceipt,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "inspect-interrupted-repair-artifacts",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::LockContention,
+        health_class: DoctorHealth::RepairBlocked,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::OperationReceipt,
+        data_loss_risk: DoctorDataLossRisk::Low,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "wait-or-inspect-active-owner-before-repair",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::StoragePressure,
+        health_class: DoctorHealth::RepairBlocked,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::Unknown,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "free-space-without-deleting-archive-evidence",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::ConfigExclusionRisk,
+        health_class: DoctorHealth::SourceAuthorityUnsafe,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::UserConfig,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "inspect-config-before-trusting-source-coverage",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::BackupUnverified,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::BackupBundle,
+        data_loss_risk: DoctorDataLossRisk::High,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "verify-backup-before-restore-or-cleanup",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::BackupStale,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Warn,
+        affected_asset_class: DoctorAssetClass::BackupBundle,
+        data_loss_risk: DoctorDataLossRisk::Medium,
+        default_outcome_kind: DoctorRepairOutcomeKind::Planned,
+        safe_for_auto_repair: false,
+        recommended_action: "create-or-verify-current-backup-before-repair",
+    },
+    DoctorAnomalyPolicy {
+        anomaly_class: DoctorAnomaly::PrivacyRedactionRequired,
+        health_class: DoctorHealth::DegradedArchiveRisk,
+        severity: DoctorSeverity::Error,
+        affected_asset_class: DoctorAssetClass::SupportBundle,
+        data_loss_risk: DoctorDataLossRisk::High,
+        default_outcome_kind: DoctorRepairOutcomeKind::Blocked,
+        safe_for_auto_repair: false,
+        recommended_action: "redact-sensitive-output-before-sharing-artifacts",
+    },
+];
+
+fn doctor_anomaly_policy(anomaly_class: DoctorAnomaly) -> &'static DoctorAnomalyPolicy {
+    DOCTOR_ANOMALY_POLICY_TABLE
+        .iter()
+        .find(|policy| policy.anomaly_class == anomaly_class)
+        .expect("doctor anomaly policy table must cover every anomaly")
+}
+
+fn doctor_anomaly_taxonomy_report() -> Vec<DoctorAnomalyTaxonomyEntry> {
+    DOCTOR_ANOMALY_POLICY_TABLE
+        .iter()
+        .map(|policy| DoctorAnomalyTaxonomyEntry {
+            anomaly_class: policy.anomaly_class,
+            health_class: policy.health_class,
+            severity: policy.severity,
+            affected_asset_class: policy.affected_asset_class,
+            data_loss_risk: policy.data_loss_risk,
+            default_outcome_kind: policy.default_outcome_kind,
+            safe_for_auto_repair: policy.safe_for_auto_repair,
+            recommended_action: policy.recommended_action,
+        })
+        .collect()
+}
+
+fn doctor_anomaly_for_check(name: &str, status: &str, message: &str) -> DoctorAnomaly {
+    if status == "pass" {
+        return DoctorAnomaly::Healthy;
+    }
+
+    match name {
+        "data_directory" => DoctorAnomaly::StoragePressure,
+        "lock_file" => DoctorAnomaly::LockContention,
+        "database" => {
+            if message.contains("quick_check") {
+                DoctorAnomaly::ArchiveDbCorrupt
+            } else {
+                DoctorAnomaly::ArchiveDbUnreadable
+            }
+        }
+        "database_backup" => DoctorAnomaly::BackupUnverified,
+        "fts_table" | "index" | "index_sync" => DoctorAnomaly::DerivedLexicalStale,
+        "rebuild" => DoctorAnomaly::RepairPreviouslyFailed,
+        "derivative_cleanup" => DoctorAnomaly::DegradedDerivedAssets,
+        "config" | "sources_config" => DoctorAnomaly::ConfigExclusionRisk,
+        "sessions" => DoctorAnomaly::SourceAuthorityUnsafe,
+        "source_inventory" => {
+            if message.contains("no longer have a visible upstream file")
+                || message.contains("Source coverage risk")
+            {
+                DoctorAnomaly::UpstreamSourcePruned
+            } else if message.contains("could not query archive coverage") {
+                DoctorAnomaly::ArchiveDbUnreadable
+            } else {
+                DoctorAnomaly::SourceAuthorityUnsafe
+            }
+        }
+        "raw_mirror" => {
+            if message.contains("interrupted capture") {
+                DoctorAnomaly::InterruptedRepair
+            } else {
+                DoctorAnomaly::RawMirrorMissing
+            }
+        }
+        _ => DoctorAnomaly::RepairBlocked,
+    }
+}
+
+fn doctor_check_report(
+    name: &str,
+    status: &str,
+    message: &str,
+    fix_available: bool,
+    fix_applied: bool,
+) -> DoctorCheckReport {
+    let anomaly_class = doctor_anomaly_for_check(name, status, message);
+    let policy = doctor_anomaly_policy(anomaly_class);
+    DoctorCheckReport {
+        name: name.to_string(),
+        status: status.to_string(),
+        message: message.to_string(),
+        anomaly_class,
+        health_class: policy.health_class,
+        severity: policy.severity,
+        affected_asset_class: policy.affected_asset_class,
+        data_loss_risk: policy.data_loss_risk,
+        recommended_action: policy.recommended_action,
+        safe_for_auto_repair: policy.safe_for_auto_repair && fix_available && status != "pass",
+        default_outcome_kind: policy.default_outcome_kind,
+        fix_available,
+        fix_applied,
+    }
+}
+
+fn doctor_health_class_for_checks(checks: &[DoctorCheckReport]) -> DoctorHealth {
+    if checks
+        .iter()
+        .any(|check| check.health_class == DoctorHealth::RepairPreviouslyFailed)
+    {
+        return DoctorHealth::RepairPreviouslyFailed;
+    }
+    if checks
+        .iter()
+        .any(|check| check.health_class == DoctorHealth::SourceAuthorityUnsafe)
+    {
+        return DoctorHealth::SourceAuthorityUnsafe;
+    }
+    if checks
+        .iter()
+        .any(|check| check.health_class == DoctorHealth::DegradedArchiveRisk)
+    {
+        return DoctorHealth::DegradedArchiveRisk;
+    }
+    if checks
+        .iter()
+        .any(|check| check.health_class == DoctorHealth::RepairBlocked)
+    {
+        return DoctorHealth::RepairBlocked;
+    }
+    if checks
+        .iter()
+        .any(|check| check.health_class == DoctorHealth::DegradedDerivedAssets)
+    {
+        return DoctorHealth::DegradedDerivedAssets;
+    }
+    DoctorHealth::Healthy
+}
+
 #[cfg(test)]
 const DOCTOR_ASSET_ALL_OPERATIONS: &[DoctorAssetOperation] = &[
     DoctorAssetOperation::Read,
@@ -19166,6 +19641,26 @@ mod cli_read_db_tests {
     }
 
     #[test]
+    fn cli_read_db_hard_timeout_reports_open_timeout() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let err = receive_franken_cli_read_db_open_result_with_hard_timeout(
+            rx,
+            "/tmp/agent_search.db".to_string(),
+            "doctor database health".to_string(),
+            Duration::from_millis(1),
+        )
+        .expect_err("open receiver timeout should produce a cli error");
+
+        assert_eq!(err.kind, CliErrorKind::DbOpen.kind_str());
+        assert!(err.retryable);
+        assert!(
+            err.message.contains("open timed out"),
+            "timeout error should be actionable, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn probe_state_db_reads_meta_without_count_scan() {
         let (_temp, db_path) = seed_cli_db();
         let snapshot = probe_state_db(&db_path, "status", Duration::from_millis(250), false);
@@ -20894,7 +21389,7 @@ fn run_doctor(
     // Fix #128: use the CLI read-only opener with a timeout to prevent hanging on degraded
     // databases without dirtying precious archive evidence during a read-only doctor check.
     if db_path.exists() {
-        let db_open_result = open_franken_cli_read_db(
+        let db_open_result = open_franken_cli_read_db_with_hard_timeout(
             db_path.to_path_buf(),
             "doctor database health",
             Duration::from_secs(30),
@@ -21034,7 +21529,7 @@ fn run_doctor(
 
                 // Check if index is empty but database has data
                 if num_docs == 0 && db_ok {
-                    if let Ok(conn) = open_franken_cli_read_db(
+                    if let Ok(conn) = open_franken_cli_read_db_with_hard_timeout(
                         db_path.to_path_buf(),
                         "doctor index sync",
                         Duration::from_secs(1),
@@ -21535,6 +22030,19 @@ fn run_doctor(
     let warn_count = checks.iter().filter(|c| c.status == "warn").count();
     let issues_found = fail_count + warn_count;
     let issues_fixed = checks.iter().filter(|c| c.fix_applied).count();
+    let check_reports: Vec<DoctorCheckReport> = checks
+        .iter()
+        .map(|check| {
+            doctor_check_report(
+                &check.name,
+                &check.status,
+                &check.message,
+                check.fix_available,
+                check.fix_applied,
+            )
+        })
+        .collect();
+    let health_class = doctor_health_class_for_checks(&check_reports);
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let all_pass = checks.iter().all(|c| c.status == "pass");
@@ -21560,6 +22068,7 @@ fn run_doctor(
         let quarantine_report = collect_diag_quarantine_report(&data_dir, &index_path);
         let mut payload = serde_json::json!({
             "status": doctor_status,
+            "health_class": health_class,
             "healthy": healthy,
             "initialized": !not_initialized,
             "explanation": explanation,
@@ -21572,10 +22081,11 @@ fn run_doctor(
             "auto_fix_applied": auto_fix_applied,
             "auto_fix_actions": auto_fix_actions,
             "asset_taxonomy": doctor_asset_taxonomy_report(),
+            "anomaly_taxonomy": doctor_anomaly_taxonomy_report(),
             "repair_contract": doctor_repair_contract_report(),
             "source_inventory": source_inventory,
             "raw_mirror": raw_mirror,
-            "checks": checks,
+            "checks": check_reports,
             "quarantine": quarantine_report,
             "_meta": {
                 "elapsed_ms": elapsed_ms,
@@ -24862,6 +25372,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
             "description": "cass doctor --json: diagnostic checks + optional auto-fix audit.",
             "properties": {
                 "status": { "type": "string" },
+                "health_class": { "type": "string", "description": "Stable kebab-case DoctorHealth value such as healthy, degraded-derived-assets, degraded-archive-risk, repair-blocked, repair-previously-failed, or source-authority-unsafe." },
                 "healthy": { "type": "boolean" },
                 "initialized": { "type": "boolean" },
                 "explanation": { "type": ["string", "null"] },
@@ -24874,6 +25385,7 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                 "auto_fix_applied": { "type": "boolean" },
                 "auto_fix_actions": { "type": "array", "items": { "type": "string" } },
                 "asset_taxonomy": response_schema_opaque_object_array(),
+                "anomaly_taxonomy": response_schema_opaque_object_array(),
                 "repair_contract": response_schema_opaque_object(),
                 "source_inventory": response_schema_doctor_source_inventory(),
                 "raw_mirror": response_schema_doctor_raw_mirror(),
@@ -24888,14 +25400,22 @@ fn build_response_schemas() -> std::collections::BTreeMap<String, serde_json::Va
                             "name": { "type": "string" },
                             "status": { "type": "string", "description": "pass | warn | fail" },
                             "message": { "type": "string" },
+                            "anomaly_class": { "type": "string", "description": "Stable kebab-case DoctorAnomaly value; robots should branch on this instead of message text." },
+                            "health_class": { "type": "string", "description": "Stable kebab-case DoctorHealth value derived from anomaly_class." },
+                            "severity": { "type": "string", "description": "info | warn | error" },
+                            "affected_asset_class": { "type": "string", "description": "Stable DoctorAssetClass value naming the asset class at risk." },
+                            "data_loss_risk": { "type": "string", "description": "none | low | medium | high | unknown" },
+                            "recommended_action": { "type": "string" },
+                            "safe_for_auto_repair": { "type": "boolean" },
+                            "default_outcome_kind": { "type": "string" },
                             "fix_available": { "type": "boolean" },
                             "fix_applied": { "type": "boolean" }
                         },
-                        "required": ["name", "status", "message", "fix_available", "fix_applied"]
+                        "required": ["name", "status", "message", "anomaly_class", "health_class", "severity", "affected_asset_class", "data_loss_risk", "recommended_action", "safe_for_auto_repair", "default_outcome_kind", "fix_available", "fix_applied"]
                     }
                 }
             },
-            "required": ["status", "healthy", "initialized", "checks"]
+            "required": ["status", "health_class", "healthy", "initialized", "checks"]
         }),
     );
 

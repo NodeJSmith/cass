@@ -160,12 +160,14 @@ impl DoctorE2eCliArgs {
     pub fn selects(&self, scenario: &DoctorE2eScenarioSpec) -> bool {
         let scenario_match =
             self.scenario_filter.is_empty() || self.scenario_filter.contains(&scenario.scenario_id);
+        let failure_self_test_match =
+            self.include_failure_self_test && scenario.labels.contains("self-test");
         let label_match = self.label_filter.is_empty()
             || self
                 .label_filter
                 .iter()
                 .any(|label| scenario.labels.contains(label));
-        scenario_match && label_match
+        scenario_match && (label_match || failure_self_test_match)
     }
 }
 
@@ -198,6 +200,14 @@ impl DoctorE2eScenarioSpec {
     pub fn require_json_pointer(mut self, pointer: impl Into<String>) -> Self {
         self.required_json_pointers.push(pointer.into());
         self
+    }
+
+    pub fn expected_runner_status(&self) -> &'static str {
+        if self.labels.contains("self-test") {
+            "fail"
+        } else {
+            "pass"
+        }
     }
 }
 
@@ -640,6 +650,23 @@ pub fn default_doctor_e2e_scenarios() -> Vec<DoctorE2eScenarioSpec> {
         )
         .require_json_pointer("/source_inventory"),
     ]
+}
+
+pub fn failure_self_test_doctor_e2e_scenario() -> DoctorE2eScenarioSpec {
+    DoctorE2eScenarioSpec::new(
+        "intentional-failure-self-test",
+        DoctorFixtureScenario::SourcePruned,
+        ["self-test"],
+    )
+    .require_json_pointer("/definitely_missing_for_self_test")
+}
+
+pub fn doctor_e2e_scenarios_for_args(args: &DoctorE2eCliArgs) -> Vec<DoctorE2eScenarioSpec> {
+    let mut scenarios = default_doctor_e2e_scenarios();
+    if args.include_failure_self_test {
+        scenarios.push(failure_self_test_doctor_e2e_scenario());
+    }
+    scenarios
 }
 
 pub fn default_doctor_e2e_run_root() -> PathBuf {

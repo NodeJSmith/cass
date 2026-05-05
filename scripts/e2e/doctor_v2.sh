@@ -11,6 +11,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 LABELS="quick"
 SCENARIOS=""
 NO_BUILD=0
+INCLUDE_FAILURE_SELF_TEST=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,9 +27,13 @@ while [[ $# -gt 0 ]]; do
       NO_BUILD=1
       shift
       ;;
+    --include-failure-self-test)
+      INCLUDE_FAILURE_SELF_TEST=1
+      shift
+      ;;
     --help|-h)
       cat <<'USAGE'
-Usage: scripts/e2e/doctor_v2.sh [--label quick,fault] [--scenario quick-source-pruned] [--no-build]
+Usage: scripts/e2e/doctor_v2.sh [--label quick,fault] [--scenario quick-source-pruned] [--include-failure-self-test] [--no-build]
 
 Artifacts:
   test-results/e2e/doctor-v2/run-*/artifacts/<scenario>/
@@ -56,6 +61,9 @@ fi
 export CASS_DOCTOR_E2E_LABELS="$LABELS"
 export CASS_DOCTOR_E2E_SCENARIOS="$SCENARIOS"
 export CASS_DOCTOR_E2E_RUN_ROOT="$RUN_ROOT"
+if [[ "$INCLUDE_FAILURE_SELF_TEST" -eq 1 ]]; then
+  export CASS_DOCTOR_E2E_INCLUDE_FAILURE_SELF_TEST=1
+fi
 
 cargo test --test doctor_e2e_runner doctor_e2e_scripted_scenarios -- --nocapture
 
