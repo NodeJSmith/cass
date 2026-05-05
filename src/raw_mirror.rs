@@ -1232,6 +1232,67 @@ mod tests {
         assert_eq!(manifests.len(), 2);
     }
 
+    #[test]
+    fn capture_source_file_rejects_non_file_sources() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_dir = temp.path().join("source-dir");
+        fs::create_dir(&source_dir).expect("source dir");
+
+        let err = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_dir,
+            db_links: &[],
+        })
+        .expect_err("directory source should be rejected");
+        assert!(
+            err.to_string().contains("non-file source"),
+            "unexpected non-file-source error: {err}"
+        );
+        assert!(
+            !data_dir.join(RAW_MIRROR_ROOT_DIR).exists(),
+            "rejected non-file sources must not initialize raw mirror storage"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_source_file_rejects_unreadable_sources_without_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = temp.path().join("unreadable.jsonl");
+        fs::write(&source_path, b"private session bytes\n").expect("source");
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o000))
+            .expect("make source unreadable");
+
+        let err = capture_source_file(RawMirrorCaptureInput {
+            data_dir: &data_dir,
+            provider: "codex",
+            source_id: "local",
+            origin_kind: "local",
+            origin_host: None,
+            source_path: &source_path,
+            db_links: &[],
+        })
+        .expect_err("unreadable source should be rejected");
+        fs::set_permissions(&source_path, fs::Permissions::from_mode(0o600))
+            .expect("restore source perms");
+        assert!(
+            err.to_string().contains("open raw mirror source"),
+            "unexpected unreadable-source error: {err}"
+        );
+        assert!(
+            !data_dir.join("raw-mirror/v1/manifests").exists(),
+            "failed unreadable-source captures must not publish manifests"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn capture_source_file_rejects_symlink_sources() {
