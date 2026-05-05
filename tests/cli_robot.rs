@@ -1241,6 +1241,29 @@ fn search_missing_index_returns_json_error_contract_with_robot_format_compact() 
 }
 
 #[test]
+fn search_dry_run_does_not_require_initialized_index() {
+    let tmp = TempDir::new().unwrap();
+    let mut cmd = base_cmd();
+    cmd.args([
+        "search",
+        "dry run sentinel",
+        "--robot",
+        "--dry-run",
+        "--data-dir",
+        tmp.path().to_str().unwrap(),
+    ]);
+
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let val: Value = serde_json::from_str(&stdout).expect("stdout should be dry-run JSON");
+
+    assert_eq!(val["dry_run"].as_bool(), Some(true));
+    assert_eq!(val["valid"].as_bool(), Some(true));
+    assert_eq!(val["query"].as_str(), Some("dry run sentinel"));
+    assert_eq!(val["_meta"]["dry_run"].as_bool(), Some(true));
+}
+
+#[test]
 fn search_missing_index_returns_json_error_contract_with_env_output_format() {
     let tmp = TempDir::new().unwrap();
     let mut cmd = base_cmd();

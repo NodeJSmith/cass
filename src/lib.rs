@@ -8721,6 +8721,117 @@ fn run_cli_search(
     let index_path = crate::search::tantivy::expected_index_dir(&data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
     let db_exists = db_path.exists();
+
+    let mut filters = SearchFilters::default();
+    if !agents.is_empty() {
+        filters.agents = HashSet::from_iter(agents.iter().cloned());
+    }
+    if !workspaces.is_empty() {
+        filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
+    }
+    filters.created_from = time_filter.since;
+    filters.created_to = time_filter.until;
+
+    // Apply source filter (P3.1)
+    if let Some(ref source_str) = source {
+        filters.source_filter = SourceFilter::parse(source_str);
+    }
+
+    // Apply session paths filter (for chained searches)
+    if let Some(ref sessions_from_arg) = sessions_from {
+        let session_paths = read_session_paths(sessions_from_arg).map_err(|e| CliError {
+            code: 2,
+            kind: CliErrorKind::SessionsFrom.kind_str(),
+            message: format!("failed to read session paths: {e}"),
+            hint: Some("Provide a file path or '-' for stdin".to_string()),
+            retryable: false,
+        })?;
+        filters.session_paths = session_paths;
+    }
+
+    // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
+    let mut limit_val = *limit;
+    let mut offset_val = *offset;
+    if let Some(ref cursor_str) = cursor {
+        let decoded = BASE64_STANDARD.decode(cursor_str).map_err(|e| CliError {
+            code: 2,
+            kind: CliErrorKind::CursorDecode.kind_str(),
+            message: format!("invalid cursor: {e}"),
+            hint: Some("Pass cursor returned in previous _meta.next_cursor".to_string()),
+            retryable: false,
+        })?;
+        let cursor_json: serde_json::Value =
+            serde_json::from_slice(&decoded).map_err(|e| CliError {
+                code: 2,
+                kind: CliErrorKind::CursorParse.kind_str(),
+                message: format!("invalid cursor payload: {e}"),
+                hint: Some("Cursor should be base64 of {\"offset\":N,\"limit\":M}".to_string()),
+                retryable: false,
+            })?;
+        if let Some(o) = cursor_json
+            .get("offset")
+            .and_then(serde_json::Value::as_u64)
+        {
+            offset_val = o as usize;
+        }
+        if let Some(l) = cursor_json.get("limit").and_then(serde_json::Value::as_u64) {
+            limit_val = l as usize;
+        }
+    }
+
+    // Determine the effective output format
+    // Priority: robot_format CLI > json flag > CASS_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > robot_auto > None
+    let effective_robot = robot_format
+        .or(if *json { Some(RobotFormat::Json) } else { None })
+        .or_else(robot_format_from_env)
+        .or(if robot_auto {
+            Some(RobotFormat::Json)
+        } else {
+            None
+        });
+    let field_mask_visible_limit = token_budget_field_mask_visible_limit(max_tokens, limit_val);
+    let field_mask = resolve_field_mask(
+        &fields,
+        max_content_length,
+        max_tokens,
+        field_mask_visible_limit,
+        effective_robot,
+        display_format,
+    );
+
+    // Parse aggregate fields if provided
+    let agg_fields = aggregate
+        .as_ref()
+        .map(|f| parse_aggregate_fields(f))
+        .transpose()?
+        .unwrap_or_default();
+    let has_aggregation = !agg_fields.is_empty();
+
+    // Handle dry-run mode before touching derived search assets. A dry run is
+    // query analysis only, so it must work on a fresh data dir with no DB/index.
+    if dry_run {
+        let explanation = QueryExplanation::analyze(query, &filters);
+        let elapsed_ms = start_time.elapsed().as_millis();
+        let meta = search_dry_run_meta(robot_meta, elapsed_ms);
+
+        let output = serde_json::json!({
+            "dry_run": true,
+            "valid": explanation.warnings.iter().all(|w| !w.contains("error") && !w.contains("invalid")),
+            "query": query,
+            "explanation": explanation,
+            "estimated_cost": format!("{:?}", explanation.estimated_cost),
+            "warnings": explanation.warnings,
+            "request_id": request_id,
+            "_meta": meta,
+        });
+
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
+        );
+        return Ok(());
+    }
+
     let search_self_heal = ensure_lexical_assets_for_search(
         &data_dir,
         &db_path,
@@ -8960,115 +9071,6 @@ fn run_cli_search(
         } else {
             semantic_opts.approximate
         };
-
-    let mut filters = SearchFilters::default();
-    if !agents.is_empty() {
-        filters.agents = HashSet::from_iter(agents.iter().cloned());
-    }
-    if !workspaces.is_empty() {
-        filters.workspaces = HashSet::from_iter(workspaces.iter().cloned());
-    }
-    filters.created_from = time_filter.since;
-    filters.created_to = time_filter.until;
-
-    // Apply source filter (P3.1)
-    if let Some(ref source_str) = source {
-        filters.source_filter = SourceFilter::parse(source_str);
-    }
-
-    // Apply session paths filter (for chained searches)
-    if let Some(ref sessions_from_arg) = sessions_from {
-        let session_paths = read_session_paths(sessions_from_arg).map_err(|e| CliError {
-            code: 2,
-            kind: CliErrorKind::SessionsFrom.kind_str(),
-            message: format!("failed to read session paths: {e}"),
-            hint: Some("Provide a file path or '-' for stdin".to_string()),
-            retryable: false,
-        })?;
-        filters.session_paths = session_paths;
-    }
-
-    // Apply cursor overrides (base64-encoded JSON { "offset": usize, "limit": usize })
-    let mut limit_val = *limit;
-    let mut offset_val = *offset;
-    if let Some(ref cursor_str) = cursor {
-        let decoded = BASE64_STANDARD.decode(cursor_str).map_err(|e| CliError {
-            code: 2,
-            kind: CliErrorKind::CursorDecode.kind_str(),
-            message: format!("invalid cursor: {e}"),
-            hint: Some("Pass cursor returned in previous _meta.next_cursor".to_string()),
-            retryable: false,
-        })?;
-        let cursor_json: serde_json::Value =
-            serde_json::from_slice(&decoded).map_err(|e| CliError {
-                code: 2,
-                kind: CliErrorKind::CursorParse.kind_str(),
-                message: format!("invalid cursor payload: {e}"),
-                hint: Some("Cursor should be base64 of {\"offset\":N,\"limit\":M}".to_string()),
-                retryable: false,
-            })?;
-        if let Some(o) = cursor_json
-            .get("offset")
-            .and_then(serde_json::Value::as_u64)
-        {
-            offset_val = o as usize;
-        }
-        if let Some(l) = cursor_json.get("limit").and_then(serde_json::Value::as_u64) {
-            limit_val = l as usize;
-        }
-    }
-
-    // Determine the effective output format
-    // Priority: robot_format CLI > json flag > CASS_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > robot_auto > None
-    let effective_robot = robot_format
-        .or(if *json { Some(RobotFormat::Json) } else { None })
-        .or_else(robot_format_from_env)
-        .or(if robot_auto {
-            Some(RobotFormat::Json)
-        } else {
-            None
-        });
-    let field_mask_visible_limit = token_budget_field_mask_visible_limit(max_tokens, limit_val);
-    let field_mask = resolve_field_mask(
-        &fields,
-        max_content_length,
-        max_tokens,
-        field_mask_visible_limit,
-        effective_robot,
-        display_format,
-    );
-
-    // Parse aggregate fields if provided
-    let agg_fields = aggregate
-        .as_ref()
-        .map(|f| parse_aggregate_fields(f))
-        .transpose()?
-        .unwrap_or_default();
-    let has_aggregation = !agg_fields.is_empty();
-
-    // Handle dry-run mode: validate and analyze query without executing
-    if dry_run {
-        let explanation = QueryExplanation::analyze(query, &filters);
-        let elapsed_ms = start_time.elapsed().as_millis();
-        let meta = search_dry_run_meta(robot_meta, elapsed_ms);
-
-        let output = serde_json::json!({
-            "dry_run": true,
-            "valid": explanation.warnings.iter().all(|w| !w.contains("error") && !w.contains("invalid")),
-            "query": query,
-            "explanation": explanation,
-            "estimated_cost": format!("{:?}", explanation.estimated_cost),
-            "warnings": explanation.warnings,
-            "request_id": request_id,
-            "_meta": meta,
-        });
-
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string())
-        );
-        return Ok(());
-    }
 
     // Use search_with_fallback to get full metadata (wildcard_fallback, cache_stats)
     let sparse_threshold = 3; // Threshold for triggering wildcard fallback
