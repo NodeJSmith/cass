@@ -1,6 +1,6 @@
 {
   "status": "not_initialized",
-  "health_class": "source-authority-unsafe",
+  "health_class": "degraded-archive-risk",
   "healthy": false,
   "initialized": false,
   "explanation": "No cass database or search index exists in [TEST_HOME]/cass-data yet. This is expected on a fresh install or when using a brand-new --data-dir.",
