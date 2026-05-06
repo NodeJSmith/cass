@@ -8318,9 +8318,13 @@ fn search_lock_busy_error(data_dir: &Path) -> CliError {
     }
 }
 
+fn lexical_repair_error_is_active_index_run(rendered: &str) -> bool {
+    rendered.contains("already holds")
+}
+
 fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliError {
     let rendered = format!("{err:#}");
-    if rendered.contains("already holds") {
+    if lexical_repair_error_is_active_index_run(&rendered) {
         return CliError {
             code: 7,
             kind: CliErrorKind::IndexBusy.kind_str(),
@@ -8421,9 +8425,39 @@ fn ensure_lexical_assets_for_search(
         db_path = %db_path.display(),
         "search detected unusable lexical assets; rebuilding from canonical database before running query"
     );
-    let repair =
-        crate::indexer::repair_lexical_index_from_canonical_db_for_search(db_path, data_dir, None)
-            .map_err(|err| search_lexical_repair_failed_error(&reason, err))?;
+    let repair = match crate::indexer::repair_lexical_index_from_canonical_db_for_search(
+        db_path, data_dir, None,
+    ) {
+        Ok(repair) => repair,
+        Err(err) => {
+            let rendered = format!("{err:#}");
+            if !lexical_repair_error_is_active_index_run(&rendered) {
+                return Err(search_lexical_repair_failed_error(
+                    &reason,
+                    anyhow::anyhow!(rendered),
+                ));
+            }
+
+            let waited = wait_for_searchable_index_after_active_rebuild(
+                data_dir,
+                db_path,
+                index_path,
+                search_active_rebuild_wait_duration(timeout_ms, started_at),
+            );
+            if waited && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none() {
+                return Ok(SearchLexicalSelfHeal {
+                    action: "waited-for-concurrent-lexical-repair",
+                    reason: Some(reason),
+                    indexed_docs: None,
+                });
+            }
+
+            crate::indexer::repair_lexical_index_from_canonical_db_for_search(
+                db_path, data_dir, None,
+            )
+            .map_err(|retry_err| search_lexical_repair_failed_error(&reason, retry_err))?
+        }
+    };
 
     Ok(SearchLexicalSelfHeal {
         action: "rebuilt-from-canonical-db",

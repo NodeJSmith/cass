@@ -5265,6 +5265,7 @@ fn seed_codex_session_s0cmk(codex_home: &std::path::Path, filename: &str, keywor
 
 fn isolated_cass_cmd(temp_home: &std::path::Path) -> Command {
     let mut cmd = Command::new(cass_bin());
+    cmd.current_dir(temp_home);
     cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
     cmd.env("CASS_IGNORE_SOURCES_CONFIG", "1");
     cmd.env("HOME", temp_home);
