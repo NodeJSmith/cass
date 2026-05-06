@@ -956,7 +956,7 @@ fn materialize_federated_search_bundle_for_write(index_path: &Path) -> Result<()
             )
         })?;
 
-    if index_path.exists() {
+    if ensure_replaceable_federated_materialization_root(index_path)? {
         fs::remove_dir_all(index_path).with_context(|| {
             format!(
                 "removing federated lexical bundle before mutable materialization {}",
@@ -975,6 +975,34 @@ fn materialize_federated_search_bundle_for_write(index_path: &Path) -> Result<()
         .close()
         .context("closing federated lexical materialization staging directory")?;
     Ok(())
+}
+
+fn ensure_replaceable_federated_materialization_root(index_path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(index_path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(anyhow::anyhow!(
+                    "refusing to materialize federated lexical bundle through symlink: {}",
+                    index_path.display()
+                ));
+            }
+            if !file_type.is_dir() {
+                return Err(anyhow::anyhow!(
+                    "refusing to materialize federated lexical bundle because root is not a directory: {}",
+                    index_path.display()
+                ));
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "checking federated lexical bundle root before materialization: {}",
+                index_path.display()
+            )
+        }),
+    }
 }
 
 pub fn publish_federated_searchable_index_directories<P: AsRef<Path>>(
@@ -2570,6 +2598,51 @@ mod tests {
             !published.join(FEDERATED_SEARCH_MANIFEST_FILE).exists(),
             "materialization should replace the federated bundle manifest"
         );
+    }
+
+    #[test]
+    fn federated_materialization_target_rejects_file_root() {
+        let root = TempDir::new().expect("temp dir");
+        let published = root.path().join("published");
+        fs::write(&published, "not a directory").expect("write file root");
+
+        let err = ensure_replaceable_federated_materialization_root(&published)
+            .expect_err("file roots must not be materialized over");
+
+        assert!(
+            err.to_string().contains("not a directory"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(&published).expect("file root should remain"),
+            "not a directory"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn federated_materialization_target_rejects_dangling_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().expect("temp dir");
+        let published = root.path().join("published");
+        let missing_target = root.path().join("missing-published");
+        symlink(&missing_target, &published).expect("create dangling symlink");
+
+        let err = ensure_replaceable_federated_materialization_root(&published)
+            .expect_err("symlink roots must not be materialized over");
+
+        assert!(
+            err.to_string().contains("through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            fs::symlink_metadata(&published)
+                .expect("symlink root should remain")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!missing_target.exists());
     }
 
     /// Equivalence gate for `coding_agent_session_search-ibuuh.32`:
