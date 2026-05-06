@@ -8362,9 +8362,7 @@ fn ensure_lexical_assets_for_search(
     let initial_index_exists = crate::search::tantivy::searchable_index_exists(index_path);
     let initial_rebuild_active = probe_index_run_lock(data_dir, db_path).active;
     if initial_rebuild_active {
-        if initial_index_exists
-            && search_lexical_self_heal_diagnosis(index_path, db_path)?.is_none()
-        {
+        if initial_index_exists {
             return Ok(SearchLexicalSelfHeal {
                 action: "active-rebuild-searching-existing-index",
                 reason: Some("lexical repair is already running".to_string()),
@@ -20231,6 +20229,288 @@ fn doctor_fast_coverage_risk_unchecked(db_exists: bool) -> DoctorCoverageRiskSum
         },
         ..DoctorCoverageRiskSummary::default()
     }
+}
+
+struct DoctorRuntimeSummaryInput<'a> {
+    surface: &'static str,
+    state: &'a serde_json::Value,
+    status: &'a str,
+    healthy: bool,
+    initialized: bool,
+    db_exists: bool,
+    rebuild_active: bool,
+    coverage_risk: &'a DoctorCoverageRiskSummary,
+    coverage_source: &'static str,
+    coverage_checked: bool,
+    quarantine_summary: Option<&'a DiagQuarantineSummary>,
+    recommended_action: Option<&'a String>,
+    data_dir: &'a Path,
+}
+
+fn doctor_summary_coverage_state(coverage_risk: &DoctorCoverageRiskSummary) -> &'static str {
+    match coverage_risk.status.as_str() {
+        "ok" => "ok",
+        "not_initialized" => "not_initialized",
+        "sole_copy_risk" => "sole_copy_risk",
+        "raw_mirror_backfill_available" => "raw_mirror_backfill_available",
+        "raw_mirror_unlinked" => "raw_mirror_unlinked",
+        "current_sources_newer_than_archive" => "current_sources_newer_than_archive",
+        status if status.starts_with("unchecked") => "not_checked",
+        _ => "unknown",
+    }
+}
+
+fn doctor_summary_source_mirror_state(coverage_risk: &DoctorCoverageRiskSummary) -> &'static str {
+    if coverage_risk.status == "not_initialized" {
+        "not_initialized"
+    } else if coverage_risk.confidence_tier == "unchecked" {
+        "not_checked"
+    } else if coverage_risk.db_without_raw_mirror_count > 0 {
+        "archive_rows_without_raw_mirror"
+    } else if coverage_risk.mirror_without_db_link_count > 0 {
+        "raw_mirror_unlinked"
+    } else if coverage_risk.raw_mirror_db_link_count > 0 {
+        "linked"
+    } else if coverage_risk.archive_conversation_count > 0 {
+        "missing"
+    } else {
+        "empty"
+    }
+}
+
+fn doctor_summary_risk_level(coverage_risk: &DoctorCoverageRiskSummary) -> &'static str {
+    if coverage_risk.status == "sole_copy_risk" {
+        "high"
+    } else if coverage_risk.confidence_tier == "unchecked" {
+        "unknown"
+    } else if coverage_risk.missing_current_source_count > 0
+        || coverage_risk.db_without_raw_mirror_count > 0
+        || coverage_risk.db_projection_only_count > 0
+    {
+        "medium"
+    } else if coverage_risk.mirror_without_db_link_count > 0
+        || coverage_risk.current_source_newer_than_archive_count > 0
+    {
+        "low"
+    } else {
+        "none"
+    }
+}
+
+fn doctor_summary_health_class(
+    coverage_risk: &DoctorCoverageRiskSummary,
+    repair_blocked_reason: Option<&str>,
+    initialized: bool,
+    healthy: bool,
+) -> &'static str {
+    if repair_blocked_reason.is_some() {
+        "repair-blocked"
+    } else if coverage_risk.status == "sole_copy_risk"
+        || coverage_risk.missing_current_source_count > 0
+        || coverage_risk.db_without_raw_mirror_count > 0
+        || coverage_risk.db_projection_only_count > 0
+    {
+        "degraded-archive-risk"
+    } else if healthy {
+        "healthy"
+    } else if !initialized {
+        "degraded-derived-assets"
+    } else {
+        "degraded-derived-assets"
+    }
+}
+
+fn doctor_summary_failure_marker_path(data_dir: &Path) -> Option<String> {
+    ["repair_apply", "cleanup_apply", "restore_apply"]
+        .into_iter()
+        .map(|repair_class| collect_doctor_repair_failure_marker(data_dir, repair_class))
+        .find(|marker| marker.found)
+        .and_then(|marker| marker.path)
+}
+
+fn build_doctor_runtime_summary(input: DoctorRuntimeSummaryInput<'_>) -> serde_json::Value {
+    let fallback_mode = doctor_fallback_mode_from_state(input.state);
+    let doctor_lock = doctor_probe_mutation_lock(input.data_dir);
+    let active_doctor_repair = matches!(
+        doctor_lock,
+        DoctorMutationLockObservation::Active { .. } | DoctorMutationLockObservation::Unavailable { .. }
+    );
+    let active_index_maintenance = input
+        .state
+        .pointer("/rebuild/active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(input.rebuild_active);
+    let repair_blocked_reason = if active_doctor_repair {
+        Some("another doctor repair appears to hold the mutation lock".to_string())
+    } else if active_index_maintenance {
+        Some("index maintenance is active; mutating doctor repair should wait".to_string())
+    } else {
+        None
+    };
+    let failure_marker_path = doctor_summary_failure_marker_path(input.data_dir);
+    let repair_previously_failed = failure_marker_path.is_some();
+    let coverage_state = doctor_summary_coverage_state(input.coverage_risk);
+    let source_mirror_state = doctor_summary_source_mirror_state(input.coverage_risk);
+    let risk_level = doctor_summary_risk_level(input.coverage_risk);
+    let health_class = doctor_summary_health_class(
+        input.coverage_risk,
+        repair_blocked_reason.as_deref(),
+        input.initialized,
+        input.healthy,
+    );
+    let doctor_check_recommended = !input.coverage_checked
+        || repair_blocked_reason.is_some()
+        || repair_previously_failed
+        || !matches!(input.coverage_risk.status.as_str(), "ok" | "not_initialized");
+    let repair_recommended = input.coverage_risk.recommended_action != "none"
+        && input.coverage_risk.confidence_tier != "unchecked";
+    let recommended_action = if let Some(reason) = repair_blocked_reason.as_ref() {
+        if reason.contains("index maintenance") {
+            "Wait for the active index operation to finish, then run 'cass doctor check --json'."
+                .to_string()
+        } else {
+            "Wait for the active doctor owner to finish, then run 'cass doctor check --json'."
+                .to_string()
+        }
+    } else if doctor_check_recommended {
+        "Run 'cass doctor check --json' to refresh archive coverage and repair readiness."
+            .to_string()
+    } else {
+        input
+            .recommended_action
+            .cloned()
+            .unwrap_or_else(|| "none".to_string())
+    };
+    let blocked_reasons = repair_blocked_reason
+        .as_ref()
+        .map(|reason| vec![reason.clone()])
+        .unwrap_or_default();
+    let cleanup_reclaimable_bytes = input
+        .quarantine_summary
+        .map(|summary| summary.cleanup_dry_run_reclaimable_bytes);
+    let quarantine_summary = input
+        .quarantine_summary
+        .and_then(|summary| serde_json::to_value(summary).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let coverage_known = input.coverage_checked && input.coverage_risk.confidence_tier != "unchecked";
+    let coverage_delta = serde_json::json!({
+        "status": if coverage_known { "unchanged" } else { "unknown" },
+        "archive_conversation_count": coverage_known.then_some(input.coverage_risk.archive_conversation_count),
+        "visible_source_conversation_count": coverage_known.then_some(
+            input
+                .coverage_risk
+                .archive_conversation_count
+                .saturating_sub(input.coverage_risk.missing_current_source_count)
+        ),
+        "raw_mirror_manifest_count": serde_json::Value::Null,
+        "db_projection_only_count": coverage_known.then_some(input.coverage_risk.db_projection_only_count),
+        "missing_current_source_count": coverage_known.then_some(input.coverage_risk.missing_current_source_count),
+        "conversation_delta": serde_json::Value::Null,
+        "message_delta": serde_json::Value::Null,
+        "semantic_vector_delta": serde_json::Value::Null,
+        "derived_asset_delta": serde_json::Value::Null,
+    });
+    let outcome_kind = if repair_blocked_reason.is_some() {
+        "blocked"
+    } else {
+        "no_op"
+    };
+    let status = if repair_blocked_reason.is_some() {
+        "blocked"
+    } else if !input.initialized || !input.coverage_checked {
+        "skipped"
+    } else if matches!(risk_level, "high" | "medium" | "low") {
+        "warn"
+    } else {
+        "ok"
+    };
+    let operation_outcome_kind = if repair_blocked_reason.is_some() {
+        "repair-blocked"
+    } else if doctor_check_recommended {
+        "ok-read-only-diagnosed"
+    } else {
+        "ok-no-action-needed"
+    };
+
+    serde_json::json!({
+        "schema_version": 2,
+        "surface": input.surface,
+        "mode": "read-only-check",
+        "status": status,
+        "outcome_kind": outcome_kind,
+        "health_class": health_class,
+        "risk_level": risk_level,
+        "asset_class": "canonical_archive_db",
+        "fallback_mode": fallback_mode,
+        "authority_status": "read_only",
+        "coverage_delta": coverage_delta,
+        "blocked_reasons": blocked_reasons,
+        "plan_fingerprint": serde_json::Value::Null,
+        "receipt_path": serde_json::Value::Null,
+        "event_log_path": serde_json::Value::Null,
+        "artifact_manifest_path": serde_json::Value::Null,
+        "recommended_action": recommended_action,
+        "redaction_status": "redacted",
+        "contract_provenance": "runtime",
+        "operation_outcome": {
+            "kind": operation_outcome_kind,
+            "reason": if repair_blocked_reason.is_some() {
+                "repair readiness is blocked by active work"
+            } else if doctor_check_recommended {
+                "health/status used bounded readiness evidence and recommends doctor check for full archive coverage"
+            } else {
+                "health/status summary found no repair blocker in bounded evidence"
+            },
+            "action_taken": "reported bounded health/status doctor summary without mutating archive data",
+            "action_not_taken": "did not run deep doctor collectors, source sync, rebuild, model verification, or filesystem-wide repair work",
+            "safe_to_retry": repair_blocked_reason.is_none(),
+            "requires_override": false,
+            "data_loss_risk": risk_level,
+            "next_command": if doctor_check_recommended || repair_blocked_reason.is_some() {
+                serde_json::json!("cass doctor check --json")
+            } else {
+                serde_json::Value::Null
+            },
+            "artifact_manifest_path": serde_json::Value::Null,
+            "exit_code_kind": if repair_blocked_reason.is_some() { "lock-busy" } else { "success" },
+        },
+        "doctor_available": true,
+        "safe_auto_run_eligible": false,
+        "last_receipt_path": serde_json::Value::Null,
+        "failure_marker_path": failure_marker_path,
+        "repair_previously_failed": repair_previously_failed,
+        "active_repair": {
+            "active": active_doctor_repair,
+            "active_index_maintenance": active_index_maintenance,
+            "repair_blocked_reason": repair_blocked_reason,
+        },
+        "repair_recommended": repair_recommended,
+        "repair_blocked_reason": repair_blocked_reason,
+        "doctor_check_recommended": doctor_check_recommended,
+        "archive_coverage_state": coverage_state,
+        "source_mirror_state": source_mirror_state,
+        "sole_copy_conversation_count": input.coverage_risk.sole_copy_warning_count,
+        "cleanup_reclaimable_bytes": cleanup_reclaimable_bytes,
+        "quarantine_summary": quarantine_summary,
+        "coverage_source": {
+            "status": if input.coverage_checked { "checked" } else { "not_checked" },
+            "source": input.coverage_source,
+            "confidence_tier": input.coverage_risk.confidence_tier,
+            "generated_at": input
+                .state
+                .pointer("/_meta/timestamp")
+                .and_then(serde_json::Value::as_str),
+            "stale_after_seconds": if input.coverage_checked { 300 } else { 0 },
+            "source_report_id": serde_json::Value::Null,
+            "recommended_action": if input.coverage_checked {
+                "Use this bounded status summary for routing; run cass doctor check --json before mutating."
+            } else {
+                "Run cass doctor check --json for current archive coverage; health/status did not run deep collectors."
+            },
+        },
+        "health_status": input.status,
+        "db_exists": input.db_exists,
+    })
 }
 
 fn doctor_raw_mirror_summary_checksum_status(
@@ -39401,7 +39681,35 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        let coverage_risk = collect_doctor_coverage_risk_summary(&data_dir, &db_path);
+        let status_collects_coverage = db_exists && !status_should_skip_db_open(&db_path);
+        let (coverage_risk, coverage_source, coverage_checked) = if status_collects_coverage {
+            (
+                collect_doctor_coverage_risk_summary(&data_dir, &db_path),
+                "status-inline-small-archive",
+                true,
+            )
+        } else {
+            (
+                doctor_fast_coverage_risk_unchecked(db_exists),
+                "status-fast-state",
+                false,
+            )
+        };
+        let doctor_summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "status-summary",
+            state: &state,
+            status,
+            healthy,
+            initialized: !not_initialized,
+            db_exists,
+            rebuild_active,
+            coverage_risk: &coverage_risk,
+            coverage_source,
+            coverage_checked,
+            quarantine_summary: Some(&quarantine_report.summary),
+            recommended_action: recommended_action.as_ref(),
+            data_dir: &data_dir,
+        });
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -39425,6 +39733,7 @@ fn run_status(
             "semantic": state.get("semantic").cloned().unwrap_or(serde_json::Value::Null),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,
+            "doctor_summary": doctor_summary,
             "coverage_risk": coverage_risk,
             "quarantine": quarantine_report,
             "recommended_action": recommended_action,
@@ -39734,6 +40043,21 @@ fn run_health(
             .cloned()
             .unwrap_or(serde_json::Value::Null);
         let coverage_risk = doctor_fast_coverage_risk_unchecked(db_exists);
+        let doctor_summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+            surface: "health-summary",
+            state: &state,
+            status,
+            healthy,
+            initialized: !not_initialized,
+            db_exists,
+            rebuild_active,
+            coverage_risk: &coverage_risk,
+            coverage_source: "health-fast-state",
+            coverage_checked: false,
+            quarantine_summary: None,
+            recommended_action: recommended_action.as_ref(),
+            data_dir: &data_dir,
+        });
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -39760,6 +40084,7 @@ fn run_health(
                     .cloned()
                     .unwrap_or(serde_json::Value::Bool(false))
             },
+            "doctor_summary": doctor_summary,
             "coverage_risk": coverage_risk,
             "policy_registry": policy_registry,
             "responsiveness": responsiveness,
@@ -46386,6 +46711,79 @@ fn response_schema_doctor_v2_summary(surface: &'static str) -> serde_json::Value
                 "failure_marker_path",
                 serde_json::json!({ "type": ["string", "null"] }),
             ),
+            (
+                "repair_previously_failed",
+                serde_json::json!({ "type": "boolean" }),
+            ),
+            (
+                "active_repair",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "active": { "type": "boolean" },
+                        "active_index_maintenance": { "type": "boolean" },
+                        "repair_blocked_reason": { "type": ["string", "null"] }
+                    }
+                }),
+            ),
+            (
+                "repair_recommended",
+                serde_json::json!({ "type": "boolean" }),
+            ),
+            (
+                "repair_blocked_reason",
+                serde_json::json!({ "type": ["string", "null"] }),
+            ),
+            (
+                "doctor_check_recommended",
+                serde_json::json!({ "type": "boolean" }),
+            ),
+            (
+                "archive_coverage_state",
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Compact coverage state: ok, not_checked, not_initialized, sole_copy_risk, raw_mirror_backfill_available, raw_mirror_unlinked, current_sources_newer_than_archive, or unknown."
+                }),
+            ),
+            (
+                "source_mirror_state",
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Compact raw-mirror/source state derived from bounded evidence."
+                }),
+            ),
+            (
+                "sole_copy_conversation_count",
+                serde_json::json!({ "type": "integer" }),
+            ),
+            (
+                "cleanup_reclaimable_bytes",
+                serde_json::json!({ "type": ["integer", "null"] }),
+            ),
+            (
+                "quarantine_summary",
+                serde_json::json!({
+                    "type": ["object", "null"],
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "coverage_source",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string" },
+                        "source": { "type": "string" },
+                        "confidence_tier": { "type": "string" },
+                        "generated_at": { "type": ["string", "null"] },
+                        "stale_after_seconds": { "type": "integer" },
+                        "source_report_id": { "type": ["string", "null"] },
+                        "recommended_action": { "type": "string" }
+                    }
+                }),
+            ),
+            ("health_status", serde_json::json!({ "type": "string" })),
+            ("db_exists", serde_json::json!({ "type": "boolean" })),
         ],
     )
 }

@@ -5350,22 +5350,17 @@ fn search_with_intact_db_but_wiped_lexical_degrades_with_truthful_warning() {
          not hard-fail. stdout: {stdout}\nstderr: {stderr}"
     );
 
-    // CONTRACT PIN 2: stderr must carry the truthful warning that
-    // names both (a) the missing lexical path and (b) the recovery
-    // command. Agents and humans consuming stderr need this to act.
+    // CONTRACT PIN 2: the missing derived lexical tree is repaired
+    // automatically from the canonical DB. The old contract printed a
+    // manual `cass index --full` warning here; the self-healing search
+    // contract should make that repair invisible to robot consumers.
     assert!(
-        stderr.contains("Tantivy search index not found"),
-        "stderr must contain the 'Tantivy search index not found' warning; got: {stderr}"
+        index_path.exists(),
+        "search must recreate the missing lexical index from the canonical DB"
     );
     assert!(
-        stderr.contains("cass index --full"),
-        "stderr warning must name the blessed recovery command `cass index --full`; \
-         got: {stderr}"
-    );
-    assert!(
-        stderr.contains(index_path.display().to_string().as_str()),
-        "stderr warning must name the exact lexical path so users can verify what \
-         they need to rebuild; got: {stderr}"
+        stderr.trim().is_empty(),
+        "automatic lexical repair should not require a manual-rebuild warning; got: {stderr}"
     );
 
     // CONTRACT PIN 3: stdout is still valid JSON so agents parse it.
