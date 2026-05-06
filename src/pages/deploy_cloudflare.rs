@@ -388,22 +388,40 @@ impl TempDeployDir {
 
 impl Drop for TempDeployDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if deploy_staging_path_is_real_dir(&self.path).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
 /// Create a temporary directory
 fn create_temp_dir() -> Result<TempDeployDir> {
     let temp_base = std::env::temp_dir();
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
     let pid = std::process::id();
-    let dir_name = format!("cass-cf-deploy-{}-{}", pid, timestamp);
-    let temp_dir = temp_base.join(dir_name);
-    std::fs::create_dir_all(&temp_dir)?;
-    Ok(TempDeployDir { path: temp_dir })
+    for attempt in 0..100 {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir_name = format!("cass-cf-deploy-{pid}-{timestamp}-{attempt}");
+        let temp_dir = temp_base.join(dir_name);
+        match std::fs::create_dir(&temp_dir) {
+            Ok(()) => return Ok(TempDeployDir { path: temp_dir }),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed creating deploy staging directory {}",
+                        temp_dir.display()
+                    )
+                });
+            }
+        }
+    }
+    bail!(
+        "failed to allocate unique Cloudflare deploy staging directory under {}",
+        temp_base.display()
+    )
 }
 
 fn stage_deploy_dir(source_path: &Path) -> Result<TempDeployDir> {
@@ -1349,9 +1367,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Result<()> {
-    if !dst.exists() {
-        std::fs::create_dir_all(dst)?;
-    }
+    ensure_deploy_staging_dir(dst)?;
 
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -1405,6 +1421,69 @@ fn copy_dir_recursive_inner(src: &Path, dst: &Path, canonical_base: &Path) -> Re
     }
 
     Ok(())
+}
+
+fn ensure_deploy_staging_dir(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "Refusing to use deploy staging directory through symlink: {}",
+                    path.display()
+                );
+            }
+            if !file_type.is_dir() {
+                bail!(
+                    "Refusing to use deploy staging path because it is not a directory: {}",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata)
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    Ok(())
+                }
+                Ok(_) => bail!(
+                    "Refusing to use deploy staging path after create because it is not a real directory: {}",
+                    path.display()
+                ),
+                Err(err) => Err(err).with_context(|| {
+                    format!(
+                        "Failed inspecting deploy staging directory after create: {}",
+                        path.display()
+                    )
+                }),
+            }
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed inspecting deploy staging directory before copy: {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn deploy_staging_path_is_real_dir(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            Ok(file_type.is_dir() && !file_type.is_symlink())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed inspecting deploy staging directory before cleanup: {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -1603,6 +1682,38 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_rejects_symlinked_destination_root() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let src = TempDir::new().unwrap();
+        let parent = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let dst = parent.path().join("deploy-site");
+
+        std::fs::write(src.path().join("root.txt"), "root").unwrap();
+        symlink(outside.path(), &dst).unwrap();
+
+        let err = copy_dir_recursive(src.path(), &dst).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("deploy staging directory through symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !outside.path().join("root.txt").exists(),
+            "deploy staging must not copy through a symlinked destination"
+        );
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
     fn test_temp_deploy_dir_cleans_up_on_drop() {
         let temp_path = {
             let temp = create_temp_dir().unwrap();
@@ -1613,6 +1724,35 @@ mod tests {
         };
 
         assert!(!temp_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_temp_deploy_dir_drop_skips_symlinked_staging_path() {
+        use std::os::unix::fs::symlink;
+        use tempfile::TempDir;
+
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("sentinel.txt"), "keep").unwrap();
+        let temp_path = {
+            let temp = create_temp_dir().unwrap();
+            let temp_path = temp.path().to_path_buf();
+            let moved_path = temp_path.with_extension("moved-aside");
+            std::fs::rename(&temp_path, &moved_path).unwrap();
+            symlink(outside.path(), &temp_path).unwrap();
+            temp_path
+        };
+
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("sentinel.txt")).unwrap(),
+            "keep"
+        );
+        assert!(
+            std::fs::symlink_metadata(&temp_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
