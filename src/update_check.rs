@@ -324,13 +324,20 @@ trap cleanup EXIT
 script="$tmp/install.sh"
 sums="$tmp/SHA256SUMS.txt"
 curl -fsSL "$1" -o "$script"
-if ! curl -fsSL "$2" -o "$sums"; then
-    curl -fsSL "$4" -o "$sums"
-fi
-
-expected="$(awk '$2 == "install.sh" { print $1; exit }' "$sums")"
+expected=""
+for checksums_url in "$2" "$4"; do
+    [ -n "$checksums_url" ] || continue
+    if ! curl -fsSL "$checksums_url" -o "$sums"; then
+        continue
+    fi
+    candidate="$(awk '$2 == "install.sh" { print $1; exit }' "$sums")"
+    if printf '%s' "$candidate" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+        expected="$candidate"
+        break
+    fi
+done
 if ! printf '%s' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$'; then
-    echo "install.sh checksum missing from SHA256SUMS.txt" >&2
+    echo "install.sh checksum missing from release checksum manifests" >&2
     exit 1
 fi
 expected_lc="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
@@ -370,22 +377,31 @@ try {
     $Script = Join-Path $Temp "install.ps1"
     $Sums = Join-Path $Temp "SHA256SUMS.txt"
     Invoke-WebRequest -Uri $InstallUrl -OutFile $Script -UseBasicParsing
-    try {
-        Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $Sums -UseBasicParsing
-    } catch {
-        Invoke-WebRequest -Uri $args[3] -OutFile $Sums -UseBasicParsing
-    }
 
     $Expected = $null
-    foreach ($Line in Get-Content -LiteralPath $Sums) {
-        $Parts = $Line.Trim() -split '\s+', 2
-        if ($Parts.Count -ge 2 -and $Parts[1] -eq "install.ps1" -and $Parts[0] -match '^[0-9a-fA-F]{64}$') {
-            $Expected = $Parts[0].ToLowerInvariant()
+    foreach ($ChecksumsCandidateUrl in @($ChecksumsUrl, $args[3])) {
+        if (-not $ChecksumsCandidateUrl) {
+            continue
+        }
+        try {
+            Invoke-WebRequest -Uri $ChecksumsCandidateUrl -OutFile $Sums -UseBasicParsing
+        } catch {
+            continue
+        }
+
+        foreach ($Line in Get-Content -LiteralPath $Sums) {
+            $Parts = $Line.Trim() -split '\s+', 2
+            if ($Parts.Count -ge 2 -and $Parts[1] -eq "install.ps1" -and $Parts[0] -match '^[0-9a-fA-F]{64}$') {
+                $Expected = $Parts[0].ToLowerInvariant()
+                break
+            }
+        }
+        if ($Expected) {
             break
         }
     }
     if (-not $Expected) {
-        Write-Error "install.ps1 checksum missing from SHA256SUMS.txt"
+        Write-Error "install.ps1 checksum missing from release checksum manifests"
         exit 1
     }
 
@@ -772,9 +788,10 @@ mod tests {
         let script = unix_self_update_script();
         assert!(script.contains(CHECKSUMS_ASSET));
         assert!(
-            script.contains(r#"curl -fsSL "$4" -o "$sums""#),
-            "Unix self-update should fall back to legacy SHA256SUMS asset URL"
+            script.contains(r#"for checksums_url in "$2" "$4"; do"#),
+            "Unix self-update should try both checksum manifest URLs"
         );
+        assert!(script.contains(r#"expected="$candidate""#));
         assert!(script.contains(&format!(r#"$2 == "{UNIX_INSTALL_ASSET}""#)));
         assert!(script.contains("sha256sum -c -"));
         assert!(script.contains("shasum -a 256"));
@@ -787,9 +804,11 @@ mod tests {
         let script = windows_self_update_script();
         assert!(script.contains(CHECKSUMS_ASSET));
         assert!(
-            script.contains("Invoke-WebRequest -Uri $args[3] -OutFile $Sums"),
-            "Windows self-update should fall back to legacy SHA256SUMS asset URL"
+            script.contains("foreach ($ChecksumsCandidateUrl in @($ChecksumsUrl, $args[3]))"),
+            "Windows self-update should try both checksum manifest URLs"
         );
+        assert!(script.contains("Invoke-WebRequest -Uri $ChecksumsCandidateUrl -OutFile $Sums"));
+        assert!(script.contains("if ($Expected)"));
         assert!(script.contains(&format!(r#"$Parts[1] -eq "{WINDOWS_INSTALL_ASSET}""#)));
         assert!(script.contains("Get-FileHash"));
         assert!(script.contains("-EasyMode -Verify -Version $Version"));
