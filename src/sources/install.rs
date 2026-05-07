@@ -448,7 +448,7 @@ impl RemoteInstaller {
         };
         let distro = raw_distro.to_ascii_lowercase();
 
-        if distro.contains("alpine") || distro.contains("void linux") {
+        if distro.contains("alpine") || distro.contains("void linux") || distro.contains("nixos") {
             return false;
         }
         if distro.contains("ubuntu") || distro.contains("pop!_os") || distro.contains("pop os") {
@@ -1436,6 +1436,8 @@ mod tests {
             "CentOS Linux 7 (Core)",
             "Amazon Linux 2023",
             "Alpine Linux v3.20",
+            "Void Linux",
+            "NixOS 24.05 (Uakari)",
             "Pop!_OS 22.04 LTS",
             "Linux Mint 21.3 Virginia",
             "elementary OS 7.1 Horus",

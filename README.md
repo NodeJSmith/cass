@@ -463,7 +463,7 @@ When the wizard installs `cass` on remote machines, it uses an intelligent fallb
 **Resource Requirements**:
 - Minimum 1GB disk space for installation
 - Recommended 2GB RAM for compilation
-- Linux pre-built binaries require glibc 2.38+; older glibc hosts fall back to source installation when possible.
+- Linux pre-built binaries require glibc 2.38+ on conventional FHS-style distributions; older glibc, musl-only, and NixOS hosts fall back to source installation when possible.
 - SSH access with key-based authentication
 
 **What Gets Installed**:
