@@ -20,9 +20,9 @@ use base64::prelude::*;
 use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Debug, thiserror::Error)]
@@ -605,8 +605,8 @@ impl DecryptionEngine {
             );
         }
 
-        let mut output_file = File::create(output_path)?;
-        let mut writer = BufWriter::new(&mut output_file);
+        let (mut pending_output, output_file) = PendingDecryptOutput::create(output_path)?;
+        let mut writer = BufWriter::new(output_file);
 
         for (chunk_index, chunk_file) in self.config.payload.files.iter().enumerate() {
             progress(chunk_index, self.config.payload.chunk_count);
@@ -664,12 +664,170 @@ impl DecryptionEngine {
         }
 
         writer.flush()?;
+        writer
+            .get_ref()
+            .sync_all()
+            .with_context(|| format!("Failed to sync {}", pending_output.path().display()))?;
+        drop(writer);
+        pending_output.persist(output_path)?;
+
         progress(
             self.config.payload.chunk_count,
             self.config.payload.chunk_count,
         );
 
         Ok(())
+    }
+}
+
+struct PendingDecryptOutput {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl PendingDecryptOutput {
+    fn create(output_path: &Path) -> Result<(Self, File)> {
+        let parent = output_parent(output_path);
+        let file_name = output_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("decryption output path must name a file"))?
+            .to_string_lossy();
+
+        for attempt in 0..100u32 {
+            let mut random_bytes = [0u8; 8];
+            let mut rng = rand::rng();
+            rng.fill_bytes(&mut random_bytes);
+            let random = u64::from_le_bytes(random_bytes);
+            let temp_path = parent.join(format!(
+                ".{file_name}.cass-decrypt-tmp.{}.{}.{:016x}",
+                std::process::id(),
+                attempt,
+                random
+            ));
+
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => {
+                    return Ok((
+                        Self {
+                            path: temp_path,
+                            keep: false,
+                        },
+                        file,
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to create temporary decrypt output {}",
+                            temp_path.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        bail!(
+            "Failed to create a unique temporary decrypt output next to {} after 100 attempts",
+            output_path.display()
+        );
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist(&mut self, output_path: &Path) -> Result<()> {
+        replace_decrypt_output_from_temp(&self.path, output_path)?;
+        self.keep = true;
+        Ok(())
+    }
+}
+
+impl Drop for PendingDecryptOutput {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn output_parent(output_path: &Path) -> &Path {
+    output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn replace_decrypt_output_from_temp(temp_path: &Path, output_path: &Path) -> Result<()> {
+    replace_decrypt_output_from_temp_impl(temp_path, output_path)?;
+    sync_parent_directory(output_path)
+}
+
+#[cfg(not(windows))]
+fn replace_decrypt_output_from_temp_impl(temp_path: &Path, output_path: &Path) -> Result<()> {
+    std::fs::rename(temp_path, output_path).with_context(|| {
+        format!(
+            "Failed to install decrypted output {} from {}",
+            output_path.display(),
+            temp_path.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn replace_decrypt_output_from_temp_impl(temp_path: &Path, output_path: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(output_path).is_err() {
+        return std::fs::rename(temp_path, output_path).with_context(|| {
+            format!(
+                "Failed to install decrypted output {} from {}",
+                output_path.display(),
+                temp_path.display()
+            )
+        });
+    }
+
+    let parent = output_parent(output_path);
+    let file_name = output_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("decryption output path must name a file"))?
+        .to_string_lossy();
+    let backup_path = parent.join(format!(
+        ".{file_name}.cass-decrypt-backup.{}",
+        std::process::id()
+    ));
+
+    std::fs::rename(output_path, &backup_path).with_context(|| {
+        format!(
+            "Failed to stage existing decrypted output {} before replacement",
+            output_path.display()
+        )
+    })?;
+
+    match std::fs::rename(temp_path, output_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            Ok(())
+        }
+        Err(replace_err) => match std::fs::rename(&backup_path, output_path) {
+            Ok(()) => Err(replace_err).with_context(|| {
+                format!(
+                    "Failed to install decrypted output {}; restored previous output",
+                    output_path.display()
+                )
+            }),
+            Err(restore_err) => bail!(
+                "Failed to install decrypted output {}; also failed to restore previous output from {}: {}; temporary output retained at {}",
+                output_path.display(),
+                backup_path.display(),
+                restore_err,
+                temp_path.display()
+            ),
+        },
     }
 }
 
@@ -1126,6 +1284,92 @@ mod tests {
                 .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
                 .is_err()
         );
+    }
+
+    #[test]
+    fn decrypt_to_file_preserves_existing_output_when_later_chunk_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        let decrypted_path = temp_dir.path().join("decrypted.txt");
+
+        let test_data: Vec<u8> = (0..4096).map(|idx| (idx % 251) as u8).collect();
+        std::fs::write(&input_path, &test_data).unwrap();
+
+        let mut engine = EncryptionEngine::new(32).unwrap();
+        engine.add_password_slot("password").unwrap();
+        let config = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .unwrap();
+        assert!(
+            config.payload.chunk_count > 1,
+            "test must produce multiple chunks to exercise partial-write failure"
+        );
+
+        let existing_output = b"existing decrypted output must survive failed decrypt";
+        std::fs::write(&decrypted_path, existing_output).unwrap();
+
+        let second_chunk_path = output_dir.join("payload/chunk-00001.bin");
+        let mut second_chunk = std::fs::read(&second_chunk_path).unwrap();
+        let last = second_chunk.len() - 1;
+        second_chunk[last] ^= 0x55;
+        std::fs::write(&second_chunk_path, &second_chunk).unwrap();
+
+        let decryptor = DecryptionEngine::unlock_with_password(config, "password").unwrap();
+        let err = decryptor
+            .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
+            .expect_err("tampered later chunk must fail");
+        assert!(
+            err.to_string().contains("Decryption failed for chunk 1"),
+            "unexpected decrypt error: {err:#}"
+        );
+        assert_file_bytes(&decrypted_path, existing_output);
+
+        let leaked_temp = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .any(|name| name.contains(".cass-decrypt-tmp."));
+        assert!(
+            !leaked_temp,
+            "failed decrypt should not leave plaintext temp files"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn decrypt_to_file_replaces_output_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let input_path = temp_dir.path().join("input.txt");
+        let output_dir = temp_dir.path().join("encrypted");
+        let protected_target_path = temp_dir.path().join("protected.txt");
+        let decrypted_path = temp_dir.path().join("decrypted.txt");
+        let test_data = b"symlink output regression data";
+
+        std::fs::write(&input_path, test_data).unwrap();
+        std::fs::write(&protected_target_path, b"protected target").unwrap();
+        symlink(&protected_target_path, &decrypted_path).unwrap();
+
+        let mut engine = EncryptionEngine::new(1024).unwrap();
+        engine.add_password_slot("password").unwrap();
+        let config = engine
+            .encrypt_file(&input_path, &output_dir, |_, _| {})
+            .unwrap();
+
+        let decryptor = DecryptionEngine::unlock_with_password(config, "password").unwrap();
+        decryptor
+            .decrypt_to_file(&output_dir, &decrypted_path, |_, _| {})
+            .unwrap();
+
+        assert_file_bytes(&protected_target_path, b"protected target");
+        let metadata = std::fs::symlink_metadata(&decrypted_path).unwrap();
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "successful decrypt should replace the output symlink itself"
+        );
+        assert_file_bytes(&decrypted_path, test_data);
     }
 
     #[test]
