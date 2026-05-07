@@ -8,7 +8,7 @@
 //!
 //! 1. **Cargo Binstall** (fastest if available) - downloads pre-built binary via
 //!    cargo, may fall back to a source build
-//! 2. **Pre-built Binary** - direct binary download from GitHub releases
+//! 2. **Pre-built Binary** - direct binary download from GitHub releases with checksum verification
 //! 3. **Cargo Install** - compile from source (most reliable fallback)
 //! 4. **Full Bootstrap** - install rustup first, then compile
 //!
@@ -376,11 +376,14 @@ impl RemoteInstaller {
             return Some(InstallMethod::CargoBinstall);
         }
 
-        // 2. Try pre-built binary if available and compatible for this system.
+        // 2. Try pre-built binary if available, compatible, and backed by
+        // release checksum evidence. Remote installs should fail closed rather
+        // than copying an unverified binary onto a user's machine.
         if let Some(url) = self.get_prebuilt_url() {
-            // Attempt to fetch checksum (non-blocking - proceed without if unavailable)
             let checksum = self.fetch_remote_prebuilt_checksum(&url);
-            return Some(InstallMethod::PrebuiltBinary { url, checksum });
+            if let Some(method) = Self::verified_prebuilt_binary_method(url, checksum) {
+                return Some(method);
+            }
         }
 
         // 3. Try cargo install if cargo is available and we have resources
@@ -439,6 +442,16 @@ impl RemoteInstaller {
             "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v{}/cass-{}-{}.tar.gz",
             self.target_version, os, arch
         ))
+    }
+
+    fn verified_prebuilt_binary_method(
+        url: String,
+        checksum: Option<String>,
+    ) -> Option<InstallMethod> {
+        checksum.map(|checksum| InstallMethod::PrebuiltBinary {
+            url,
+            checksum: Some(checksum),
+        })
     }
 
     fn linux_prebuilt_binary_supported_by_distro(distro: Option<&str>) -> bool {
@@ -575,8 +588,9 @@ impl RemoteInstaller {
 
     /// Fetch checksum from remote URL via SSH.
     ///
-    /// Returns the SHA256 hex string if successful, None if checksum unavailable.
-    /// This is non-blocking - if checksum can't be fetched, installation proceeds without verification.
+    /// Returns the SHA256 hex string if successful. If checksum resolution
+    /// fails, the direct prebuilt path is skipped so the installer can fall
+    /// back to a source-based method or fail before mutating the remote host.
     fn fetch_remote_checksum(
         &self,
         checksum_url: &str,
@@ -594,7 +608,7 @@ impl RemoteInstaller {
 
         match self.run_ssh_command(&fetch_cmd, Duration::from_secs(10)) {
             Ok(output) => Self::parse_remote_checksum_output(&output, expected_asset),
-            Err(_) => None, // Checksum unavailable - proceed without verification
+            Err(_) => None,
         }
     }
 
@@ -715,6 +729,12 @@ impl RemoteInstaller {
     where
         F: Fn(InstallProgress),
     {
+        let checksum = checksum.ok_or_else(|| {
+            InstallError::VerificationFailed(
+                "pre-built binary checksum unavailable; refusing unverified remote install".into(),
+            )
+        })?;
+
         on_progress(InstallProgress {
             stage: InstallStage::Downloading,
             message: "Downloading pre-built binary...".into(),
@@ -727,17 +747,12 @@ impl RemoteInstaller {
 
         self.run_ssh_command(&download_cmd, Duration::from_secs(60))?;
 
-        // Checksum is verified inside the shell script (before installation).
-        // If the script succeeded, the checksum matched (or was not provided).
-        let verified_checksum = checksum.map(|c| c.to_string());
+        // Checksum is verified inside the shell script before installation.
+        let verified_checksum = checksum.to_string();
 
         on_progress(InstallProgress {
             stage: InstallStage::Installing,
-            message: if verified_checksum.is_some() {
-                "Binary installed and verified at ~/.local/bin/cass".into()
-            } else {
-                "Binary installed to ~/.local/bin/cass (checksum not available)".into()
-            },
+            message: "Binary installed and verified at ~/.local/bin/cass".into(),
             percent: Some(80),
             elapsed: start.elapsed(),
         });
@@ -748,7 +763,7 @@ impl RemoteInstaller {
         Ok(InstallResult {
             method: InstallMethod::PrebuiltBinary {
                 url: url.to_string(),
-                checksum: verified_checksum,
+                checksum: Some(verified_checksum),
             },
             version: self.target_version.clone(),
             duration: start.elapsed(),
@@ -763,7 +778,7 @@ impl RemoteInstaller {
 
     fn build_prebuilt_binary_install_script(
         url: &str,
-        checksum: Option<&str>,
+        checksum: &str,
         has_curl: bool,
     ) -> String {
         // Download into a secure mktemp directory (not predictable /tmp/), verify
@@ -775,11 +790,10 @@ impl RemoteInstaller {
         } else {
             format!(r#"wget -q {url_arg} -O "${{archive_path}}""#)
         };
-        let checksum_verify = if let Some(expected) = checksum {
-            let expected_lower = expected.to_lowercase();
-            let expected_arg = Self::shell_quote_arg(&expected_lower);
-            format!(
-                r#"
+        let expected_lower = checksum.to_lowercase();
+        let expected_arg = Self::shell_quote_arg(&expected_lower);
+        let checksum_verify = format!(
+            r#"
 expected_sum={expected_arg}
 if command -v sha256sum >/dev/null 2>&1; then
     actual_sum="$(sha256sum "${{archive_path}}" | cut -d' ' -f1)"
@@ -794,10 +808,7 @@ if [ "${{actual_sum}}" != "${{expected_sum}}" ]; then
     exit 1
 fi
 "#
-            )
-        } else {
-            String::new()
-        };
+        );
         format!(
             r#"
 set -euo pipefail
