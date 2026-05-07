@@ -64556,6 +64556,7 @@ fn load_opencode_session_for_export(
     // Build map of message_id -> parts
     #[derive(serde::Deserialize, Clone)]
     struct PartInfo {
+        id: Option<String>,
         #[serde(rename = "messageID")]
         message_id: Option<String>,
         #[serde(rename = "type")]
@@ -64568,8 +64569,33 @@ fn load_opencode_session_for_export(
         output: Option<String>,
     }
 
+    fn trailing_ascii_number(value: &str) -> Option<u64> {
+        let bytes = value.as_bytes();
+        let mut start = bytes.len();
+        while start > 0 && bytes[start - 1].is_ascii_digit() {
+            start -= 1;
+        }
+        if start == bytes.len() {
+            return None;
+        }
+        value[start..].parse().ok()
+    }
+
+    fn opencode_part_order(path: &Path, part: &PartInfo) -> u64 {
+        part.id
+            .as_deref()
+            .and_then(trailing_ascii_number)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(trailing_ascii_number)
+            })
+            .unwrap_or(u64::MAX)
+    }
+
     let mut parts_by_msg: HashMap<String, Vec<PartInfo>> = HashMap::new();
     if part_dir.exists() {
+        let mut part_records: Vec<(std::path::PathBuf, PartInfo)> = Vec::new();
         for entry in WalkDir::new(&part_dir).into_iter().flatten() {
             if !entry.file_type().is_file() {
                 continue;
@@ -64578,9 +64604,18 @@ fn load_opencode_session_for_export(
             if p.extension().map(|e| e == "json").unwrap_or(false)
                 && let Ok(content) = std::fs::read_to_string(p)
                 && let Ok(part) = serde_json::from_str::<PartInfo>(&content)
-                && let Some(msg_id) = &part.message_id
             {
-                parts_by_msg.entry(msg_id.clone()).or_default().push(part);
+                part_records.push((p.to_path_buf(), part));
+            }
+        }
+        part_records.sort_by(|(a_path, a_part), (b_path, b_part)| {
+            opencode_part_order(a_path, a_part)
+                .cmp(&opencode_part_order(b_path, b_part))
+                .then_with(|| a_path.cmp(b_path))
+        });
+        for (_, part) in part_records {
+            if let Some(msg_id) = part.message_id.clone() {
+                parts_by_msg.entry(msg_id).or_default().push(part);
             }
         }
     }
@@ -64599,7 +64634,7 @@ fn load_opencode_session_for_export(
         created: Option<i64>,
     }
 
-    let mut messages: Vec<(i64, serde_json::Value)> = Vec::new();
+    let mut messages: Vec<(i64, std::path::PathBuf, serde_json::Value)> = Vec::new();
     let mut message_ts_min: Option<i64> = None;
     let mut message_ts_max: Option<i64> = None;
 
@@ -64686,12 +64721,14 @@ fn load_opencode_session_for_export(
         }
 
         // Keep unknown timestamps at the end while preserving deterministic output.
-        messages.push((timestamp.unwrap_or(i64::MAX), msg_json));
+        messages.push((timestamp.unwrap_or(i64::MAX), p.to_path_buf(), msg_json));
     }
 
     // Sort by timestamp
-    messages.sort_by_key(|(ts, _)| *ts);
-    let sorted_messages: Vec<serde_json::Value> = messages.into_iter().map(|(_, m)| m).collect();
+    messages.sort_by(|(a_ts, a_path, _), (b_ts, b_path, _)| {
+        a_ts.cmp(b_ts).then_with(|| a_path.cmp(b_path))
+    });
+    let sorted_messages: Vec<serde_json::Value> = messages.into_iter().map(|(_, _, m)| m).collect();
 
     // Compute timestamps from messages if not available in session metadata.
     let start = session_start.or(message_ts_min);
@@ -67282,6 +67319,70 @@ mod opencode_export_tests {
         assert!(
             messages[1].get("timestamp").is_none(),
             "message without timestamp should not get an artificial 0"
+        );
+    }
+
+    #[test]
+    fn load_opencode_export_orders_parts_by_provider_part_number() {
+        let temp = TempDir::new().expect("tempdir");
+        let storage = temp.path().join("storage");
+        let session_dir = storage.join("session/project-1");
+        let message_dir = storage.join("message/session-1");
+        let part_dir = storage.join("part/m1");
+
+        fs::create_dir_all(&session_dir).expect("create session dir");
+        fs::create_dir_all(&message_dir).expect("create message dir");
+        fs::create_dir_all(&part_dir).expect("create part dir");
+
+        let session_path = session_dir.join("session-1.json");
+        fs::write(
+            &session_path,
+            json!({
+                "id": "session-1",
+                "title": "OpenCode Ordered Parts"
+            })
+            .to_string(),
+        )
+        .expect("write session");
+
+        fs::write(
+            message_dir.join("m1.json"),
+            json!({
+                "id": "m1",
+                "role": "assistant",
+                "time": {
+                    "created": 1733000000
+                }
+            })
+            .to_string(),
+        )
+        .expect("write message");
+
+        for (filename, id, text) in [
+            ("part10.json", "part10", "third"),
+            ("part2.json", "part2", "second"),
+            ("part1.json", "part1", "first"),
+        ] {
+            fs::write(
+                part_dir.join(filename),
+                json!({
+                    "id": id,
+                    "messageID": "m1",
+                    "type": "text",
+                    "text": text
+                })
+                .to_string(),
+            )
+            .expect("write part");
+        }
+
+        let (_title, _start, _end, messages) =
+            load_opencode_session_for_export(&session_path).expect("load opencode export");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].get("content").and_then(|v| v.as_str()),
+            Some("first\n\nsecond\n\nthird")
         );
     }
 }
