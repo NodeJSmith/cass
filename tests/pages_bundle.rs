@@ -776,6 +776,72 @@ mod tests {
     }
 
     #[test]
+    fn test_archive_search_time_filters_are_applied_before_pagination() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let search_js = include_str!("../src/pages_assets/search.js");
+
+        assert!(
+            database_js.contains("searchMode = 'auto', since = null, until = null"),
+            "searchConversations should accept time filters at the database boundary"
+        );
+        assert!(
+            database_js.contains("sql += ' AND c.started_at >= ?';")
+                && database_js.contains("sql += ' AND c.started_at <= ?';"),
+            "FTS search should add time predicates to SQL instead of filtering after LIMIT/OFFSET"
+        );
+
+        let since_predicate = database_js
+            .find("sql += ' AND c.started_at >= ?';")
+            .expect("expected lower-bound search predicate");
+        let until_predicate = database_js
+            .find("sql += ' AND c.started_at <= ?';")
+            .expect("expected upper-bound search predicate");
+        let result_ordering = database_js
+            .find("ORDER BY score")
+            .expect("expected FTS score ordering");
+        assert!(
+            since_predicate < result_ordering && until_predicate < result_ordering,
+            "time predicates must be added before ORDER BY/LIMIT so pagination cannot hide valid matches"
+        );
+
+        assert!(
+            search_js.contains("since: currentFilters.since,")
+                && search_js.contains("until: currentFilters.until,"),
+            "search UI should pass active route/control time filters into searchConversations"
+        );
+        assert!(
+            !search_js.contains("Apply time filter post-query"),
+            "search UI should not reintroduce post-query time filtering after pagination"
+        );
+    }
+
+    #[test]
+    fn test_archive_recent_filters_combine_agent_and_time_before_limit() {
+        let database_js = include_str!("../src/pages_assets/database.js");
+        let search_js = include_str!("../src/pages_assets/search.js");
+
+        assert!(
+            database_js.contains(
+                "export function getConversationsByAgent(agent, limit = 50, since = null, until = null)"
+            ),
+            "agent-filtered recent queries should accept optional time bounds"
+        );
+        assert!(
+            database_js.contains("sql += ' AND started_at >= ?';")
+                && database_js.contains("sql += ' AND started_at <= ?';"),
+            "agent-filtered recent queries should apply time bounds in SQL before LIMIT"
+        );
+        assert!(
+            search_js.contains("const hasTimeFilter = currentFilters.since !== null || currentFilters.until !== null;"),
+            "recent search should treat an explicit since=0 route filter as present"
+        );
+        assert!(
+            search_js.contains("currentFilters.since,\n                currentFilters.until,"),
+            "recent search should pass time bounds when an agent filter is also active"
+        );
+    }
+
+    #[test]
     fn test_search_cleanup_paths_reset_virtual_results_presentation() {
         let search_js = include_str!("../src/pages_assets/search.js");
         assert!(

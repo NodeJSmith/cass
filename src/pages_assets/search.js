@@ -624,23 +624,15 @@ async function performSearch(epoch) {
         offset: currentPage * SEARCH_CONFIG.PAGE_SIZE,
         agent: currentFilters.agent,
         searchMode: currentSearchMode,
+        since: currentFilters.since,
+        until: currentFilters.until,
     };
 
-    // Pass raw query - searchConversations handles escaping and FTS table routing
+    // Pass raw query and filters - searchConversations applies SQL filters before pagination.
     currentResults = searchConversations(currentQuery, options);
 
     // Update search mode indicator
     updateSearchModeIndicator(currentQuery);
-
-    // Apply time filter post-query if needed
-    if (currentFilters.since || currentFilters.until) {
-        currentResults = currentResults.filter(r => {
-            const ts = r.started_at;
-            if (currentFilters.since && ts < currentFilters.since) return false;
-            if (currentFilters.until && ts > currentFilters.until) return false;
-            return true;
-        });
-    }
 
     if (!isCurrentSearchEpoch(epoch)) {
         return;
@@ -655,12 +647,18 @@ async function performSearch(epoch) {
 async function loadRecentConversations(epoch = searchEpoch) {
     try {
         let results;
+        const hasTimeFilter = currentFilters.since !== null || currentFilters.until !== null;
 
         if (currentFilters.agent) {
-            results = getConversationsByAgent(currentFilters.agent, SEARCH_CONFIG.PAGE_SIZE);
-        } else if (currentFilters.since || currentFilters.until) {
-            const since = currentFilters.since || 0;
-            const until = currentFilters.until || Date.now();
+            results = getConversationsByAgent(
+                currentFilters.agent,
+                SEARCH_CONFIG.PAGE_SIZE,
+                currentFilters.since,
+                currentFilters.until,
+            );
+        } else if (hasTimeFilter) {
+            const since = currentFilters.since ?? 0;
+            const until = currentFilters.until ?? Date.now();
             results = getConversationsByTimeRange(since, until, SEARCH_CONFIG.PAGE_SIZE);
         } else {
             results = getRecentConversations(SEARCH_CONFIG.PAGE_SIZE);

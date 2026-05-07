@@ -343,6 +343,20 @@ function escapeFts5Query(query) {
         .join(' ');
 }
 
+function normalizeTimestampFilterValue(value) {
+    if (value === undefined || value === null || value === '') {
+        return null;
+    }
+
+    const numeric = Number(value);
+    const integer = Math.trunc(numeric);
+    if (!Number.isFinite(numeric) || numeric < 0 || !Number.isSafeInteger(integer)) {
+        return null;
+    }
+
+    return integer;
+}
+
 /**
  * Search conversations using FTS5
  * Automatically routes to the appropriate FTS table:
@@ -355,10 +369,12 @@ function escapeFts5Query(query) {
  * @param {number} [options.offset=0] - Result offset for pagination
  * @param {string|null} [options.agent=null] - Filter by agent name
  * @param {SearchMode} [options.searchMode='auto'] - Search mode: 'auto', 'prose', or 'code'
+ * @param {number|string|null} [options.since=null] - Earliest conversation start timestamp (ms)
+ * @param {number|string|null} [options.until=null] - Latest conversation start timestamp (ms)
  * @returns {Array<Object>} Search results
  */
 export function searchConversations(query, options = {}) {
-    const { limit = 50, offset = 0, agent = null, searchMode = 'auto' } = options;
+    const { limit = 50, offset = 0, agent = null, searchMode = 'auto', since = null, until = null } = options;
 
     // Escape query for FTS5
     const escapedQuery = escapeFts5Query(query);
@@ -401,6 +417,18 @@ export function searchConversations(query, options = {}) {
         params.push(agent);
     }
 
+    const sinceTimestamp = normalizeTimestampFilterValue(since);
+    if (sinceTimestamp !== null) {
+        sql += ' AND c.started_at >= ?';
+        params.push(sinceTimestamp);
+    }
+
+    const untilTimestamp = normalizeTimestampFilterValue(until);
+    if (untilTimestamp !== null) {
+        sql += ' AND c.started_at <= ?';
+        params.push(untilTimestamp);
+    }
+
     sql += `
         ORDER BY score
         LIMIT ? OFFSET ?
@@ -419,16 +447,37 @@ export function searchConversations(query, options = {}) {
  * Get conversations by agent
  * @param {string} agent - Agent name
  * @param {number} limit - Maximum results
+ * @param {number|string|null} since - Earliest conversation start timestamp (ms)
+ * @param {number|string|null} until - Latest conversation start timestamp (ms)
  * @returns {Array<Object>} Conversation objects
  */
-export function getConversationsByAgent(agent, limit = 50) {
-    return queryAll(`
+export function getConversationsByAgent(agent, limit = 50, since = null, until = null) {
+    let sql = `
         SELECT id, agent, workspace, title, source_path, started_at, message_count
         FROM conversations
         WHERE agent = ?
+    `;
+    const params = [agent];
+
+    const sinceTimestamp = normalizeTimestampFilterValue(since);
+    if (sinceTimestamp !== null) {
+        sql += ' AND started_at >= ?';
+        params.push(sinceTimestamp);
+    }
+
+    const untilTimestamp = normalizeTimestampFilterValue(until);
+    if (untilTimestamp !== null) {
+        sql += ' AND started_at <= ?';
+        params.push(untilTimestamp);
+    }
+
+    sql += `
         ORDER BY started_at DESC
         LIMIT ?
-    `, [agent, limit]);
+    `;
+    params.push(limit);
+
+    return queryAll(sql, params);
 }
 
 /**
