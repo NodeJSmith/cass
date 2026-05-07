@@ -1087,6 +1087,7 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         _ => None,
     };
     let checkpoint_incomplete = checkpoint.is_some_and(|state| !state.completed);
+    let checkpoint_db_mismatch = checkpoint_db_matches == Some(false);
     let contract_mismatch = schema_matches == Some(false) || page_size_compatible == Some(false);
     let fingerprint_mismatch = fingerprint_matches == Some(false);
     let age_seconds = last_indexed_at_ms
@@ -1113,7 +1114,12 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
     let stale = if rebuilding {
         !exists || contract_mismatch
     } else {
-        exists && (age_stale || checkpoint_incomplete || contract_mismatch || fingerprint_mismatch)
+        exists
+            && (age_stale
+                || checkpoint_db_mismatch
+                || checkpoint_incomplete
+                || contract_mismatch
+                || fingerprint_mismatch)
     };
     let fresh = exists && !stale && !rebuilding;
     let status = if rebuilding {
@@ -1129,6 +1135,8 @@ fn lexical_state_from_observations(input: LexicalObservationInput<'_>) -> Lexica
         Some("lexical rebuild is in progress".to_string())
     } else if !exists {
         Some("lexical Tantivy metadata missing".to_string())
+    } else if checkpoint_db_mismatch {
+        Some("lexical rebuild checkpoint points at a different database".to_string())
     } else if contract_mismatch {
         Some("lexical rebuild checkpoint no longer matches the active lexical contract".to_string())
     } else if fingerprint_mismatch {
@@ -1935,6 +1943,59 @@ mod tests {
         assert_eq!(state.processed_conversations, None);
         assert_eq!(state.total_conversations, None);
         assert_eq!(state.indexed_docs, None);
+    }
+
+    #[test]
+    fn lexical_state_marks_checkpoint_db_mismatch_stale_without_fingerprint_probe() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_path = temp.path().join("index").join("v4");
+        std::fs::create_dir_all(&index_path).expect("create index dir");
+        std::fs::write(index_path.join("meta.json"), b"{}").expect("write meta.json");
+        let db_path = temp.path().join("agent_search.db");
+        let other_db_path = temp.path().join("other_agent_search.db");
+        std::fs::write(&db_path, b"db").expect("write db file");
+        std::fs::write(&other_db_path, b"other db").expect("write other db file");
+
+        let checkpoint = LexicalRebuildCheckpoint {
+            db_path: other_db_path.display().to_string(),
+            total_conversations: 10,
+            storage_fingerprint: "old-db-fingerprint".to_string(),
+            committed_offset: 10,
+            committed_conversation_id: Some(10),
+            processed_conversations: 10,
+            indexed_docs: 100,
+            schema_hash: SCHEMA_HASH.to_string(),
+            page_size: LEXICAL_REBUILD_PAGE_SIZE_PUBLIC,
+            completed: true,
+            updated_at_ms: 1_733_000_000_000,
+        };
+
+        let state = lexical_state_from_observations(LexicalObservationInput {
+            index_path: &index_path,
+            db_path: &db_path,
+            stale_threshold: 60,
+            last_indexed_at_ms: Some(1_733_000_000_000),
+            now_secs: 1_733_000_001,
+            maintenance: SearchMaintenanceSnapshot::default(),
+            checkpoint: Some(&checkpoint),
+            current_db_fingerprint: None,
+        });
+
+        assert_eq!(state.status, "stale");
+        assert!(state.stale);
+        assert!(!state.fresh);
+        assert_eq!(state.checkpoint.db_matches, Some(false));
+        assert_eq!(state.fingerprint.matches_current_db_fingerprint, None);
+        assert_eq!(state.pending_sessions, 0);
+        assert_eq!(state.processed_conversations, None);
+        assert_eq!(state.total_conversations, None);
+        assert_eq!(state.indexed_docs, None);
+        assert!(
+            state
+                .status_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("different database"))
+        );
     }
 
     #[test]
