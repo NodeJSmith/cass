@@ -6,7 +6,7 @@
 //! # Features
 //!
 //! - **Role-based styling**: User, assistant, tool, and system messages
-//! - **Agent-specific theming**: Visual differentiation for 11 supported agents
+//! - **Agent-specific theming**: Visual differentiation for supported agents
 //! - **Code blocks**: Syntax highlighting with Prism.js language classes
 //! - **Tool calls**: Collapsible details with formatted JSON
 //! - **Long message collapse**: Optional folding for lengthy content
@@ -481,36 +481,56 @@ const ICON_SPARKLES: &str = r#"<svg class="lucide-icon" xmlns="http://www.w3.org
 ///
 /// Maps agent identifiers to their visual styling class.
 pub fn agent_css_class(slug: &str) -> &'static str {
-    match slug {
+    let slug = slug.trim().to_ascii_lowercase().replace('-', "_");
+    match slug.as_str() {
         "claude_code" | "claude" => "agent-claude",
         "codex" | "codex_cli" => "agent-codex",
         "cursor" | "cursor_ai" => "agent-cursor",
         "chatgpt" | "openai" => "agent-chatgpt",
-        "gemini" | "google" => "agent-gemini",
+        "gemini" | "gemini_cli" | "google" => "agent-gemini",
         "aider" => "agent-aider",
-        "copilot" | "github_copilot" => "agent-copilot",
+        "copilot" | "copilot_cli" | "github_copilot" | "github_copilot_cli" => "agent-copilot",
         "cody" | "sourcegraph" => "agent-cody",
         "windsurf" => "agent-windsurf",
         "amp" => "agent-amp",
         "grok" => "agent-grok",
+        "cline" | "clawdbot" | "kimi" => "agent-gemini",
+        "opencode" | "qwen" => "agent-codex",
+        "pi_agent" | "factory" | "droid" => "agent-aider",
+        "openclaw" => "agent-copilot",
+        "vibe" | "mistral" => "agent-chatgpt",
+        "crush" => "agent-amp",
         _ => "agent-default",
     }
 }
 
 /// Get human-readable agent name.
 pub fn agent_display_name(slug: &str) -> &'static str {
-    match slug {
+    let slug = slug.trim().to_ascii_lowercase().replace('-', "_");
+    match slug.as_str() {
         "claude_code" | "claude" => "Claude",
         "codex" | "codex_cli" => "Codex",
         "cursor" | "cursor_ai" => "Cursor",
         "chatgpt" | "openai" => "ChatGPT",
-        "gemini" | "google" => "Gemini",
+        "gemini" | "gemini_cli" | "google" => "Gemini",
         "aider" => "Aider",
         "copilot" | "github_copilot" => "GitHub Copilot",
+        "copilot_cli" | "github_copilot_cli" => "GitHub Copilot CLI",
         "cody" | "sourcegraph" => "Cody",
         "windsurf" => "Windsurf",
         "amp" => "Amp",
         "grok" => "Grok",
+        "cline" => "Cline",
+        "opencode" => "OpenCode",
+        "pi_agent" => "Pi Agent",
+        "factory" | "droid" => "Factory",
+        "openclaw" => "OpenClaw",
+        "clawdbot" => "ClawdBot",
+        "vibe" => "Vibe",
+        "mistral" => "Mistral",
+        "crush" => "Crush",
+        "kimi" => "Kimi",
+        "qwen" => "Qwen",
         _ => "AI Assistant",
     }
 }
@@ -1541,6 +1561,9 @@ mod tests {
         assert_eq!(agent_css_class("codex"), "agent-codex");
         assert_eq!(agent_css_class("cursor"), "agent-cursor");
         assert_eq!(agent_css_class("gemini"), "agent-gemini");
+        assert_eq!(agent_css_class("opencode"), "agent-codex");
+        assert_eq!(agent_css_class("copilot-cli"), "agent-copilot");
+        assert_eq!(agent_css_class("qwen"), "agent-codex");
         assert_eq!(agent_css_class("unknown"), "agent-default");
     }
 
@@ -1549,7 +1572,33 @@ mod tests {
         assert_eq!(agent_display_name("claude_code"), "Claude");
         assert_eq!(agent_display_name("codex"), "Codex");
         assert_eq!(agent_display_name("github_copilot"), "GitHub Copilot");
+        assert_eq!(agent_display_name("copilot-cli"), "GitHub Copilot CLI");
+        assert_eq!(agent_display_name("opencode"), "OpenCode");
+        assert_eq!(agent_display_name("pi_agent"), "Pi Agent");
+        assert_eq!(agent_display_name("factory"), "Factory");
+        assert_eq!(agent_display_name("openclaw"), "OpenClaw");
+        assert_eq!(agent_display_name("clawdbot"), "ClawdBot");
+        assert_eq!(agent_display_name("vibe"), "Vibe");
+        assert_eq!(agent_display_name("crush"), "Crush");
+        assert_eq!(agent_display_name("kimi"), "Kimi");
+        assert_eq!(agent_display_name("qwen"), "Qwen");
         assert_eq!(agent_display_name("unknown"), "AI Assistant");
+    }
+
+    #[test]
+    fn connector_registry_slugs_have_specific_html_identity() {
+        for (slug, _) in crate::indexer::get_connector_factories() {
+            assert_ne!(
+                agent_css_class(slug),
+                "agent-default",
+                "registered connector {slug} should not use default HTML export styling"
+            );
+            assert_ne!(
+                agent_display_name(slug),
+                "AI Assistant",
+                "registered connector {slug} should have a specific HTML export display name"
+            );
+        }
     }
 
     #[test]
