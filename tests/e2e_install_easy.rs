@@ -113,30 +113,6 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Clean up stale install lock (tests may leave locks behind if they crash)
-fn cleanup_stale_install_lock() {
-    let lock_dir = std::path::Path::new("/tmp/coding-agent-search-install.lock.d");
-    if lock_dir.exists() {
-        // Check if the lock is stale (PID not running)
-        let pid_file = lock_dir.join("pid");
-        if let Ok(pid_str) = fs::read_to_string(&pid_file) {
-            let pid = pid_str.trim();
-            if !pid.is_empty() {
-                // Use kill -0 to check if process is still running
-                let is_running = Command::new("kill")
-                    .arg("-0")
-                    .arg(pid)
-                    .output()
-                    .is_ok_and(|o| o.status.success());
-                if !is_running {
-                    // Stale lock, remove it
-                    let _ = fs::remove_dir_all(lock_dir);
-                }
-            }
-        }
-    }
-}
-
 // ============================================
 // Fixture Helpers
 // ============================================
@@ -146,13 +122,11 @@ struct InstallFixture {
     checksum: String,
     temp_home: tempfile::TempDir,
     dest: tempfile::TempDir,
+    tmp_root: tempfile::TempDir,
 }
 
 impl InstallFixture {
     fn new() -> Self {
-        // Clean up any stale locks from previous test runs
-        cleanup_stale_install_lock();
-
         let tar_path =
             fixture("tests/fixtures/install/coding-agent-search-vtest-linux-x86_64.tar.gz");
         let checksum = fs::read_to_string(
@@ -164,12 +138,14 @@ impl InstallFixture {
 
         let temp_home = tempfile::TempDir::new().expect("create temp HOME");
         let dest = tempfile::TempDir::new().expect("create dest dir");
+        let tmp_root = tempfile::TempDir::new().expect("create install TMPDIR");
 
         Self {
             tar_path,
             checksum,
             temp_home,
             dest,
+            tmp_root,
         }
     }
 
@@ -219,6 +195,7 @@ fn install_easy_mode_end_to_end() {
         .arg("--dest")
         .arg(fix.dest.path())
         .env("HOME", fix.temp_home.path())
+        .env("TMPDIR", fix.tmp_root.path())
         .env("ARTIFACT_URL", fix.artifact_url())
         .env("CHECKSUM", &fix.checksum)
         .env("RUSTUP_INIT_SKIP", "1")
@@ -353,6 +330,7 @@ fn install_basic_mode() {
         .arg("--dest")
         .arg(fix.dest.path())
         .env("HOME", fix.temp_home.path())
+        .env("TMPDIR", fix.tmp_root.path())
         .env("ARTIFACT_URL", fix.artifact_url())
         .env("CHECKSUM", &fix.checksum)
         .env("RUSTUP_INIT_SKIP", "1")
@@ -431,6 +409,7 @@ fn install_quiet_mode() {
         .arg("--dest")
         .arg(fix.dest.path())
         .env("HOME", fix.temp_home.path())
+        .env("TMPDIR", fix.tmp_root.path())
         .env("ARTIFACT_URL", fix.artifact_url())
         .env("CHECKSUM", &fix.checksum)
         .env("RUSTUP_INIT_SKIP", "1")
@@ -502,6 +481,7 @@ fn install_checksum_mismatch_fails() {
         .arg("--dest")
         .arg(fix.dest.path())
         .env("HOME", fix.temp_home.path())
+        .env("TMPDIR", fix.tmp_root.path())
         .env("ARTIFACT_URL", fix.artifact_url())
         .env("CHECKSUM", bad_checksum)
         .env("RUSTUP_INIT_SKIP", "1")
@@ -575,6 +555,7 @@ fn install_missing_artifact_fails() {
         .arg("--dest")
         .arg(fix.dest.path())
         .env("HOME", fix.temp_home.path())
+        .env("TMPDIR", fix.tmp_root.path())
         .env("ARTIFACT_URL", bad_url)
         .env("CHECKSUM", &fix.checksum)
         .env("RUSTUP_INIT_SKIP", "1")
@@ -647,13 +628,9 @@ fn install_help_flag() {
 
 /// Verify lock file prevents concurrent installs.
 ///
-/// NOTE: This test is ignored by default because it creates a global lock
-/// at `/tmp/coding-agent-search-install.lock.d` which can interfere with
-/// other install tests running in parallel.
-///
-/// Run with: `cargo test --test e2e_install_easy install_lock_prevents_concurrent -- --ignored`
+/// Uses the fixture-owned `TMPDIR` so the active lock cannot affect other
+/// installer runs on the same machine.
 #[test]
-#[ignore] // Uses global lock that interferes with parallel tests
 #[cfg_attr(not(target_os = "linux"), ignore)]
 fn install_lock_prevents_concurrent() {
     skip_unless_install_tests!();
@@ -665,11 +642,11 @@ fn install_lock_prevents_concurrent() {
     let fix = InstallFixture::new();
 
     // Create a fake lock directory to simulate another installer running
-    let lock_dir = std::path::Path::new("/tmp/coding-agent-search-install.lock.d");
-    if lock_dir.exists() {
-        let _ = fs::remove_dir_all(lock_dir);
-    }
-    fs::create_dir_all(lock_dir).expect("create lock dir");
+    let lock_dir = fix
+        .tmp_root
+        .path()
+        .join("coding-agent-search-install.lock.d");
+    fs::create_dir_all(&lock_dir).expect("create lock dir");
     // Write a fake PID that's still "running" (use current PID)
     fs::write(lock_dir.join("pid"), format!("{}", std::process::id())).expect("write fake pid");
 
@@ -690,6 +667,7 @@ fn install_lock_prevents_concurrent() {
         .arg("--dest")
         .arg(fix.dest.path())
         .env("HOME", fix.temp_home.path())
+        .env("TMPDIR", fix.tmp_root.path())
         .env("ARTIFACT_URL", fix.artifact_url())
         .env("CHECKSUM", &fix.checksum)
         .env("RUSTUP_INIT_SKIP", "1")
@@ -697,9 +675,6 @@ fn install_lock_prevents_concurrent() {
         .expect("run installer");
 
     save_command_artifacts(&tracker, &output.stdout, &output.stderr);
-
-    // Clean up lock
-    let _ = fs::remove_dir_all(lock_dir);
 
     tracker.end(
         "run_install",
@@ -758,6 +733,7 @@ fn install_creates_expected_artifacts() {
         .arg("--dest")
         .arg(fix.dest.path())
         .env("HOME", fix.temp_home.path())
+        .env("TMPDIR", fix.tmp_root.path())
         .env("ARTIFACT_URL", fix.artifact_url())
         .env("CHECKSUM", &fix.checksum)
         .env("RUSTUP_INIT_SKIP", "1")
