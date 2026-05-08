@@ -650,7 +650,7 @@ impl SyncEngine {
         }
 
         source
-            .validate_name()
+            .validate_structure()
             .map_err(|e| SyncError::InvalidSource(e.to_string()))?;
 
         let method = Self::detect_sync_method();
@@ -2818,6 +2818,27 @@ mod tests {
         assert!(
             !temp.path().join("remotes").exists(),
             "invalid source name must be rejected before creating mirror roots"
+        );
+    }
+
+    #[test]
+    fn test_sync_source_rejects_invalid_host_before_mirror_creation() {
+        let temp = TempDir::new().unwrap();
+        let engine = SyncEngine::new(temp.path());
+        let mut source = SourceDefinition::ssh("unsafe-host", "user@host withspace");
+        source.paths = vec!["/tmp/sessions".to_string()];
+
+        let err = engine
+            .sync_source(&source)
+            .expect_err("invalid host should fail before local writes");
+
+        assert!(
+            matches!(err, SyncError::InvalidSource(ref message) if message.contains("SSH host cannot contain whitespace")),
+            "expected invalid host rejection, got {err}"
+        );
+        assert!(
+            !temp.path().join("remotes").exists(),
+            "invalid host must be rejected before creating mirror roots"
         );
     }
 

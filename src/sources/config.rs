@@ -190,7 +190,7 @@ impl SourceDefinition {
 
     /// Validate the source definition.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.validate_without_paths()?;
+        self.validate_structure()?;
         self.validate_paths()
     }
 
@@ -198,7 +198,7 @@ impl SourceDefinition {
         validate_source_name(&self.name)
     }
 
-    fn validate_without_paths(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate_structure(&self) -> Result<(), ConfigError> {
         self.validate_name()?;
 
         if self.is_remote() && self.host.is_none() {
@@ -512,32 +512,11 @@ impl SourcesConfig {
     /// - Primary: `$XDG_CONFIG_HOME/cass/sources.toml`
     /// - Fallback: platform-specific config dir (e.g., `~/.config/cass/sources.toml` on Linux)
     pub fn config_path() -> Result<PathBuf, ConfigError> {
-        // Respect XDG_CONFIG_HOME first (important for testing and Linux users)
-        if let Ok(xdg_config) = dotenvy::var("XDG_CONFIG_HOME") {
-            return Ok(PathBuf::from(xdg_config).join("cass").join("sources.toml"));
-        }
-
-        // Check the platform-specific config dir (e.g. ~/Library/Application Support/ on macOS)
-        let platform_path = dirs::config_dir().map(|p| p.join("cass").join("sources.toml"));
-
-        // If the platform path exists, use it
-        if let Some(ref p) = platform_path
-            && p.exists()
-        {
-            return Ok(p.clone());
-        }
-
-        // Fallback: check ~/.config/cass/sources.toml (common on macOS for users
-        // who follow XDG conventions without setting XDG_CONFIG_HOME)
-        if let Some(home) = dirs::home_dir() {
-            let dot_config_path = home.join(".config").join("cass").join("sources.toml");
-            if dot_config_path.exists() {
-                return Ok(dot_config_path);
-            }
-        }
-
-        // Neither exists — return the platform path for creation (original behavior)
-        platform_path.ok_or(ConfigError::NoConfigDir)
+        config_path_from_parts(
+            dotenvy::var("XDG_CONFIG_HOME").ok().map(PathBuf::from),
+            dirs::config_dir(),
+            dirs::home_dir(),
+        )
     }
 
     /// Validate all sources in the configuration.
@@ -556,7 +535,7 @@ impl SourcesConfig {
             if validate_paths {
                 source.validate()?;
             } else {
-                source.validate_without_paths()?;
+                source.validate_structure()?;
             }
 
             if !seen_names.insert(source_name_key(&source.name)) {
@@ -663,6 +642,37 @@ impl SourcesConfig {
         });
         Ok(self.disabled_agents.len() != initial_len)
     }
+}
+
+fn config_path_from_parts(
+    xdg_config_home: Option<PathBuf>,
+    platform_config_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+) -> Result<PathBuf, ConfigError> {
+    // Respect XDG_CONFIG_HOME first (important for testing and Linux users).
+    if let Some(xdg_config) = xdg_config_home {
+        return Ok(xdg_config.join("cass").join("sources.toml"));
+    }
+
+    // Check the platform-specific config dir (e.g. ~/Library/Application Support/ on macOS).
+    let platform_path = platform_config_dir.map(|p| p.join("cass").join("sources.toml"));
+    if let Some(ref path) = platform_path
+        && path.exists()
+    {
+        return Ok(path.clone());
+    }
+
+    // Fallback: check ~/.config/cass/sources.toml for users who follow XDG
+    // conventions without setting XDG_CONFIG_HOME.
+    if let Some(home) = home_dir {
+        let dot_config_path = home.join(".config").join("cass").join("sources.toml");
+        if dot_config_path.exists() {
+            return Ok(dot_config_path);
+        }
+    }
+
+    // Neither exists: return the platform path for creation (original behavior).
+    platform_path.ok_or(ConfigError::NoConfigDir)
 }
 
 /// Get preset paths for a given platform.
@@ -1426,6 +1436,59 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.parent(), final_path.parent());
         assert_eq!(second.parent(), final_path.parent());
+    }
+
+    #[test]
+    fn test_config_path_from_parts_prefers_xdg_config_home() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_config_home = temp.path().join("xdg-config");
+        let platform_config_dir = temp.path().join("platform-config");
+        let home_dir = temp.path().join("home");
+
+        assert_eq!(
+            config_path_from_parts(
+                Some(xdg_config_home.clone()),
+                Some(platform_config_dir),
+                Some(home_dir)
+            )
+            .expect("path from xdg config home"),
+            xdg_config_home.join("cass").join("sources.toml")
+        );
+    }
+
+    #[test]
+    fn test_config_path_from_parts_prefers_existing_platform_path_before_dot_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let platform_config_dir = temp.path().join("platform-config");
+        let platform_path = platform_config_dir.join("cass").join("sources.toml");
+        let home_dir = temp.path().join("home");
+        let dot_config_path = home_dir.join(".config").join("cass").join("sources.toml");
+        std::fs::create_dir_all(platform_path.parent().expect("platform parent")).unwrap();
+        std::fs::create_dir_all(dot_config_path.parent().expect("dot-config parent")).unwrap();
+        std::fs::write(&platform_path, "").unwrap();
+        std::fs::write(&dot_config_path, "").unwrap();
+
+        assert_eq!(
+            config_path_from_parts(None, Some(platform_config_dir), Some(home_dir))
+                .expect("existing platform path"),
+            platform_path
+        );
+    }
+
+    #[test]
+    fn test_config_path_from_parts_uses_existing_dot_config_before_new_platform_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let platform_config_dir = temp.path().join("platform-config");
+        let home_dir = temp.path().join("home");
+        let dot_config_path = home_dir.join(".config").join("cass").join("sources.toml");
+        std::fs::create_dir_all(dot_config_path.parent().expect("dot-config parent")).unwrap();
+        std::fs::write(&dot_config_path, "").unwrap();
+
+        assert_eq!(
+            config_path_from_parts(None, Some(platform_config_dir), Some(home_dir))
+                .expect("existing dot-config path"),
+            dot_config_path
+        );
     }
 
     #[test]
