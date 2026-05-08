@@ -703,7 +703,7 @@ pub fn discover_ssh_hosts() -> Vec<DiscoveredHost> {
 /// Parse SSH config file content into discovered hosts.
 fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
     let mut hosts = Vec::new();
-    let mut current_host: Option<DiscoveredHost> = None;
+    let mut current_hosts: Vec<DiscoveredHost> = Vec::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -724,42 +724,36 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
 
         match key.as_str() {
             "host" => {
-                // Save previous host if exists
-                if let Some(host) = current_host.take() {
-                    // Skip wildcard patterns and generic hosts
-                    if !host.name.contains('*') && !host.name.contains('?') {
-                        hosts.push(host);
-                    }
-                }
-
-                // Start new host (skip wildcards)
-                if !value.contains('*') && !value.contains('?') {
-                    current_host = Some(DiscoveredHost {
-                        name: value.to_string(),
+                hosts.append(&mut current_hosts);
+                current_hosts = value
+                    .split_whitespace()
+                    .filter(|name| !name.contains('*') && !name.contains('?'))
+                    .map(|name| DiscoveredHost {
+                        name: name.to_string(),
                         hostname: None,
                         user: None,
                         port: None,
                         identity_file: None,
-                    });
-                }
+                    })
+                    .collect();
             }
             "hostname" => {
-                if let Some(ref mut host) = current_host {
+                for host in &mut current_hosts {
                     host.hostname = Some(value.to_string());
                 }
             }
             "user" => {
-                if let Some(ref mut host) = current_host {
+                for host in &mut current_hosts {
                     host.user = Some(value.to_string());
                 }
             }
             "port" => {
-                if let Some(ref mut host) = current_host {
+                for host in &mut current_hosts {
                     host.port = value.parse().ok();
                 }
             }
             "identityfile" => {
-                if let Some(ref mut host) = current_host {
+                for host in &mut current_hosts {
                     host.identity_file = Some(value.to_string());
                 }
             }
@@ -767,13 +761,8 @@ fn parse_ssh_config(content: &str) -> Vec<DiscoveredHost> {
         }
     }
 
-    // Don't forget the last host
-    if let Some(host) = current_host
-        && !host.name.contains('*')
-        && !host.name.contains('?')
-    {
-        hosts.push(host);
-    }
+    // Don't forget the last host block.
+    hosts.append(&mut current_hosts);
 
     hosts
 }
@@ -1860,6 +1849,34 @@ mod tests {
         for host in hosts {
             assert!(!host.name.is_empty());
         }
+    }
+
+    #[test]
+    fn test_parse_ssh_config_splits_multiple_host_aliases() {
+        let hosts = super::parse_ssh_config(
+            r#"
+Host alpha beta *.internal ?wild
+  HostName 192.0.2.10
+  User ubuntu
+  Port 2222
+  IdentityFile ~/.ssh/id_ed25519
+
+Host gamma
+  User deploy
+"#,
+        );
+
+        assert_eq!(hosts.len(), 3);
+        assert_eq!(hosts[0].name, "alpha");
+        assert_eq!(hosts[1].name, "beta");
+        assert_eq!(hosts[2].name, "gamma");
+        for host in &hosts[..2] {
+            assert_eq!(host.hostname.as_deref(), Some("192.0.2.10"));
+            assert_eq!(host.user.as_deref(), Some("ubuntu"));
+            assert_eq!(host.port, Some(2222));
+            assert_eq!(host.identity_file.as_deref(), Some("~/.ssh/id_ed25519"));
+        }
+        assert_eq!(hosts[2].user.as_deref(), Some("deploy"));
     }
 
     // ==========================================================================
