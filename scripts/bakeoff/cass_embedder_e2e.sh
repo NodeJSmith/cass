@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2317
 # cass_embedder_e2e.sh — End-to-end test for embedder registry and model selection (bd-2mbe)
 #
 # Tests:
@@ -12,14 +13,25 @@
 #   ./scripts/bakeoff/cass_embedder_e2e.sh
 #
 # Environment:
-#   CASS_BIN - path to cass binary (default: cargo run -q --)
-#   VERBOSE  - set to 1 for detailed output
+#   CASS_BIN       - path to cass binary (default: target/release/cass,
+#                    target/debug/cass, or cass on PATH)
+#   RCH_BIN        - rch executable (default: rch)
+#   RCH_TARGET_DIR - remote cargo target directory
+#   VERBOSE        - set to 1 for detailed output
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CASS_BIN="${CASS_BIN:-cargo run -q --}"
+RCH_BIN="${RCH_BIN:-rch}"
+RCH_TARGET_DIR="${RCH_TARGET_DIR:-/tmp/rch_target_cass_embedder_e2e}"
+CASS_BIN="${CASS_BIN:-${REPO_ROOT}/target/release/cass}"
+if [[ ! -f "$CASS_BIN" ]]; then
+    CASS_BIN="${REPO_ROOT}/target/debug/cass"
+fi
+if [[ ! -f "$CASS_BIN" ]]; then
+    CASS_BIN="$(command -v cass 2>/dev/null || echo "")"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -65,10 +77,6 @@ run_test() {
     fi
 }
 
-# Create temp directory for test data
-TMPDIR=$(mktemp -d)
-trap "rm -rf $TMPDIR" EXIT
-
 cd "$REPO_ROOT"
 
 echo "========================================"
@@ -76,15 +84,40 @@ echo "Embedder E2E Tests (bd-2mbe)"
 echo "========================================"
 echo ""
 
+if [[ -z "$CASS_BIN" || ! -f "$CASS_BIN" ]]; then
+    log_fail "cass binary not found. Build via rch, then rerun this script with CASS_BIN=/path/to/cass"
+    exit 1
+fi
+
+log_info "Using cass binary: $CASS_BIN"
+log_info "cass version: $("${CASS_BIN}" --version 2>/dev/null || echo 'unknown')"
+
 # Test 1: Unit tests pass
 test_unit_tests() {
-    cargo test --lib embedder_registry 2>&1 | tail -5 | grep -q "11 passed"
+    local output
+    local status
+
+    if ! command -v "$RCH_BIN" >/dev/null 2>&1; then
+        log_warn "rch binary not found; embedder registry unit tests must be offloaded"
+        return 1
+    fi
+
+    set +e
+    output=$("$RCH_BIN" exec -- env CARGO_TARGET_DIR="$RCH_TARGET_DIR" cargo test embedder_registry --lib -- --nocapture 2>&1)
+    status=$?
+    set -e
+
+    if [[ "$VERBOSE" == "1" ]]; then
+        printf '%s\n' "$output"
+    fi
+
+    [[ "$status" -eq 0 ]] && echo "$output" | grep -q "test result: ok"
 }
-run_test "Unit tests pass (11 embedder_registry tests)" test_unit_tests
+run_test "Embedder registry unit tests pass" test_unit_tests
 
 # Test 2: Help shows --model flag
 test_help_shows_model_flag() {
-    $CASS_BIN search --help 2>&1 | grep -q -- "--model"
+    "$CASS_BIN" search --help 2>&1 | grep -q -- "--model"
 }
 run_test "CLI help shows --model flag" test_help_shows_model_flag
 
@@ -92,7 +125,7 @@ run_test "CLI help shows --model flag" test_help_shows_model_flag
 test_hash_embedder_lexical() {
     # Hash embedder should be available even without semantic mode
     # Just verify the CLI parses the flag without error
-    $CASS_BIN search "test" --model hash --limit 1 --robot 2>&1 | head -1 | grep -qE '^\{|^No results'
+    "$CASS_BIN" search "test" --model hash --limit 1 --robot 2>&1 | head -1 | grep -qE '^\{|^No results'
     return 0  # Either result or empty is fine
 }
 run_test "Hash embedder works in lexical mode" test_hash_embedder_lexical || true
@@ -101,7 +134,7 @@ run_test "Hash embedder works in lexical mode" test_hash_embedder_lexical || tru
 test_invalid_model_error() {
     local output
     # Must use --mode semantic to trigger validation
-    output=$($CASS_BIN search "test" --model nonexistent --mode semantic --limit 1 --robot 2>&1) || true
+    output=$("$CASS_BIN" search "test" --model nonexistent --mode semantic --limit 1 --robot 2>&1) || true
     # Should contain error about unknown embedder
     echo "$output" | grep -qi "unknown\|unavailable\|Available" || return 1
 }
