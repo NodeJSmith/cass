@@ -819,6 +819,63 @@ fn robot_json_goldens_do_not_embed_repo_paths_or_raw_session_content() {
     }
 }
 
+fn should_scan_for_bare_golden_regeneration_recipe(rel_path: &str) -> bool {
+    if rel_path == "README.md" {
+        return true;
+    }
+    if rel_path.starts_with("docs/artifacts/") || rel_path == "docs/planning/UPGRADE_LOG.md" {
+        return false;
+    }
+    if rel_path.starts_with("docs/") {
+        return rel_path.ends_with(".md");
+    }
+    if rel_path.starts_with("tests/golden/") {
+        return rel_path.ends_with(".golden")
+            || rel_path.ends_with(".json")
+            || rel_path.ends_with(".md");
+    }
+    rel_path.starts_with("tests/") && rel_path.ends_with(".rs")
+}
+
+#[test]
+fn golden_regeneration_hints_do_not_use_bare_cargo() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let forbidden = concat!("UPDATE_GOLDENS=1 ", "cargo test");
+    let mut violations = Vec::new();
+
+    for root in ["README.md", "docs", "tests"] {
+        let root = repo_root.join(root);
+        for entry in WalkDir::new(&root) {
+            let entry = entry.expect("walk golden recipe policy files");
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let rel_path = entry
+                .path()
+                .strip_prefix(&repo_root)
+                .expect("entry under repo root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !should_scan_for_bare_golden_regeneration_recipe(&rel_path) {
+                continue;
+            }
+
+            let contents = fs::read_to_string(entry.path())
+                .unwrap_or_else(|err| panic!("read {}: {err}", entry.path().display()));
+            if contents.contains(forbidden) {
+                violations.push(rel_path);
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "golden regeneration hints must use rch offload, not bare cargo:\n{}",
+        violations.join("\n")
+    );
+}
+
 /// Capture stdout of `cass <args>` in the isolated test home and return
 /// the scrubbed canonical-JSON form (keys-sorted by serde_json's default
 /// `BTreeMap` insertion preservation, pretty-printed, dynamic values
