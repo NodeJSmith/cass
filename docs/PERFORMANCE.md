@@ -43,37 +43,40 @@ This document describes performance characteristics, benchmarks, and optimizatio
 
 ## Running Benchmarks
 
+Benchmarks are CPU-heavy. Run them through `rch` with an explicit target
+directory so local agent sessions do not consume the development machine.
+
 ### Quick Benchmarks
 
 Run all benchmarks with default settings:
 
 ```bash
-cargo bench
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-target cargo bench
 ```
 
 Run specific benchmark suite:
 
 ```bash
 # Crypto benchmarks
-cargo bench --bench crypto_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-crypto-target cargo bench --bench crypto_perf
 
 # Database benchmarks
-cargo bench --bench db_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-db-target cargo bench --bench db_perf
 
 # Export/compression benchmarks
-cargo bench --bench export_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-export-target cargo bench --bench export_perf
 
 # Search benchmarks
-cargo bench --bench search_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-search-target cargo bench --bench search_perf
 
 # Indexing benchmarks
-cargo bench --bench index_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-index-target cargo bench --bench index_perf
 
 # Cache microbenchmarks
-cargo bench --bench cache_micro
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-cache-target cargo bench --bench cache_micro
 
 # Full runtime benchmarks
-cargo bench --bench runtime_perf
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-runtime-target cargo bench --bench runtime_perf
 ```
 
 ### Filtered Benchmarks
@@ -82,13 +85,13 @@ Run specific benchmark functions:
 
 ```bash
 # Only Argon2 benchmarks
-cargo bench -- argon2
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-filter-target cargo bench -- argon2
 
 # Only compression benchmarks
-cargo bench -- compress
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-filter-target cargo bench -- compress
 
 # Only scaling benchmarks
-cargo bench -- scaling
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-filter-target cargo bench -- scaling
 ```
 
 ### CI/Release Benchmarks
@@ -97,13 +100,13 @@ For thorough benchmarking with more samples:
 
 ```bash
 # Increase sample size for more accurate results
-cargo bench -- --sample-size 100
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-release-target cargo bench -- --sample-size 100
 
 # Save baseline for regression detection
-cargo bench -- --save-baseline main
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-baseline-target cargo bench -- --save-baseline main
 
 # Compare against baseline
-cargo bench -- --baseline main
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-baseline-target cargo bench -- --baseline main
 ```
 
 ## Benchmark Suites
