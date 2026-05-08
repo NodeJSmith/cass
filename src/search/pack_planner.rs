@@ -103,6 +103,75 @@ pub enum PackSourceReadiness {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackLexicalReadiness {
+    #[default]
+    Ready,
+    Stale,
+    Missing,
+    Rebuilding,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackSemanticReadiness {
+    #[default]
+    NotReported,
+    Joined,
+    FallbackLexical,
+    Unavailable,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackSourceSyncGapKind {
+    RemoteStale,
+    SourcePruned,
+    SyncDeferred,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackSourceSyncGap {
+    pub source_id: String,
+    pub origin_kind: String,
+    pub kind: PackSourceSyncGapKind,
+    pub lag_seconds: Option<i64>,
+    pub last_synced_at_ms: Option<i64>,
+    pub recommended_action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackReadinessSnapshot {
+    pub index_generation: Option<String>,
+    pub lexical_readiness: PackLexicalReadiness,
+    pub semantic_readiness: PackSemanticReadiness,
+    pub active_rebuild: bool,
+    pub lock_state: Option<String>,
+    pub missing_database: bool,
+    pub source_sync_gaps: Vec<PackSourceSyncGap>,
+    pub recommended_action: Option<String>,
+}
+
+impl Default for PackReadinessSnapshot {
+    fn default() -> Self {
+        Self {
+            index_generation: None,
+            lexical_readiness: PackLexicalReadiness::Ready,
+            semantic_readiness: PackSemanticReadiness::NotReported,
+            active_rebuild: false,
+            lock_state: None,
+            missing_database: false,
+            source_sync_gaps: Vec::new(),
+            recommended_action: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackCandidate {
     pub candidate_id: String,
@@ -361,6 +430,7 @@ pub struct PackRenderRequest {
     pub sensitive_output: bool,
     pub skill_content_included: bool,
     pub explain_selection: bool,
+    pub readiness: PackReadinessSnapshot,
 }
 
 impl Default for PackRenderRequest {
@@ -382,6 +452,7 @@ impl Default for PackRenderRequest {
             sensitive_output: false,
             skill_content_included: false,
             explain_selection: false,
+            readiness: PackReadinessSnapshot::default(),
         }
     }
 }
@@ -450,10 +521,15 @@ struct RenderedRealized {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct RenderedHealth {
     healthy: bool,
-    recommended_action: Option<&'static str>,
+    recommended_action: Option<String>,
     index_state: &'static str,
+    index_generation: Option<String>,
+    lexical_readiness: &'static str,
     semantic_state: &'static str,
     active_rebuild: bool,
+    lock_state: Option<String>,
+    missing_database: bool,
+    source_sync_gaps: Vec<RenderedSourceSyncGap>,
     source_readiness: Vec<RenderedSourceReadiness>,
 }
 
@@ -464,6 +540,16 @@ struct RenderedSourceReadiness {
     readiness: &'static str,
     healthy: bool,
     evidence_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct RenderedSourceSyncGap {
+    source_id: String,
+    origin_kind: String,
+    kind: &'static str,
+    lag_seconds: Option<i64>,
+    last_synced_at_ms: Option<i64>,
+    recommended_action: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1277,6 +1363,7 @@ fn rendered_answer_pack(
         .collect::<Vec<_>>();
     let source_summary = rendered_source_summary(&evidence);
     let source_readiness = rendered_source_readiness(&evidence);
+    let source_sync_gaps = rendered_source_sync_gaps(&request.readiness.source_sync_gaps);
     let stale_evidence_count = evidence
         .iter()
         .filter(|item| {
@@ -1286,17 +1373,21 @@ fn rendered_answer_pack(
             )
         })
         .count();
-    let health_is_healthy = source_readiness.iter().all(|source| source.healthy);
     let redacted_count = plan
         .omitted
         .iter()
         .filter(|omitted| omitted.reason == PackOmittedReason::RedactedToEmpty)
         .count();
-    let warnings = if evidence.is_empty() {
-        vec!["no_evidence_found".to_string()]
-    } else {
-        Vec::new()
-    };
+    let semantic_readiness = effective_semantic_readiness(request);
+    let health_is_healthy = health_is_healthy(request, &source_readiness);
+    let warnings = readiness_warnings(
+        request,
+        semantic_readiness,
+        &source_readiness,
+        evidence.is_empty(),
+    );
+    let recommended_action =
+        readiness_recommended_action(request, semantic_readiness, health_is_healthy);
 
     RenderedAnswerPack {
         schema_version: "cass.pack.v1",
@@ -1332,15 +1423,15 @@ fn rendered_answer_pack(
         },
         health: RenderedHealth {
             healthy: health_is_healthy,
-            recommended_action: (!health_is_healthy)
-                .then_some("inspect cass health --json and source sync status"),
-            index_state: "ready",
-            semantic_state: request
-                .fallback_mode
-                .as_deref()
-                .map(|_| "fallback")
-                .unwrap_or("not_reported"),
-            active_rebuild: false,
+            recommended_action,
+            index_state: lexical_readiness_label(request.readiness.lexical_readiness),
+            index_generation: request.readiness.index_generation.clone(),
+            lexical_readiness: lexical_readiness_label(request.readiness.lexical_readiness),
+            semantic_state: semantic_readiness_label(semantic_readiness),
+            active_rebuild: request.readiness.active_rebuild,
+            lock_state: request.readiness.lock_state.clone(),
+            missing_database: request.readiness.missing_database,
+            source_sync_gaps,
             source_readiness,
         },
         freshness: RenderedFreshness {
@@ -1376,6 +1467,126 @@ fn rendered_answer_pack(
         },
         warnings,
     }
+}
+
+fn health_is_healthy(
+    request: &PackRenderRequest,
+    source_readiness: &[RenderedSourceReadiness],
+) -> bool {
+    matches!(
+        request.readiness.lexical_readiness,
+        PackLexicalReadiness::Ready
+    ) && !request.readiness.active_rebuild
+        && !request.readiness.missing_database
+        && request.readiness.lock_state.is_none()
+        && request.readiness.source_sync_gaps.is_empty()
+        && source_readiness.iter().all(|source| source.healthy)
+}
+
+fn readiness_warnings(
+    request: &PackRenderRequest,
+    semantic_readiness: PackSemanticReadiness,
+    source_readiness: &[RenderedSourceReadiness],
+    no_evidence: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if no_evidence {
+        warnings.push("no_evidence_found".to_string());
+    }
+    match request.readiness.lexical_readiness {
+        PackLexicalReadiness::Ready => {}
+        PackLexicalReadiness::Stale => warnings.push("lexical_index_stale".to_string()),
+        PackLexicalReadiness::Missing => warnings.push("lexical_index_missing".to_string()),
+        PackLexicalReadiness::Rebuilding => warnings.push("lexical_index_rebuilding".to_string()),
+        PackLexicalReadiness::Unknown => warnings.push("lexical_index_unknown".to_string()),
+    }
+    match semantic_readiness {
+        PackSemanticReadiness::FallbackLexical => {
+            warnings.push("semantic_fallback_lexical".to_string());
+        }
+        PackSemanticReadiness::Unavailable => {
+            warnings.push("semantic_unavailable_lexical_fallback".to_string());
+        }
+        PackSemanticReadiness::Disabled => warnings.push("semantic_disabled".to_string()),
+        PackSemanticReadiness::Joined | PackSemanticReadiness::NotReported => {}
+    }
+    if request.readiness.active_rebuild {
+        warnings.push("active_rebuild".to_string());
+    }
+    if request.readiness.lock_state.is_some() {
+        warnings.push("index_lock_active".to_string());
+    }
+    if request.readiness.missing_database {
+        warnings.push("missing_database".to_string());
+    }
+    for gap in &request.readiness.source_sync_gaps {
+        warnings.push(format!(
+            "source_sync_gap:{}:{}",
+            gap.source_id,
+            source_sync_gap_kind_label(gap.kind)
+        ));
+    }
+    for source in source_readiness.iter().filter(|source| !source.healthy) {
+        warnings.push(format!(
+            "source_readiness:{}:{}",
+            source.source_id, source.readiness
+        ));
+    }
+    warnings
+}
+
+fn readiness_recommended_action(
+    request: &PackRenderRequest,
+    semantic_readiness: PackSemanticReadiness,
+    health_is_healthy: bool,
+) -> Option<String> {
+    if let Some(action) = trimmed_optional_string(request.readiness.recommended_action.as_deref()) {
+        return Some(action);
+    }
+    if request.readiness.missing_database {
+        return Some("run cass index --full".to_string());
+    }
+    match request.readiness.lexical_readiness {
+        PackLexicalReadiness::Ready => {}
+        PackLexicalReadiness::Stale => {
+            return Some("refresh lexical index with cass index --full".to_string());
+        }
+        PackLexicalReadiness::Missing => {
+            return Some("build lexical index with cass index --full".to_string());
+        }
+        PackLexicalReadiness::Rebuilding => {
+            return Some("wait for active rebuild or inspect cass status --json".to_string());
+        }
+        PackLexicalReadiness::Unknown => {
+            return Some("inspect cass health --json".to_string());
+        }
+    }
+    if request.readiness.active_rebuild {
+        return Some("wait for active rebuild or inspect cass status --json".to_string());
+    }
+    if request.readiness.lock_state.is_some() {
+        return Some("inspect cass status --json for active locks".to_string());
+    }
+    if !request.readiness.source_sync_gaps.is_empty() {
+        return Some("inspect cass sources sync --json and source status".to_string());
+    }
+    if !health_is_healthy {
+        return Some("inspect cass health --json and source sync status".to_string());
+    }
+    if matches!(
+        semantic_readiness,
+        PackSemanticReadiness::FallbackLexical | PackSemanticReadiness::Unavailable
+    ) {
+        return Some(
+            "continue with lexical evidence or install semantic model explicitly".to_string(),
+        );
+    }
+    None
+}
+
+fn trimmed_optional_string(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn normalized_query(request: &PackRenderRequest) -> String {
@@ -1572,6 +1783,19 @@ fn rendered_source_readiness(evidence: &[RenderedEvidence]) -> Vec<RenderedSourc
         .collect()
 }
 
+fn rendered_source_sync_gaps(gaps: &[PackSourceSyncGap]) -> Vec<RenderedSourceSyncGap> {
+    gaps.iter()
+        .map(|gap| RenderedSourceSyncGap {
+            source_id: gap.source_id.clone(),
+            origin_kind: gap.origin_kind.clone(),
+            kind: source_sync_gap_kind_label(gap.kind),
+            lag_seconds: gap.lag_seconds,
+            last_synced_at_ms: gap.last_synced_at_ms,
+            recommended_action: gap.recommended_action.clone(),
+        })
+        .collect()
+}
+
 impl RenderedEvidence {
     fn citation_source_readiness(&self) -> PackSourceReadiness {
         if !self.citation.verified {
@@ -1640,7 +1864,15 @@ fn render_answer_pack_markdown(envelope: &RenderedAnswerPack) -> String {
     let mut out = String::new();
     out.push_str("# ");
     out.push_str(&markdown_line(&envelope.pack.title));
-    out.push_str("\n\n## Handoff\n");
+    if !envelope.warnings.is_empty() {
+        out.push_str("\n\n## Warnings\n");
+        for warning in &envelope.warnings {
+            out.push_str("- ");
+            out.push_str(&markdown_line(warning));
+            out.push('\n');
+        }
+    }
+    out.push_str("\n## Handoff\n");
     if envelope.pack.handoff.is_empty() {
         out.push_str("- No evidence selected.\n");
     } else {
@@ -1779,6 +2011,55 @@ fn source_readiness_label(readiness: PackSourceReadiness) -> &'static str {
     }
 }
 
+fn lexical_readiness_label(readiness: PackLexicalReadiness) -> &'static str {
+    match readiness {
+        PackLexicalReadiness::Ready => "ready",
+        PackLexicalReadiness::Stale => "stale",
+        PackLexicalReadiness::Missing => "missing",
+        PackLexicalReadiness::Rebuilding => "rebuilding",
+        PackLexicalReadiness::Unknown => "unknown",
+    }
+}
+
+fn semantic_readiness_label(readiness: PackSemanticReadiness) -> &'static str {
+    match readiness {
+        PackSemanticReadiness::NotReported => "not_reported",
+        PackSemanticReadiness::Joined => "joined",
+        PackSemanticReadiness::FallbackLexical => "fallback_lexical",
+        PackSemanticReadiness::Unavailable => "unavailable",
+        PackSemanticReadiness::Disabled => "disabled",
+    }
+}
+
+fn source_sync_gap_kind_label(kind: PackSourceSyncGapKind) -> &'static str {
+    match kind {
+        PackSourceSyncGapKind::RemoteStale => "remote_stale",
+        PackSourceSyncGapKind::SourcePruned => "source_pruned",
+        PackSourceSyncGapKind::SyncDeferred => "sync_deferred",
+        PackSourceSyncGapKind::Unknown => "unknown",
+    }
+}
+
+fn effective_semantic_readiness(request: &PackRenderRequest) -> PackSemanticReadiness {
+    if !matches!(
+        request.readiness.semantic_readiness,
+        PackSemanticReadiness::NotReported
+    ) {
+        return request.readiness.semantic_readiness;
+    }
+    if request.semantic_joined {
+        return PackSemanticReadiness::Joined;
+    }
+    if request
+        .fallback_mode
+        .as_deref()
+        .is_some_and(|mode| mode.eq_ignore_ascii_case("lexical"))
+    {
+        return PackSemanticReadiness::FallbackLexical;
+    }
+    PackSemanticReadiness::NotReported
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1861,6 +2142,7 @@ mod tests {
             sensitive_output: false,
             skill_content_included: false,
             explain_selection: false,
+            readiness: PackReadinessSnapshot::default(),
         }
     }
 
@@ -1938,7 +2220,7 @@ mod tests {
         let omitted: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(
             meta["_meta"]["warnings"],
-            serde_json::json!(["no_evidence_found"])
+            serde_json::json!(["no_evidence_found", "semantic_fallback_lexical"])
         );
         assert_eq!(omitted["omitted"]["count"], 0);
     }
@@ -1958,6 +2240,8 @@ mod tests {
             rendered,
             format!(
                 "# pack handoff\n\n\
+                 ## Warnings\n\
+                 - semantic_fallback_lexical\n\n\
                  ## Handoff\n\
                  - 0123456789abcdef [{evidence_id}]\n\n\
                  ## Evidence\n\
@@ -1991,6 +2275,194 @@ mod tests {
     }
 
     #[test]
+    fn render_healthy_readiness_reports_generation_and_ready_states() {
+        let plan = plan_answer_pack(request(vec![candidate(
+            "healthy",
+            "local",
+            "/s/healthy.jsonl",
+            10.0,
+        )]))
+        .unwrap();
+        let mut req = render_request(PackRenderFormat::Json);
+        req.fallback_mode = None;
+        req.semantic_joined = true;
+        req.readiness.index_generation = Some("lexical-generation-42".to_string());
+        req.readiness.semantic_readiness = PackSemanticReadiness::Joined;
+
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+
+        assert_eq!(value["health"]["healthy"], true);
+        assert_eq!(value["health"]["index_state"], "ready");
+        assert_eq!(value["health"]["index_generation"], "lexical-generation-42");
+        assert_eq!(value["health"]["lexical_readiness"], "ready");
+        assert_eq!(value["health"]["semantic_state"], "joined");
+        assert_eq!(
+            value["health"]["recommended_action"],
+            serde_json::Value::Null
+        );
+        assert_eq!(value["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn render_stale_lexical_readiness_reports_action() {
+        let plan = plan_answer_pack(request(vec![candidate(
+            "stale-index",
+            "local",
+            "/s/stale-index.jsonl",
+            10.0,
+        )]))
+        .unwrap();
+        let mut req = render_request(PackRenderFormat::Json);
+        req.readiness.lexical_readiness = PackLexicalReadiness::Stale;
+
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+
+        assert_eq!(value["health"]["healthy"], false);
+        assert_eq!(value["health"]["index_state"], "stale");
+        assert_eq!(value["health"]["lexical_readiness"], "stale");
+        assert_eq!(
+            value["health"]["recommended_action"],
+            "refresh lexical index with cass index --full"
+        );
+        assert_eq!(value["warnings"][0], "lexical_index_stale");
+    }
+
+    #[test]
+    fn render_semantic_unavailable_keeps_lexical_health_truthful() {
+        let plan = plan_answer_pack(request(vec![candidate(
+            "semantic",
+            "local",
+            "/s/semantic.jsonl",
+            10.0,
+        )]))
+        .unwrap();
+        let mut req = render_request(PackRenderFormat::Json);
+        req.readiness.semantic_readiness = PackSemanticReadiness::Unavailable;
+
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+
+        assert_eq!(value["health"]["healthy"], true);
+        assert_eq!(value["health"]["semantic_state"], "unavailable");
+        assert_eq!(
+            value["health"]["recommended_action"],
+            "continue with lexical evidence or install semantic model explicitly"
+        );
+        assert_eq!(
+            value["warnings"],
+            serde_json::json!(["semantic_unavailable_lexical_fallback"])
+        );
+    }
+
+    #[test]
+    fn render_active_rebuild_marks_pack_not_fresh() {
+        let plan = plan_answer_pack(request(vec![candidate(
+            "rebuild",
+            "local",
+            "/s/rebuild.jsonl",
+            10.0,
+        )]))
+        .unwrap();
+        let mut req = render_request(PackRenderFormat::Json);
+        req.readiness.active_rebuild = true;
+        req.readiness.lock_state = Some("writer-lock".to_string());
+
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+
+        assert_eq!(value["health"]["healthy"], false);
+        assert_eq!(value["health"]["active_rebuild"], true);
+        assert_eq!(value["health"]["lock_state"], "writer-lock");
+        assert_eq!(
+            value["health"]["recommended_action"],
+            "wait for active rebuild or inspect cass status --json"
+        );
+        assert!(
+            value["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning == "active_rebuild")
+        );
+    }
+
+    #[test]
+    fn render_missing_db_reports_reindex_action() {
+        let plan = plan_answer_pack(request(Vec::new())).unwrap();
+        let mut req = render_request(PackRenderFormat::Json);
+        req.readiness.missing_database = true;
+        req.readiness.lexical_readiness = PackLexicalReadiness::Missing;
+
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+
+        assert_eq!(value["health"]["healthy"], false);
+        assert_eq!(value["health"]["missing_database"], true);
+        assert_eq!(value["health"]["index_state"], "missing");
+        assert_eq!(
+            value["health"]["recommended_action"],
+            "run cass index --full"
+        );
+        assert!(
+            value["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning == "missing_database")
+        );
+    }
+
+    #[test]
+    fn render_source_sync_gap_and_pruned_source_metadata() {
+        let plan = plan_answer_pack(request(vec![candidate(
+            "remote-gap",
+            "remote",
+            "/s/remote-gap.jsonl",
+            10.0,
+        )]))
+        .unwrap();
+        let mut req = render_request(PackRenderFormat::Json);
+        req.readiness.source_sync_gaps = vec![
+            PackSourceSyncGap {
+                source_id: "remote".to_string(),
+                origin_kind: "ssh".to_string(),
+                kind: PackSourceSyncGapKind::RemoteStale,
+                lag_seconds: Some(3_600),
+                last_synced_at_ms: Some(1_000_000),
+                recommended_action: Some("run cass sources sync --json".to_string()),
+            },
+            PackSourceSyncGap {
+                source_id: "old-laptop".to_string(),
+                origin_kind: "ssh".to_string(),
+                kind: PackSourceSyncGapKind::SourcePruned,
+                lag_seconds: None,
+                last_synced_at_ms: None,
+                recommended_action: Some("remove or refresh pruned source".to_string()),
+            },
+        ];
+
+        let value = render_answer_pack_value(&plan, &req).unwrap();
+
+        assert_eq!(value["health"]["healthy"], false);
+        assert_eq!(
+            value["health"]["source_sync_gaps"][0]["kind"],
+            "remote_stale"
+        );
+        assert_eq!(
+            value["health"]["source_sync_gaps"][1]["kind"],
+            "source_pruned"
+        );
+        assert_eq!(
+            value["health"]["recommended_action"],
+            "inspect cass sources sync --json and source status"
+        );
+        assert!(
+            value["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning == "source_sync_gap:old-laptop:source_pruned")
+        );
+    }
+
+    #[test]
     fn render_redacted_empty_pack_reports_privacy_counts() {
         let mut redacted = candidate("redacted", "local", "/s/redacted.jsonl", 9.0);
         redacted.excerpt = " \n\t ".to_string();
@@ -2002,7 +2474,10 @@ mod tests {
         assert_eq!(value["privacy"]["redaction_applied"], true);
         assert_eq!(value["privacy"]["redaction_counts"]["redacted_to_empty"], 1);
         assert_eq!(value["omitted"]["items"][0]["reason"], "redacted_to_empty");
-        assert_eq!(value["warnings"], serde_json::json!(["no_evidence_found"]));
+        assert_eq!(
+            value["warnings"],
+            serde_json::json!(["no_evidence_found", "semantic_fallback_lexical"])
+        );
     }
 
     #[test]
