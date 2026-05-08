@@ -14,6 +14,16 @@ This document describes performance characteristics, benchmarks, and optimizatio
 | Boolean queries | < 500ms | 10K+ conversations | AND/OR combinations |
 | Complex queries | < 2s | 10K+ conversations | Nested boolean + wildcards |
 
+### Answer-Pack Operations
+
+| Operation | Target | Corpus | Notes |
+|-----------|--------|--------|-------|
+| Candidate hydration | Track p50/p95 | 64 / 512 / 2,048 candidates | `SearchHit` to `PackCandidate` conversion |
+| Planner selection | Track p50/p95 | 64 / 512 / 2,048 candidates | Evidence scoring, freshness, dedupe, omissions |
+| JSON rendering | Track p50/p95 | 512 candidates | Pretty and compact robot output serialization |
+| Markdown rendering | Track p50/p95 | 512 candidates | Human handoff rendering with citations |
+| Token-budget scaling | No overflow beyond planner allowance | 4K / 12K / 48K token budgets | Benchmark IDs include selected, omitted, and utilization counts |
+
 ### Cryptographic Operations
 
 | Operation | Target | Parameters | Notes |
@@ -68,6 +78,12 @@ rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-export-target cargo bench --ben
 
 # Search benchmarks
 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-search-target cargo bench --bench search_perf
+
+# Answer-pack planner/render benchmarks
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-pack-target cargo bench --bench search_perf -- answer_pack
+
+# Fast answer-pack SLO report with p50/p95 stage timings
+rch exec -- env CARGO_TARGET_DIR=/tmp/cass-test-pack-target cargo test --test robot_perf answer_pack_planner_and_render_p95_under_slo -- --nocapture
 
 # Indexing benchmarks
 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-bench-index-target cargo bench --bench index_perf
@@ -167,6 +183,17 @@ Search operation benchmarks:
 - **canonicalize_with_code**: Code block canonicalization
 - **vector_search_scaling**: Vector search at various corpus sizes
 - **rrf_fusion**: Rank reciprocal fusion performance
+- **answer_pack_candidate_hydration**: Search hit to answer-pack candidate conversion at 64 / 512 / 2,048 candidates
+- **answer_pack_planner_scaling**: Planner selection, freshness, dedupe, omitted-item accounting, and token-budget utilization
+- **answer_pack_renderers**: JSON pretty, JSON compact, and Markdown rendering cost for selected evidence
+- **answer_pack_token_budget_scaling**: Planner plus JSON rendering at 4K / 12K / 48K soft token budgets
+
+Answer-pack benchmark IDs include candidate count, selected evidence count,
+omitted candidate count, and token-budget utilization percentage. The hydration
+benchmarks include a heap-footprint proxy in KiB based on candidate struct and
+owned string sizes. Treat a same-host p95 or Criterion typical-estimate drift
+over 10% as an investigation trigger and over 20% as a regression unless the
+artifact explains a deliberate tradeoff.
 
 ### runtime_perf.rs
 

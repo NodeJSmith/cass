@@ -2,6 +2,11 @@ use coding_agent_search::default_data_dir;
 use coding_agent_search::search::canonicalize::{MAX_EMBED_CHARS, canonicalize_for_embedding};
 use coding_agent_search::search::embedder::Embedder;
 use coding_agent_search::search::hash_embedder::HashEmbedder;
+use coding_agent_search::search::pack_planner::{
+    PackCandidate, PackFreshnessPolicy, PackLexicalReadiness, PackPlanRequest, PackPlannerLimits,
+    PackReadinessSnapshot, PackRenderFormat, PackRenderRequest, PackSemanticReadiness,
+    PackSourceReadiness, PlannedAnswerPack, plan_answer_pack, render_answer_pack,
+};
 use coding_agent_search::search::query::{
     FieldMask, MatchType, SearchClient, SearchFilters, SearchHit, rrf_fuse_hits,
 };
@@ -10,11 +15,17 @@ use coding_agent_search::search::vector_index::{
     Quantization, SemanticDocId, SemanticFilter, VectorIndex, dot_product_f16_scalar_bench,
     dot_product_f16_simd_bench, dot_product_scalar_bench, dot_product_simd_bench,
 };
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use half::f16;
 use std::collections::HashSet;
 use std::hint::black_box;
+use std::mem::size_of;
 use tempfile::TempDir;
+
+const PACK_BENCH_NOW_MS: i64 = 1_764_000_000_000;
+const PACK_BENCH_FRESHNESS_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
+const PACK_BENCH_QUERY_TERMS: usize = 4;
+const PACK_BENCH_QUERY_PHRASES: usize = 1;
 
 // =============================================================================
 // Hash Embedder Benchmarks
@@ -193,6 +204,298 @@ fn bench_rrf_fusion_overlapping(c: &mut Criterion) {
             black_box(fused)
         })
     });
+}
+
+// =============================================================================
+// Answer Pack Benchmarks
+// =============================================================================
+
+fn make_pack_bench_hit(idx: usize) -> SearchHit {
+    let mut hit = make_bench_hit(&format!("pack-{idx:05}"), 1000.0 - idx as f32 * 0.1);
+    let agent = format!("bench-agent-{}", idx % 12);
+    let workspace = format!("/workspace/answer-pack-project-{}", idx % 16);
+    let source_id = if idx.is_multiple_of(7) {
+        "remote-build"
+    } else {
+        "local"
+    };
+    let origin_kind = if idx.is_multiple_of(7) {
+        "remote"
+    } else {
+        "local"
+    };
+    let created_at = PACK_BENCH_NOW_MS - (idx as i64 % 180) * 3_600_000;
+    let query_lane = match idx % 4 {
+        0 => "checkout failure root cause",
+        1 => "answer pack cited evidence",
+        2 => "freshness health fallback",
+        _ => "token budget omitted evidence",
+    };
+    let duplicate_note = if idx.is_multiple_of(13) {
+        " Duplicate snippet for suppression coverage."
+    } else {
+        ""
+    };
+    let privacy_note = if idx.is_multiple_of(17) {
+        " The raw note mentioned API_KEY=sk-test-redacted and /home/alice/private/session.jsonl."
+    } else {
+        ""
+    };
+
+    hit.title = format!("Answer pack benchmark session {idx}");
+    hit.snippet = format!("{query_lane} summary for candidate {idx}.{duplicate_note}");
+    hit.content = format!(
+        "Candidate {idx} covers {query_lane}. The team selected cited evidence, \
+         checked source readiness, reviewed semantic fallback, and measured JSON plus Markdown \
+         rendering cost for agent handoff workflows.{duplicate_note}{privacy_note}"
+    );
+    hit.content_hash = 0xfeed_0000_u64 + idx as u64;
+    hit.source_path = format!("/tmp/cass-pack-bench/{agent}/session-{idx:05}.jsonl");
+    hit.agent = agent;
+    hit.workspace = workspace;
+    hit.workspace_original = (idx.is_multiple_of(5)).then(|| format!("~/src/pack-{idx}"));
+    hit.created_at = Some(created_at);
+    hit.line_number = Some(idx % 300 + 1);
+    hit.match_type = match idx % 5 {
+        0 => MatchType::Exact,
+        1 => MatchType::Prefix,
+        2 => MatchType::Substring,
+        3 => MatchType::Wildcard,
+        _ => MatchType::ImplicitWildcard,
+    };
+    hit.source_id = source_id.to_string();
+    hit.origin_kind = origin_kind.to_string();
+    hit.origin_host = idx
+        .is_multiple_of(7)
+        .then(|| format!("worker-{}.local", idx % 3));
+    hit.conversation_id = Some(idx as i64);
+    hit
+}
+
+fn build_pack_bench_hits(count: usize) -> Vec<SearchHit> {
+    (0..count).map(make_pack_bench_hit).collect()
+}
+
+fn build_pack_bench_candidates(count: usize) -> Vec<PackCandidate> {
+    build_pack_bench_hits(count)
+        .iter()
+        .enumerate()
+        .map(|(rank, hit)| {
+            let mut candidate = PackCandidate::from_search_hit(
+                hit,
+                PACK_BENCH_QUERY_TERMS,
+                PACK_BENCH_QUERY_PHRASES,
+            );
+            candidate.hybrid_rank = Some(rank + 1);
+            candidate.source_readiness = if rank.is_multiple_of(29) {
+                PackSourceReadiness::StaleReadable
+            } else {
+                PackSourceReadiness::Healthy
+            };
+            candidate.source_explicitly_requested = rank.is_multiple_of(11);
+            candidate
+        })
+        .collect()
+}
+
+fn pack_bench_limits(max_tokens: usize) -> PackPlannerLimits {
+    PackPlannerLimits {
+        max_tokens,
+        max_sessions: 12,
+        max_evidence: 32,
+        context_lines: 3,
+        max_excerpt_chars: 1_200,
+    }
+}
+
+fn pack_bench_plan(candidates: Vec<PackCandidate>, limits: PackPlannerLimits) -> PlannedAnswerPack {
+    plan_answer_pack(PackPlanRequest {
+        now_ms: PACK_BENCH_NOW_MS,
+        limits,
+        freshness_policy: PackFreshnessPolicy::PreferRecent,
+        freshness_window_seconds: PACK_BENCH_FRESHNESS_WINDOW_SECONDS,
+        candidates,
+        explain_selection: true,
+    })
+    .expect("answer pack benchmark plan")
+}
+
+fn pack_bench_render_request(
+    format: PackRenderFormat,
+    limits: PackPlannerLimits,
+) -> PackRenderRequest {
+    PackRenderRequest {
+        query_text: "checkout failure answer pack freshness".to_string(),
+        normalized_query: "checkout failure answer pack freshness".to_string(),
+        generated_at_ms: PACK_BENCH_NOW_MS,
+        elapsed_ms: 0,
+        request_id: Some("bench-answer-pack".to_string()),
+        format,
+        limits,
+        search_mode: "lexical".to_string(),
+        fallback_mode: Some("lexical".to_string()),
+        semantic_joined: false,
+        freshness_policy: PackFreshnessPolicy::PreferRecent,
+        freshness_window_seconds: PACK_BENCH_FRESHNESS_WINDOW_SECONDS,
+        redaction_policy: "strict".to_string(),
+        sensitive_output: false,
+        skill_content_included: false,
+        explain_selection: true,
+        readiness: PackReadinessSnapshot {
+            index_generation: Some("bench-generation".to_string()),
+            lexical_readiness: PackLexicalReadiness::Ready,
+            semantic_readiness: PackSemanticReadiness::FallbackLexical,
+            active_rebuild: false,
+            lock_state: None,
+            missing_database: false,
+            source_sync_gaps: Vec::new(),
+            recommended_action: None,
+        },
+    }
+}
+
+fn approx_pack_candidate_bytes(candidates: &[PackCandidate]) -> usize {
+    candidates
+        .iter()
+        .map(|candidate| {
+            size_of::<PackCandidate>()
+                + candidate.candidate_id.len()
+                + candidate.source_path.len()
+                + candidate.source_id.len()
+                + candidate.origin_kind.len()
+                + candidate.workspace.len()
+                + candidate.agent.len()
+                + candidate.content_hash.len()
+                + candidate.span_hash.len()
+                + candidate.excerpt.len()
+                + candidate
+                    .origin_host
+                    .as_ref()
+                    .map_or(0, std::string::String::len)
+                + candidate
+                    .workspace_original
+                    .as_ref()
+                    .map_or(0, std::string::String::len)
+        })
+        .sum()
+}
+
+fn pack_bench_id(stage: &str, candidate_count: usize, plan: &PlannedAnswerPack) -> BenchmarkId {
+    let utilization_pct =
+        plan.estimated_tokens.saturating_mul(100) / plan.diagnostics.budget.max_tokens;
+    BenchmarkId::new(
+        stage,
+        format!(
+            "{candidate_count}_candidates_{}_selected_{}_omitted_{utilization_pct}pct_budget",
+            plan.selected_evidence_count,
+            plan.omitted.len()
+        ),
+    )
+}
+
+fn bench_answer_pack_candidate_hydration(c: &mut Criterion) {
+    let mut group = c.benchmark_group("answer_pack_candidate_hydration");
+    for count in [64usize, 512, 2_048] {
+        let hits = build_pack_bench_hits(count);
+        let candidates = build_pack_bench_candidates(count);
+        let memory_proxy_kib = approx_pack_candidate_bytes(&candidates) / 1024;
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(
+            BenchmarkId::new(
+                "from_search_hit",
+                format!("{count}_hits_{memory_proxy_kib}kib_proxy"),
+            ),
+            &hits,
+            |bench, input| {
+                bench.iter(|| {
+                    let candidates = input
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, hit)| {
+                            let mut candidate = PackCandidate::from_search_hit(
+                                black_box(hit),
+                                PACK_BENCH_QUERY_TERMS,
+                                PACK_BENCH_QUERY_PHRASES,
+                            );
+                            candidate.hybrid_rank = Some(rank + 1);
+                            candidate
+                        })
+                        .collect::<Vec<_>>();
+                    black_box(candidates);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_answer_pack_planner_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("answer_pack_planner_scaling");
+    for count in [64usize, 512, 2_048] {
+        let candidates = build_pack_bench_candidates(count);
+        let limits = pack_bench_limits(12_000);
+        let plan = pack_bench_plan(candidates.clone(), limits.clone());
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(
+            pack_bench_id("plan", count, &plan),
+            &candidates,
+            |bench, input| {
+                bench.iter_batched(
+                    || input.clone(),
+                    |candidates| black_box(pack_bench_plan(candidates, limits.clone())),
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+fn bench_answer_pack_renderers(c: &mut Criterion) {
+    let candidates = build_pack_bench_candidates(512);
+    let limits = pack_bench_limits(12_000);
+    let plan = pack_bench_plan(candidates, limits.clone());
+    let mut group = c.benchmark_group("answer_pack_renderers");
+    group.throughput(Throughput::Elements(plan.selected_evidence_count as u64));
+
+    for (label, format) in [
+        ("json_pretty", PackRenderFormat::Json),
+        ("json_compact", PackRenderFormat::CompactJson),
+        ("markdown", PackRenderFormat::Markdown),
+    ] {
+        let request = pack_bench_render_request(format, limits.clone());
+        group.bench_function(BenchmarkId::new(label, "512_candidates"), |bench| {
+            bench.iter(|| {
+                let rendered =
+                    render_answer_pack(black_box(&plan), black_box(&request)).expect(label);
+                black_box(rendered);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_answer_pack_token_budget_scaling(c: &mut Criterion) {
+    let candidates = build_pack_bench_candidates(768);
+    let mut group = c.benchmark_group("answer_pack_token_budget_scaling");
+    for max_tokens in [4_000usize, 12_000, 48_000] {
+        let limits = pack_bench_limits(max_tokens);
+        let plan = pack_bench_plan(candidates.clone(), limits.clone());
+        group.throughput(Throughput::Elements(plan.selected_evidence_count as u64));
+        group.bench_function(pack_bench_id("plan_and_render_json", 768, &plan), |bench| {
+            bench.iter_batched(
+                || candidates.clone(),
+                |candidates| {
+                    let plan = pack_bench_plan(candidates, limits.clone());
+                    let request = pack_bench_render_request(PackRenderFormat::Json, limits.clone());
+                    let rendered = render_answer_pack(&plan, &request).expect("render json");
+                    black_box((plan, rendered));
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
 }
 
 // =============================================================================
@@ -487,6 +790,11 @@ criterion_group!(
     // RRF fusion benchmarks
     bench_rrf_fusion_100_results,
     bench_rrf_fusion_overlapping,
+    // Answer-pack planner/render benchmarks
+    bench_answer_pack_candidate_hydration,
+    bench_answer_pack_planner_scaling,
+    bench_answer_pack_renderers,
+    bench_answer_pack_token_budget_scaling,
     // Vector index benchmarks
     bench_empty_search,
     bench_vector_index_search_10k,
