@@ -7,14 +7,18 @@ that requires re-approval.
 
 ## Regeneration
 
+Cargo-based golden regeneration is CPU-heavy in this repo. Run it through
+`rch` and pin `CARGO_TARGET_DIR` so local agents do not contend for the shared
+machine target cache.
+
 ```bash
 # Regenerate every golden
-UPDATE_GOLDENS=1 cargo test --test golden_robot_json
-UPDATE_GOLDENS=1 cargo test --test pages_export_golden
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test pages_export_golden
 
 # Regenerate a specific test
-UPDATE_GOLDENS=1 cargo test --test golden_robot_json -- capabilities_json
-UPDATE_GOLDENS=1 cargo test --test pages_export_golden -- basic_export_html
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json -- capabilities_json
+UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test pages_export_golden -- basic_export_html
 
 # After regeneration, review and commit
 git diff tests/golden/
@@ -40,6 +44,29 @@ Keys are also sorted and the payload is re-indented by
 treated as shape drift.
 
 ## Files
+
+### Planned answer-pack goldens
+
+Bead `coding_agent_session_search-uuwye.6` tracks future goldens for
+`cass pack`. Those goldens must follow the same review loop as existing robot
+goldens: generate through `rch`, canonicalize dynamic values before freezing,
+review every `tests/golden/` diff, and commit the test plus golden update
+together.
+
+Expected answer-pack golden families:
+
+| Family | Path | Stability Strategy | Required Scrubbing |
+|---|---|---|---|
+| Robot JSON | `robot/pack_*.json.golden` | Scrubbed exact JSON after key sorting | generated times, elapsed times, request ids, temp paths, source roots, index generations |
+| Compact JSON | `robot/pack_*_compact.json.golden` | Structural equality with pretty JSON plus exact compact payload | same as robot JSON |
+| JSONL | `robot/pack_*.jsonl.golden` | Exact line order after canonicalization | same as robot JSON plus per-line dynamic metadata |
+| TOON | `robot/pack_*.toon.golden` | Exact TOON if decoder equality is unavailable | same as robot JSON |
+| Markdown | `robot_docs/pack_*.md.golden` or focused pack docs goldens | Exact canonicalized text after JSON goldens pass | temp paths, source roots, timestamps |
+
+Answer-pack goldens are not conformant if they freeze model-generated
+summaries, ambient local paths, wall-clock freshness, or unredacted secrets.
+They should capture only extractive evidence selected from deterministic
+fixtures and should prove that citations survive scrubbing.
 
 ### `robot/capabilities.json.golden`
 
