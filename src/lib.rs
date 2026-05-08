@@ -10921,7 +10921,7 @@ fn run_cli_pack(
     if require_evidence && plan.evidence.is_empty() {
         return Err(CliError {
             code: 13,
-            kind: CliErrorKind::PackNoEvidence.kind_str(),
+            kind: CliErrorKind::NotFound.kind_str(),
             message: "no evidence matched the pack query".to_string(),
             hint: Some("Broaden the query or remove restrictive filters.".to_string()),
             retryable: false,
