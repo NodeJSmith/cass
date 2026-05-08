@@ -191,8 +191,14 @@ main() {
         if [[ -d "test-results/e2e" ]]; then
             while IFS= read -r -d '' file; do
                 files+=("$file")
-            done < <(find test-results/e2e -type f \( -name "*.jsonl" -o -name "cass.log" \) \
-                ! -name "trace.jsonl" ! -name "combined.jsonl" -print0 | sort -z)
+            done < <(
+                find test-results/e2e \
+                    -type f \( -name "*.jsonl" -o -name "cass.log" \) \
+                    ! -name "trace.jsonl" \
+                    ! -name "combined.jsonl" \
+                    ! -path "test-results/e2e/.previous/*" \
+                    -print0 | sort -z
+            )
         fi
     fi
 

@@ -201,6 +201,59 @@ fn shell_validator_rejects_test_end_without_result_status() {
 }
 
 #[test]
+fn shell_validator_default_discovery_skips_archived_logs() {
+    let tracker = tracker_for("shell_validator_default_discovery_skips_archived_logs");
+    let _trace_guard = tracker.trace_env_guard();
+
+    let repo_root = std::env::current_dir().expect("repo root");
+    let validator = repo_root.join("scripts/validate-e2e-jsonl.sh");
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let current_dir = temp.path().join("test-results/e2e");
+    let archived_dir = current_dir.join(".previous/old-run");
+    fs::create_dir_all(&archived_dir).expect("create archived log dir");
+
+    fs::write(
+        current_dir.join("current.jsonl"),
+        r#"{"ts":"2026-01-01T00:00:00Z","event":"run_start","run_id":"current","runner":"rust","env":{}}
+{"ts":"2026-01-01T00:00:01Z","event":"test_start","run_id":"current","runner":"rust","test":{"name":"current"}}
+{"ts":"2026-01-01T00:00:02Z","event":"test_end","run_id":"current","runner":"rust","test":{"name":"current"},"result":{"status":"pass"}}
+{"ts":"2026-01-01T00:00:03Z","event":"run_end","run_id":"current","runner":"rust","summary":{}}
+"#,
+    )
+    .expect("write current jsonl fixture");
+    fs::write(
+        archived_dir.join("stale.jsonl"),
+        r#"{"ts":"2026-01-01T00:00:00Z","event":"run_start","run_id":"stale","runner":"rust","env":{}}
+{"ts":"2026-01-01T00:00:01Z","event":"test_start","run_id":"stale","runner":"rust","test":{"name":"stale"}}
+{"ts":"2026-01-01T00:00:02Z","event":"test_end","run_id":"stale","runner":"rust","test":{"name":"stale"}}
+{"ts":"2026-01-01T00:00:03Z","event":"run_end","run_id":"stale","runner":"rust","summary":{}}
+"#,
+    )
+    .expect("write archived jsonl fixture");
+
+    let output = Command::new("bash")
+        .arg(&validator)
+        .current_dir(temp.path())
+        .output()
+        .expect("run shell JSONL validator");
+
+    assert!(
+        output.status.success(),
+        "shell validator no-arg discovery validated archived .previous logs\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(".previous"),
+        "shell validator should not list archived .previous logs in no-arg mode:\n{stdout}"
+    );
+
+    tracker.complete();
+}
+
+#[test]
 fn jsonl_files_valid_schema() {
     let tracker = tracker_for("jsonl_files_valid_schema");
     let _trace_guard = tracker.trace_env_guard();
