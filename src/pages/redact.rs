@@ -420,6 +420,15 @@ pub fn swarm_evidence_redaction_config() -> RedactionConfig {
         ..Default::default()
     };
     config.custom_patterns.push(CustomPattern {
+        name: "absolute_path_with_spaces".to_string(),
+        pattern: Regex::new(
+            r#"(?i)(?:/home/|/Users/|[A-Z]:\\Users\\|/data/projects/)[^"'<>;,)#\r\n]+"#,
+        )
+        .expect("swarm absolute path redaction regex must compile"),
+        replacement: "[REDACTED_PATH]".to_string(),
+        enabled: true,
+    });
+    config.custom_patterns.push(CustomPattern {
         name: "absolute_path".to_string(),
         pattern: Regex::new(
             r#"(?i)(?:/home/|/Users/|[A-Z]:\\Users\\|/data/projects/)[^\s"'<>;,)#]+"#,
@@ -858,6 +867,22 @@ mod tests {
         assert!(snippet.contains("[REDACTED_PATH]"));
         assert!(!snippet.contains("alice@example.com"));
         assert!(!snippet.contains("/home/alice"));
+    }
+
+    #[test]
+    fn swarm_redaction_scrubs_absolute_paths_with_spaces() {
+        for path in [
+            "/home/alice/Secret Project",
+            "/Users/alice/Secret Project",
+            "C:\\Users\\alice\\Secret Project",
+            "/data/projects/Secret Project",
+        ] {
+            let redacted = redact_swarm_text(&format!("Blocked on {path}"));
+
+            assert_eq!(redacted, "Blocked on [REDACTED_PATH]");
+            assert!(!redacted.contains(path));
+            assert!(!redacted.contains("Secret Project"));
+        }
     }
 
     #[test]
