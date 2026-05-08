@@ -168,6 +168,12 @@ fn error_kinds_golden_coverage() {
 
     let golden_json: serde_json::Value =
         serde_json::from_str(&golden_content).expect("parse golden JSON");
+    let expected_json = build_golden_json(&source_kinds);
+    assert_eq!(
+        golden_json["_meta"], expected_json["_meta"],
+        "Error envelope golden metadata drift detected.\n\n\
+         Regenerate: UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_error_envelope"
+    );
     let golden_kinds = golden_json["kinds"].as_object().expect("kinds object");
 
     let mut missing_from_golden = Vec::new();
