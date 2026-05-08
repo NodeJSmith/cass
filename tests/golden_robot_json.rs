@@ -820,7 +820,7 @@ fn robot_json_goldens_do_not_embed_repo_paths_or_raw_session_content() {
 }
 
 fn should_scan_for_bare_golden_regeneration_recipe(rel_path: &str) -> bool {
-    if rel_path == "README.md" {
+    if rel_path == "AGENTS.md" || rel_path == "README.md" {
         return true;
     }
     if rel_path.starts_with("docs/artifacts/") || rel_path == "docs/planning/UPGRADE_LOG.md" {
@@ -843,7 +843,7 @@ fn golden_regeneration_hints_do_not_use_bare_cargo() {
     let forbidden = concat!("UPDATE_GOLDENS=1 ", "cargo test");
     let mut violations = Vec::new();
 
-    for root in ["README.md", "docs", "tests"] {
+    for root in ["AGENTS.md", "README.md", "docs", "tests"] {
         let root = repo_root.join(root);
         for entry in WalkDir::new(&root) {
             let entry = entry.expect("walk golden recipe policy files");
