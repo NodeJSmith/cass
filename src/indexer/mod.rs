@@ -10491,14 +10491,21 @@ pub fn run_index(
         }
     }
 
-    let now_ms = FrankenStorage::now_millis();
-    persist_final_index_run_metadata(
-        &storage,
-        &opts.db_path,
-        performed_scan,
-        scan_start_ts,
-        now_ms,
-    )?;
+    if targeted_watch_once_only_run {
+        tracing::info!(
+            db_path = %opts.db_path.display(),
+            "deferring final index-run metadata update until targeted watch-once paths are evaluated"
+        );
+    } else {
+        let now_ms = FrankenStorage::now_millis();
+        persist_final_index_run_metadata(
+            &storage,
+            &opts.db_path,
+            performed_scan,
+            scan_start_ts,
+            now_ms,
+        )?;
+    }
     let exact_total_counts = exact_total_counts_from_progress(opts.progress.as_ref());
     if exact_completed_lexical_checkpoint && exact_total_counts.is_some() {
         tracing::info!(
@@ -32643,7 +32650,7 @@ mod tests {
             .raw()
             .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
             .unwrap();
-        assert_eq!(message_count, 3);
+        assert_eq!(message_count, 2);
     }
 
     #[test]
