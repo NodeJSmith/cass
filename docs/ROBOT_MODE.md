@@ -1,8 +1,9 @@
 # Robot Mode Guide (cass)
 
-Updated: 2026-04-22
+Updated: 2026-05-09
 
 ## TL;DR (copy/paste)
+- First command: `cass triage --json` (follow `next_command` when present)
 - First index: `cass index --full --json`
 - Search JSON: `cass search "query" --robot`
 - Handoff pack: `cass pack "query" --robot --max-tokens 12000 --limit 40`
@@ -17,6 +18,7 @@ Updated: 2026-04-22
 ## Core commands for agents
 | Need | Command |
 | --- | --- |
+| One-shot preflight | `cass triage --json` |
 | Search with JSON | `cass search "panic" --robot` |
 | Build cited handoff evidence | `cass pack "panic root cause" --robot --max-tokens 12000 --limit 40` |
 | Search today | `cass search "auth" --robot --today` |
@@ -27,7 +29,7 @@ Updated: 2026-04-22
 | Truncate content | `--max-content-length 400` or budgeted `--max-tokens 200` |
 | Metadata | `--robot-meta` (elapsed_ms, cache stats, index freshness, cursor, warnings) |
 | Health snapshot | `cass state --json` (alias `status`) |
-| Capabilities | `cass capabilities --json` (first-stop workflows, mistake recoveries, commands, flags, env vars, exit codes, limits) |
+| Capabilities | `cass capabilities --json` (static workflows, mistake recoveries, commands, flags, env vars, exit codes, limits) |
 | Introspection | `cass introspect --json` (schemas for responses) |
 
 ## Search asset contract
@@ -35,7 +37,7 @@ Updated: 2026-04-22
 - Lexical search is the required fast path. If the lexical derivative is missing, stale, schema-drifted, or corrupt, cass reports that state and should rebuild it from SQLite instead of requiring routine manual repair.
 - Hybrid is the default search intent. With `--robot-meta`, `_meta.requested_search_mode`, `_meta.search_mode`, `_meta.semantic_refinement`, `_meta.fallback_tier`, and `_meta.fallback_reason` tell agents what actually happened.
 - Semantic search is opportunistic enrichment. Lexical-only behavior is expected during first indexing, semantic backfill, disabled semantic policy, or missing local model/vector assets.
-- Treat `recommended_commands[]` from health/status as the exact next-command contract. `recommended_action` is the human-readable summary; do not run repair commands by habit when cass is already rebuilding or when lexical fallback is an expected state.
+- Treat `next_command` / `recommended_commands[]` from triage as the exact next-command contract. Health/status expose the same readiness recommendations for narrower probes. `recommended_action` is the human-readable summary; do not run repair commands by habit when cass is already rebuilding or when lexical fallback is an expected state.
 
 ## Response shapes (robot)
 - Search:
@@ -51,7 +53,8 @@ Updated: 2026-04-22
   - `privacy`: redaction policy, whether redaction was applied, sensitive-output flag, skill-content flag, and redaction counts
   - `warnings`: machine-readable strings such as `privacy_redactions_applied`, `semantic_fallback_lexical`, or `no_evidence_found`; selected evidence age is structural via `freshness.stale_evidence_count`
 - State/Status: `status, healthy, initialized, recommended_action, recommended_commands[{id,command,safety,run_when,success_signal,parse_fields,retry_after_ms}], index{exists,fresh,last_indexed_at,age_seconds,stale}, database{exists,conversations,messages,path}, pending{sessions,watch_active}, rebuild{active,...}, semantic{status,availability,can_search,fallback_mode,hint}, _meta{timestamp,data_dir,db_path}`
-- Capabilities: `crate_version, api_version, contract_version, documentation_url, features[], connectors[], limits{max_limit,max_content_length,max_fields,max_agg_buckets}`
+- Triage: `surface, schema_version, status, healthy, initialized, recommended_action, recommended_commands[], next_command, readiness{index,database,pending,rebuild,rebuild_progress,semantic}, discovery{capabilities_command,schemas_command,docs_command,api_version_command}, starter_workflows[], mistake_recoveries[], _meta`
+- Capabilities: `crate_version, api_version, contract_version, features[], connectors[], workflows[], mistake_recoveries[], limits{max_limit,max_content_length,max_fields,max_agg_buckets}`
 
 ## Flags worth knowing
 - `--fields minimal|summary|<list>`: reduce payload size
@@ -68,6 +71,7 @@ Updated: 2026-04-22
 
 ## Best practices for agents
 - Always pass `--robot`/`--json` and `--robot-meta` when you care about freshness or pagination.
+- Start unknown automation with `cass triage --json`; aliases `cass ready --json` and `cass preflight --json` are accepted.
 - Use `--fields minimal` during wide scans; fetch details with `cass view` if needed.
 - Respect `_warning`, `index_freshness.stale`, and health/status `recommended_action`; run `cass index --full` for first setup or explicit recommended refresh, not as a blind repair loop.
 - Treat lexical fallback in default hybrid search as expected when semantic assets are not ready. Escalate only when lexical itself is unavailable after the recommended rebuild path.
@@ -89,6 +93,7 @@ Copy-paste examples:
 
 ```bash
 # 1. Pre-flight readiness for freshness-sensitive handoffs
+cass triage --json
 cass status --json
 
 # 2. Broad exploration
@@ -162,7 +167,7 @@ cass search "panic" --robot --fields minimal --robot-meta \
 ```
 
 ## Troubleshooting
-- “not initialized” → run `cass index --full` once
+- “not initialized” → run `cass triage --json` and then its `next_command` (usually `cass index --full ...`)
 - Stale warning → read `recommended_action`; wait if rebuild is active, otherwise refresh with `cass index`
 - Hybrid returned lexical → check `_meta.fallback_reason`; this is normal when semantic assets are unavailable or backfilling
 - Pack warning `privacy_redactions_applied` → inspect `privacy.redaction_counts` before copying the pack; the cited excerpt text has been redacted.
@@ -177,4 +182,4 @@ cass search "panic" --robot --fields minimal --robot-meta \
 - 0.1.30: `_meta.index_freshness` + `_warning` in search robot output; capabilities limits enforced; cursor/request-id exposed.
 
 ---
-For first-stop discovery use `cass capabilities --json`; for deeper response schemas use `cass introspect --json`.
+For one-shot readiness plus discovery use `cass triage --json`; for static self-description use `cass capabilities --json`; for deeper response schemas use `cass introspect --json`.

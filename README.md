@@ -50,9 +50,8 @@ Homebrew bottles are currently published for Linux and Apple Silicon macOS. On I
 ⚠️ **Never run bare `cass` in an agent context** — it launches the interactive TUI. Always use `--robot` or `--json`.
 
 ```bash
-# 1) Health is the first stop. If it is not ready, follow
-#    recommended_commands[0].command for the same data dir.
-cass health --json
+# 1) One-shot agent triage. Follow next_command when present.
+cass triage --json
 
 # 2) Search across all agent history. Default search is hybrid-preferred:
 #    lexical is the fast required path; semantic refinement joins when ready.
@@ -67,6 +66,7 @@ cass view /path/to/session.jsonl -n 42 --json
 cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
 # 5) Discover the full machine API
+cass capabilities --json
 cass robot-docs guide
 cass robot-docs schemas
 
@@ -87,7 +87,7 @@ cass sources agents include openclaw
 - Hybrid is the default search intent. Robot metadata (`--robot --robot-meta`) reports the requested mode, realized mode, semantic refinement status, and any lexical fallback reason when semantic assets are not ready.
 - Semantic assets are opportunistic background enrichment. Lexical-only results are expected during first indexing, semantic catch-up, disabled semantic policy, or unavailable local model/vector files.
 - Semantic model acquisition is **opt-in**: `cass models install` downloads the requested embedder on explicit request; cass never auto-downloads. Three embedders are supported via `--model <name>`: `all-minilm-l6-v2` (alias `minilm`, ~90 MB; the default), `snowflake-arctic-s` (~120 MB), and `nomic-embed` (~270 MB). Air-gapped installs use `--from-file <dir>`. While the chosen model is absent, search silently uses lexical-only and reports `fallback_mode="lexical"` in health/status.
-- `cass health --json` and `cass status --json` are the truth surface for readiness, active rebuilds, and recovery. Prefer `recommended_commands[].command` for exact next steps, and treat `recommended_action` as the human-readable summary.
+- `cass triage --json` is the safest first command for agents: it combines readiness, `next_command`, `recommended_commands[]`, docs/schema pointers, starter workflows, and accepted recoveries. `cass health --json` and `cass status --json` remain the narrower truth surfaces for readiness, active rebuilds, and recovery.
 
 **Lexical publish durability (atomic-swap)**
 - Every lexical publish is an atomic renameat2(RENAME_EXCHANGE) on Linux, or a parked-rename + restore-on-failure dance elsewhere. Readers never see a half-torn index — they see either the old or the new generation, never a mix. See `src/indexer/mod.rs::publish_staged_lexical_index`.
@@ -100,7 +100,7 @@ cass sources agents include openclaw
 - Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit `cass models backfill` / `cass index --full --force-rebuild` replaces the source data.
 
 **Schema stability guarantees**
-- The JSON contract surfaces (`capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
+- The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
 - `cass introspect --json`'s `response_schemas` block enumerates every schema in a stable alphabetical order (`BTreeMap`-backed — see bead coding_agent_session_search-8sl73).
 - Error envelopes (`{error: {code, kind, message, hint, retryable}}`) have a fixed shape. `kind` values are kebab-case; branch on `err.kind`, not on the numeric code, for codes ≥ 10 (see the Error Handling section below).
 
@@ -520,8 +520,8 @@ cass sources doctor
 
 #### Remote Archive Safety
 
-Remote source diagnostics are intentionally local-only. `cass doctor --json`,
-`cass health --json`, and `cass status --json` report the
+Remote source diagnostics are intentionally local-only. `cass triage --json`,
+`cass doctor --json`, `cass health --json`, and `cass status --json` report the
 `remote_source_sync` summary from cass-owned evidence: `sources.toml`,
 `sync_status.json`, the local `remotes/<source>/mirror/` copy, and archive DB
 provenance rows. They do not open SSH sessions, mutate remote machines, or
@@ -728,6 +728,7 @@ This cross-pollination of knowledge across different AI agents is transformative
 
 ```bash
 # First-stop capability contract for agents
+cass triage --json
 cass capabilities --json
 # → {"version": "...", "workflows": [...], "mistake_recoveries": [...], "commands": [...], "exit_codes": [...], "env_vars": [...]}
 
@@ -752,13 +753,15 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass --Robot --LIMIT 5` | `cass --robot --limit 5` | Case normalized |
 | `cass find "auth"` | `cass search "auth"` | `find`/`query`/`q` → `search` via alias table |
 | `cass --robot-docs` | `cass robot-docs` | Flag-as-subcommand detected |
+| `cass ready --json` | `cass triage --json` | One-shot triage alias |
+| `cass preflight --json` | `cass triage --json` | One-shot triage alias |
 | `cass search --limt 5` | `cass search --limit 5` | Flag typos within Levenshtein distance ≤2 corrected |
 
 The CLI applies multiple normalization layers:
 1. **Flag typo correction**: Long flag names within Levenshtein distance 2 are auto-corrected (e.g. `--limt` → `--limit`). *Subcommand typos are NOT fuzzy-corrected* — use one of the documented aliases instead (see layer 4 below). A typo that isn't a known alias will produce a clap usage error with the canonical form in the hint.
 2. **Case normalization**: `--Robot`, `--LIMIT` → `--robot`, `--limit`
 3. **Single-dash recovery**: `-robot` → `--robot` (common LLM mistake)
-4. **Subcommand aliases**: `find`/`query`/`q`/`grep`/`lookup` → `search`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
+4. **Subcommand aliases**: `ready`/`preflight` → `triage`; `find`/`query`/`q`/`grep`/`lookup` → `search`; `ls`/`list`/`info`/`summary` → `stats`; `st`/`state` → `status`; `reindex`/`idx`/`rebuild` → `index`; `show`/`get`/`read` → `view`; `docs`/`help-robot`/`robotdocs` → `robot-docs`
 5. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
@@ -1139,8 +1142,8 @@ cass introspect --json
 
  Quick Start
 
- # Check if index is healthy (exit 0=ok, 1=run index first)
- cass health --json
+ # One-shot agent triage (read next_command when present)
+ cass triage --json
 
  # Search across all agent histories
  cass search "authentication error" --robot --limit 5
@@ -1158,7 +1161,7 @@ cass introspect --json
  cass expand /path/to/session.jsonl -n 42 -C 3 --json
 
  # Learn the full API
- cass capabilities --json # First-stop agent self-description
+ cass capabilities --json # Static agent self-description
  cass robot-docs guide # LLM-optimized docs
 
  Why Use It
@@ -2127,6 +2130,7 @@ Every Tantivy index stores a `schema_hash.json` file containing the schema versi
 
 ```bash
 # Check the current truth surface first
+cass triage --json
 cass health --json
 cass status --json
 
@@ -2172,7 +2176,7 @@ The SQLite database serves as the authoritative data store. Lexical rebuilds rec
 // Progress tracked via IndexingProgress for UI feedback
 ```
 
-This means corrupted lexical data is a repairable derivative-state problem. Operators should read `cass health --json` or `cass status --json` first, then follow `recommended_action`.
+This means corrupted lexical data is a repairable derivative-state problem. Operators should start with `cass triage --json` for the exact next command, or read `cass health --json` / `cass status --json` for the narrower readiness snapshot.
 
 ### Database Schema Migrations
 
@@ -2424,6 +2428,7 @@ cass pack "query" --robot --freshness-policy strict --freshness-window-seconds 6
 cass pack "query" --robot --max-tokens 4000 --max-evidence 8 --max-sessions 3 --max-excerpt-chars 600
 
 # Inspection & Health
+cass triage --json                    # One-shot agent preflight with exact next command
 cass status --json                    # Quick health snapshot
 cass health                           # Minimal pre-flight check (<50ms)
 cass capabilities --json              # First-stop agent self-description
@@ -2457,6 +2462,7 @@ cass completions bash > ~/.bash_completion.d/cass
 | `index --watch` | Daemon mode: watch for file changes, reindex automatically |
 | `search --robot` | JSON output for automation pipelines |
 | `pack --robot` | Deterministic cited answer packs for agent/human handoffs; reports health, freshness, privacy, and warnings |
+| `triage` / `ready` / `preflight` | One-shot agent preflight: readiness, exact next command, docs, schemas, workflows, and recoveries |
 | `status` / `state` | Health snapshot: index freshness, DB stats, recommended action |
 | `health` | Minimal health check (<50ms), exit 0=healthy, 1=unhealthy |
 | `capabilities` | First-stop agent self-description: workflow recipes, mistake recoveries, commands, global flags, exit codes, env vars, and limits |
@@ -2485,6 +2491,10 @@ cass completions bash > ~/.bash_completion.d/cass
 Commands for troubleshooting, debugging, and understanding system state:
 
 ```bash
+# One-shot agent preflight
+cass triage --json
+# → { "surface": "triage", "status": "healthy", "next_command": null, ... }
+
 # Health check (fast, <50ms)
 cass health --json
 # → { "healthy": true, "index_age_seconds": 120, "message_count": 5000 }
