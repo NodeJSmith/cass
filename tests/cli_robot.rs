@@ -807,6 +807,25 @@ fn capabilities_format_json_alias_outputs_capabilities_json() {
 }
 
 #[test]
+fn export_format_json_missing_path_is_not_robot_error_wrapped() {
+    let mut cmd = base_cmd();
+    cmd.args(["export", "--format", "json"]);
+    let output = cmd.assert().failure().code(2).get_output().clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let last_line = stderr
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("stderr should contain a usage error");
+
+    assert_eq!(last_line, "Could not parse arguments");
+    assert!(
+        serde_json::from_str::<Value>(last_line).is_err(),
+        "export --format json is the export format enum, not robot mode"
+    );
+}
+
+#[test]
 fn leading_json_before_robot_docs_is_removed_as_redundant() {
     let mut cmd = base_cmd();
     cmd.args(["--json", "robot-docs", "commands", "--color=never"]);

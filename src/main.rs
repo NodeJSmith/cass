@@ -23,8 +23,75 @@ fn is_robot_format_name(value: &str) -> bool {
     )
 }
 
+fn raw_command_name(args: &[String]) -> Option<&str> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+
+        if arg == "--" {
+            return args.get(index + 1).map(String::as_str);
+        }
+
+        if matches!(
+            arg,
+            "--color"
+                | "--progress"
+                | "--wrap"
+                | "--db"
+                | "--trace-file"
+                | "--data-dir"
+                | "--stale-threshold"
+                | "--robot-format"
+                | "--format"
+        ) {
+            index += 2;
+            continue;
+        }
+
+        if arg.starts_with("--color=")
+            || arg.starts_with("--progress=")
+            || arg.starts_with("--wrap=")
+            || arg.starts_with("--db=")
+            || arg.starts_with("--trace-file=")
+            || arg.starts_with("--data-dir=")
+            || arg.starts_with("--stale-threshold=")
+            || arg.starts_with("--robot-format=")
+            || arg.starts_with("--format=")
+        {
+            index += 1;
+            continue;
+        }
+
+        if matches!(
+            arg,
+            "--json"
+                | "--robot"
+                | "-json"
+                | "-robot"
+                | "--nowrap"
+                | "--quiet"
+                | "-q"
+                | "--verbose"
+                | "-v"
+                | "--robot-help"
+        ) {
+            index += 1;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+
+        return Some(arg);
+    }
+    None
+}
+
 fn is_robot_mode_args() -> bool {
     let args: Vec<String> = std::env::args().collect();
+    let command_name = raw_command_name(&args);
     for (index, arg) in args.iter().enumerate() {
         if matches!(arg.as_str(), "--json" | "--robot" | "-json" | "-robot") {
             return true;
@@ -34,6 +101,7 @@ fn is_robot_mode_args() -> bool {
         }
         if let Some(value) = arg.strip_prefix("--format=")
             && is_robot_format_name(value)
+            && command_name != Some("export")
         {
             return true;
         }
@@ -41,6 +109,7 @@ fn is_robot_mode_args() -> bool {
             && args
                 .get(index + 1)
                 .is_some_and(|value| is_robot_format_name(value))
+            && command_name != Some("export")
         {
             return true;
         }
