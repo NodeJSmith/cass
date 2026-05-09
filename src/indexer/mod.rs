@@ -32654,6 +32654,63 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn run_index_watch_once_reindexes_changed_explicit_codex_path_already_in_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let session = tmp
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("08")
+            .join("rollout-explicit-watch-once-repeat.jsonl");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        let initial = r#"{"timestamp":"2026-05-08T23:09:00.000Z","type":"session_meta","payload":{"id":"explicit-watch-once-repeat","cwd":"/data/projects/ntm"}}
+{"timestamp":"2026-05-08T23:09:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"bd-2mb03 repeat first"}]}}
+"#;
+        std::fs::write(&session, initial).unwrap();
+
+        let opts = |data_dir: &Path, session: &Path| super::IndexOptions {
+            full: false,
+            watch: false,
+            force_rebuild: false,
+            watch_once_paths: Some(vec![session.to_path_buf()]),
+            db_path: data_dir.join("db.sqlite"),
+            data_dir: data_dir.to_path_buf(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: "fastembed".to_string(),
+            progress: None,
+            watch_interval_secs: 30,
+        };
+
+        run_index(opts(&data_dir, &session), None).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        std::fs::write(
+            &session,
+            format!(
+                "{initial}{}",
+                r#"{"timestamp":"2026-05-08T23:09:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-repeat","output":"bd-2mb03 repeat second\n"}}
+"#,
+            ),
+        )
+        .unwrap();
+
+        run_index(opts(&data_dir, &session), None).unwrap();
+
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite")).unwrap();
+        let message_count: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM messages", &[], |row| row.get_typed(0))
+            .unwrap();
+        assert_eq!(message_count, 2);
+    }
+
+    #[test]
     fn watch_event_filter_ignores_read_access_noise() {
         let event = notify::Event::new(notify::event::EventKind::Access(AccessKind::Read))
             .add_path(PathBuf::from("/tmp/session.jsonl"));
