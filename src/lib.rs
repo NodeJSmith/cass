@@ -2529,6 +2529,82 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
     }
 }
 
+fn command_accepts_time_assignment(command: &str) -> bool {
+    matches!(command, "search" | "pack" | "timeline")
+}
+
+fn compact_relative_time_value(value: &str) -> bool {
+    let digits_len = value
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if digits_len == 0 {
+        return false;
+    }
+
+    matches!(
+        value[digits_len..].trim(),
+        "m" | "min"
+            | "mins"
+            | "minute"
+            | "minutes"
+            | "h"
+            | "hr"
+            | "hrs"
+            | "hour"
+            | "hours"
+            | "d"
+            | "day"
+            | "days"
+            | "w"
+            | "week"
+            | "weeks"
+    )
+}
+
+fn normalize_past_time_window_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with('-')
+        || trimmed.ends_with("ago")
+        || matches!(trimmed, "now" | "today" | "yesterday")
+    {
+        return trimmed.to_string();
+    }
+    if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return format!("-{trimmed}d");
+    }
+    if compact_relative_time_value(trimmed) {
+        return format!("-{trimmed}");
+    }
+    trimmed.to_string()
+}
+
+fn time_assignment_option_for_command(
+    command: &str,
+    key: &str,
+    value: &str,
+) -> Option<(&'static str, &'static [&'static str], String)> {
+    if !command_accepts_time_assignment(command) {
+        return None;
+    }
+
+    match key {
+        "last" | "recent" | "past" | "within" => Some((
+            "--since",
+            &["--since"],
+            normalize_past_time_window_value(value),
+        )),
+        "from" | "after" | "start" | "start-date" | "start_date" => {
+            Some(("--since", &["--since"], value.trim().to_string()))
+        }
+        "to" | "before" | "end" | "end-date" | "end_date" => {
+            Some(("--until", &["--until"], value.trim().to_string()))
+        }
+        _ => None,
+    }
+}
+
 fn recover_key_value_option_assignments(rest: &mut [String], corrections: &mut Vec<String>) {
     let Some(command) = rest.first().cloned() else {
         return;
@@ -2540,6 +2616,17 @@ fn recover_key_value_option_assignments(rest: &mut [String], corrections: &mut V
             continue;
         };
         if value.is_empty() {
+            continue;
+        }
+        if let Some((flag, aliases, rewritten_value)) =
+            time_assignment_option_for_command(&command, key, value)
+        {
+            if !has_option_alias(rest, aliases) {
+                rest[index] = format!("{flag}={rewritten_value}");
+                corrections.push(format!(
+                    "'{command} {key}=<value>' → '{command} {flag} <value>' (time-window assignment)"
+                ));
+            }
             continue;
         }
         let Some(option) = assignment_option_for_command(&command, key) else {
@@ -12375,7 +12462,7 @@ fn parse_datetime_str(s: &str) -> Option<i64> {
         return local_midnight_ts(date);
     }
 
-    None
+    crate::ui::time_parser::parse_time_input(s)
 }
 
 /// Compute aggregations from search hits
@@ -63158,6 +63245,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass search auth --agent codex --days 7 --fields minimal --json",
             true,
             "Known bare filter assignments are converted to canonical long flags.",
+        ),
+        mistake_recovery_capability(
+            "cass search auth last=7d before=now --json",
+            "cass search auth --since -7d --until now --json",
+            true,
+            "Familiar time-window assignments are converted to canonical since/until filters.",
         ),
         mistake_recovery_capability(
             "cass search auth -n 5 --json",

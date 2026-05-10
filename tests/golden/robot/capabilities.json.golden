@@ -3089,6 +3089,12 @@
       "behavior": "Known bare filter assignments are converted to canonical long flags."
     },
     {
+      "wrong": "cass search auth last=7d before=now --json",
+      "canonical": "cass search auth --since -7d --until now --json",
+      "accepted": true,
+      "behavior": "Familiar time-window assignments are converted to canonical since/until filters."
+    },
+    {
       "wrong": "cass search auth -n 5 --json",
       "canonical": "cass search auth --limit 5 --json",
       "accepted": true,
