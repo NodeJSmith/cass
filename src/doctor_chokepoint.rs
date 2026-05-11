@@ -427,6 +427,12 @@ fn apply_op(path: &Path, op: &Op, run_dir: &Path) -> Result<(), ChokepointError>
             fs::rename(path, &dest)?;
         }
         Op::AppendLine { line } => {
+            // Pass-11 fix (P1): same atomicity concern as
+            // doctor_runs::append_action — combine body + newline into a
+            // single buffer so the O_APPEND write is atomic up to PIPE_BUF.
+            // Splitting into two write_all calls could let a concurrent
+            // appender slip its body between this body and its newline,
+            // corrupting the log.
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -434,8 +440,10 @@ fn apply_op(path: &Path, op: &Op, run_dir: &Path) -> Result<(), ChokepointError>
                 .create(true)
                 .append(true)
                 .open(path)?;
-            f.write_all(line.as_bytes())?;
-            f.write_all(b"\n")?;
+            let mut buf = String::with_capacity(line.len() + 1);
+            buf.push_str(line);
+            buf.push('\n');
+            f.write_all(buf.as_bytes())?;
             f.sync_data()?;
         }
     }

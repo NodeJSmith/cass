@@ -36009,7 +36009,10 @@ fn run_doctor_explain(
             "actions_jsonl_parse_errors": parse_errs.len(),
         },
         "actions": records,
-        "actions_jsonl_parse_errors": parse_errs.iter().map(|(idx, msg)| serde_json::json!({"line": idx, "error": msg})).collect::<Vec<_>>(),
+        // Pass-11 fix (P3): the underlying parse-error tuple stores 0-indexed
+        // enumerate offsets. Agents expect 1-indexed file line numbers to match
+        // editor + grep conventions, so we add 1 here.
+        "actions_jsonl_parse_errors": parse_errs.iter().map(|(idx, msg)| serde_json::json!({"line": idx + 1, "error": msg})).collect::<Vec<_>>(),
     });
     if structured_format.is_some() {
         println!(

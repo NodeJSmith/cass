@@ -289,7 +289,21 @@ pub(crate) fn append_band_completed(
 /// Append a single record to `<run_dir>/actions.jsonl`. Each record is one line
 /// of JSON; the file is opened with `O_APPEND` so concurrent appenders within
 /// the same process are race-free up to OS guarantees (Linux: atomic for
-/// writes ≤PIPE_BUF).
+/// writes ≤PIPE_BUF, typically 4 KiB).
+///
+/// **Pass-11 fix (P1):** the previous implementation issued two separate
+/// `write_all` calls — one for the JSON body, one for the `\n` terminator.
+/// Under O_APPEND, each `write()` syscall is independently atomic, but two
+/// concurrent writers could interleave their bodies between their newlines,
+/// producing corrupted JSON like `{a}{b}\n\n`. The fix is to combine the
+/// body and newline into a single buffer and emit ONE `write_all` so
+/// all-or-nothing atomicity holds for records ≤PIPE_BUF.
+///
+/// **Bounded-size note:** ActionRecord variants serialize well under 4 KiB
+/// in practice (the largest field is a hex Blake3 hash at 64 chars).
+/// Records exceeding PIPE_BUF would split into multiple syscalls and lose
+/// the atomicity guarantee. Pass-12+ may switch to `pwrite` + explicit
+/// file-locking if larger records are needed.
 pub(crate) fn append_action(run_dir: &Path, rec: &ActionRecord) -> std::io::Result<()> {
     use std::io::Write;
     let path = run_dir.join(ACTIONS_JSONL_NAME);
@@ -297,10 +311,10 @@ pub(crate) fn append_action(run_dir: &Path, rec: &ActionRecord) -> std::io::Resu
         .create(true)
         .append(true)
         .open(&path)?;
-    let line = serde_json::to_string(rec)
+    let mut line = serde_json::to_string(rec)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push('\n');
     file.write_all(line.as_bytes())?;
-    file.write_all(b"\n")?;
     file.sync_data()?;
     Ok(())
 }
