@@ -3103,6 +3103,12 @@
       "behavior": "Search-result field names such as line_number/line-number are accepted as drill-down line aliases."
     },
     {
+      "wrong": "cass view source_path=session.jsonl source_id=local line_number=42 --json",
+      "canonical": "cass view session.jsonl --source local --line 42 --json",
+      "accepted": true,
+      "behavior": "Search-result field bundles can be pasted directly into follow-up drill-down commands."
+    },
+    {
       "wrong": "cass search auth --format json",
       "canonical": "cass search auth --robot-format json",
       "accepted": true,

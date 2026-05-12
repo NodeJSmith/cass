@@ -2566,6 +2566,14 @@ fn assignment_option_for_command(command: &str, key: &str) -> Option<AssignmentO
             }),
             _ => None,
         },
+        "context" | "expand" | "export" | "export-html" | "view" => match key {
+            "source" | "source-id" | "source_id" => Some(AssignmentOption {
+                flag: "--source",
+                aliases: &["--source", "--source-id"],
+                repeatable: false,
+            }),
+            _ => None,
+        },
         "timeline" => match key {
             "agent" | "provider" | "tool" | "connector" | "agent-type" | "agent_type" => {
                 Some(AssignmentOption {
@@ -3543,7 +3551,8 @@ fn recover_multiword_query_positionals(rest: &mut Vec<String>, corrections: &mut
 /// 17. **Implicit robot search recovery**: `foo bar --json` → `search "foo bar" --json`
 /// 18. **Drill-down option recovery**: `view file line=42` → `view file --line 42`
 /// 19. **Search-result field aliases**: `view file --line-number 42` → `view file --line 42`
-/// 20. **Global flag hoisting**: Moves global flags to front regardless of position
+/// 20. **Search-result source aliases**: `view source_path=file source_id=local` → `view file --source local`
+/// 21. **Global flag hoisting**: Moves global flags to front regardless of position
 ///
 /// Returns normalized argv plus an optional correction note teaching proper syntax.
 fn normalize_args(raw: Vec<String>) -> (Vec<String>, Option<String>) {
@@ -65240,6 +65249,12 @@ fn build_mistake_recovery_capabilities() -> Vec<MistakeRecoveryCapability> {
             "cass view session.jsonl --line 42 --json",
             true,
             "Search-result field names such as line_number/line-number are accepted as drill-down line aliases.",
+        ),
+        mistake_recovery_capability(
+            "cass view source_path=session.jsonl source_id=local line_number=42 --json",
+            "cass view session.jsonl --source local --line 42 --json",
+            true,
+            "Search-result field bundles can be pasted directly into follow-up drill-down commands.",
         ),
         mistake_recovery_capability(
             "cass search auth --format json",

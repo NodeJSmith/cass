@@ -772,6 +772,7 @@ AI agents sometimes make syntax mistakes. `cass` aggressively normalizes input t
 | `cass view --path session.jsonl --line 42 --json` | `cass view session.jsonl --line 42 --json` | Named path option converted to required positional path |
 | `cass view session.jsonl --line-number 42 --json` | `cass view session.jsonl --line 42 --json` | Search result field name accepted as a line alias |
 | `cass view session.jsonl line_number=42 --json` | `cass view session.jsonl --line 42 --json` | Search result field assignment accepted as a line option |
+| `cass view source_path=session.jsonl source_id=local line_number=42 --json` | `cass view session.jsonl --source local --line 42 --json` | Search hit field bundle accepted as a follow-up command |
 | `cass search "auth" --format json` | `cass search "auth" --robot-format json` | Familiar format spelling converted to robot format |
 | `cass --format json status` | `cass status --robot-format json` | Leading format request moved to the target subcommand |
 | `cass search "auth" --max-results 5` | `cass search "auth" --limit 5` | Result-count alias converted to canonical limit |
@@ -800,9 +801,10 @@ The CLI applies multiple normalization layers:
 14. **Bare option pairs**: after at least one search/pack query word, `provider codex`, `limit 5`, and `last 7d` become canonical filter flags before the remaining words are folded into the query
 15. **Pack-intent recovery**: a bare robot query or explicit structured-output `search` with pack-only flags such as `--max-evidence`, `--max-sessions`, or `--freshness-policy` becomes `pack`, not implicit or explicit `search`
 16. **Search-result field aliases**: `--line-number`, `--line_number`, and `line_number=42` become the canonical drill-down `--line` option
-17. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
-18. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
-19. **Global flag hoisting**: Position-independent flag handling
+17. **Search-hit bundle recovery**: `source_path=... source_id=... line_number=...` can be pasted into follow-up `view`/`expand` commands and becomes the canonical path/source/line form
+18. **Leading-filter query recovery**: if a search/pack query comes after leading options, the query is moved back to the required positional slot
+19. **Implicit robot search**: unquoted top-level words with an explicit robot/JSON output request become a `search` query unless they look like a subcommand typo
+20. **Global flag hoisting**: Position-independent flag handling
 
 When corrections are applied, `cass` emits a teaching note to stderr so agents learn the canonical syntax.
 

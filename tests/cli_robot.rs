@@ -492,6 +492,13 @@ fn capabilities_are_self_describing_for_agents() {
     );
     assert!(
         recoveries.iter().any(|recovery| recovery["wrong"]
+            == "cass view source_path=session.jsonl source_id=local line_number=42 --json"
+            && recovery["canonical"] == "cass view session.jsonl --source local --line 42 --json"
+            && recovery["accepted"] == true),
+        "capabilities should advertise search-hit field bundle recovery"
+    );
+    assert!(
+        recoveries.iter().any(|recovery| recovery["wrong"]
             == "cass search auth --max_results 5 --json"
             && recovery["canonical"] == "cass search auth --limit 5 --json"
             && recovery["accepted"] == true),
@@ -999,6 +1006,30 @@ fn view_accepts_search_result_line_number_aliases() {
 fn view_line_number_assignment_attaches_to_line_option() {
     let mut cmd = base_cmd();
     cmd.args(["view", "README.md", "line_number=1", "context=0", "--json"]);
+    let output = cmd.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
+
+    assert_eq!(json["path"], "README.md");
+    assert_eq!(json["target_line"].as_u64(), Some(1));
+    assert_eq!(
+        json["lines"].as_array().map(Vec::len),
+        Some(1),
+        "context=0 should produce only the target line"
+    );
+}
+
+#[test]
+fn view_search_hit_assignments_attach_to_path_source_and_line() {
+    let mut cmd = base_cmd();
+    cmd.args([
+        "view",
+        "source_path=README.md",
+        "source_id=local",
+        "line_number=1",
+        "context=0",
+        "--json",
+    ]);
     let output = cmd.assert().success().get_output().clone();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let json: Value = serde_json::from_str(stdout.trim()).expect("valid view JSON");
