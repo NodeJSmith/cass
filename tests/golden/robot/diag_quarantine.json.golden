@@ -114,6 +114,11 @@
       "name": "crush",
       "path": "(not detected)",
       "found": false
+    },
+    {
+      "name": "hermes",
+      "path": "(not detected)",
+      "found": false
     }
   ],
   "quarantine": {

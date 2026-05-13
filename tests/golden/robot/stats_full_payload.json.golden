@@ -21,5 +21,21 @@
     "oldest": "[TIMESTAMP]",
     "newest": "[TIMESTAMP]"
   },
+  "raw_mirror": {
+    "initialized": false,
+    "root_path": "[TEST_HOME]/search_demo_data/raw-mirror/v1",
+    "total_storage_bytes": 0,
+    "manifest_count": 0,
+    "manifest_bytes": 0,
+    "unique_blob_count": 0,
+    "total_blob_bytes": 0,
+    "largest_blob_bytes": 0,
+    "missing_blob_count": 0,
+    "invalid_manifest_count": 0,
+    "oldest_capture_at_ms": null,
+    "newest_capture_at_ms": null,
+    "oldest_source_mtime_ms": null,
+    "newest_source_mtime_ms": null
+  },
   "db_path": "[TEST_HOME]/search_demo_data/agent_search.db"
 }

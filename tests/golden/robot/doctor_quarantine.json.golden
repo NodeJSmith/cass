@@ -716,7 +716,7 @@
     "hnsw_path": null,
     "hnsw_ready": false,
     "progressive_ready": false,
-    "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical.",
+    "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'.",
     "fast_tier": {
       "present": false,
       "ready": false,

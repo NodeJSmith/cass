@@ -259,7 +259,7 @@ fn scan_for_set_e_arithmetic(path: &Path) -> Vec<Finding> {
                 line: idx + 1,
                 snippet: raw.trim().to_string(),
                 rule: "set_e_arithmetic_abort",
-                hint: "use `((VAR += 1))` or `((VAR++)) || true` — `((VAR++))` evaluates to 0 when VAR was 0, which `set -e` treats as failure",
+                hint: "use `((VAR += 1))` — `((VAR++))` evaluates to 0 when VAR was 0, which `set -e` treats as failure",
             });
         }
     }

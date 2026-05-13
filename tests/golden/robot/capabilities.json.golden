@@ -357,6 +357,17 @@
           ]
         },
         {
+          "name": "robot-trace-ingest",
+          "description": "Emit per-ingest-batch NDJSON timing and lookup counters on stderr for perf bisection",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2567,6 +2578,12 @@
       "has_json_output": true
     },
     {
+      "name": "mirror",
+      "description": "Inspect and prune raw-mirror evidence under explicit operator control",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
       "name": "sources",
       "description": "Manage remote sources (P5.x)",
       "arguments": [],
@@ -2986,7 +3003,7 @@
       "wrong": "cass commands --json",
       "canonical": "cass robot-docs commands",
       "accepted": true,
-      "behavior": "Robot-docs topic shorthands such as commands, schemas, examples, exit-codes, and guide route to robot-docs instead of search."
+      "behavior": "Non-command robot-docs topic shorthands such as commands, schemas, examples, env, paths, exit-codes, and guide route to robot-docs instead of search."
     },
     {
       "wrong": "cass search \"query\" limit=5",
@@ -2999,6 +3016,24 @@
       "canonical": "cass robot-docs guide",
       "accepted": true,
       "behavior": "robot-docs is already machine-readable; redundant robot/json flags are removed and the guide topic is used by default."
+    },
+    {
+      "wrong": "cass help --json",
+      "canonical": "cass robot-docs guide",
+      "accepted": true,
+      "behavior": "Structured help requests route to the agent guide instead of clap's human help path."
+    },
+    {
+      "wrong": "cass help commands --json",
+      "canonical": "cass robot-docs commands",
+      "accepted": true,
+      "behavior": "Structured help for robot-docs topics routes directly to the matching robot-docs topic."
+    },
+    {
+      "wrong": "cass search --help --json",
+      "canonical": "cass robot-docs commands",
+      "accepted": true,
+      "behavior": "Structured command help routes to the machine-readable command reference while plain --help remains native clap help."
     },
     {
       "wrong": "cass ready --json",
@@ -3035,6 +3070,12 @@
       "canonical": "cass status --json",
       "accepted": true,
       "behavior": "A leading robot-mode flag is canonicalized to the subcommand's JSON output flag."
+    },
+    {
+      "wrong": "cass --data-dir /tmp/cass health --json",
+      "canonical": "cass health --data-dir /tmp/cass --json",
+      "accepted": true,
+      "behavior": "A leading data-dir override is moved onto the data-dir-aware subcommand."
     },
     {
       "wrong": "cass search --query auth --json",

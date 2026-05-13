@@ -59,7 +59,22 @@ fn sort_example_paths(value: &mut Value) {
             if let Some(Value::Array(paths)) = map.get_mut("example_paths") {
                 paths.sort_by(|left, right| left.as_str().cmp(&right.as_str()));
             }
-            for child in map.values_mut() {
+            for (key, child) in map.iter_mut() {
+                match key.as_str() {
+                    "current_capacity_pct" => {
+                        *child = json!(100);
+                        continue;
+                    }
+                    "shrink_count" | "grow_count" => {
+                        *child = json!(0);
+                        continue;
+                    }
+                    "recent_decisions" => {
+                        *child = json!([]);
+                        continue;
+                    }
+                    _ => {}
+                }
                 sort_example_paths(child);
             }
         }

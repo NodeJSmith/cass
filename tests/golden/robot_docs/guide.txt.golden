@@ -1,6 +1,6 @@
 guide:
   Robot-mode handbook: docs/ROBOT_MODE.md (automation quickstart)
-  Output: --robot/--json; formats via --robot-format json|jsonl|compact|toon
+  Output: --robot/--json; formats via --robot-format json|jsonl|compact|toon (--format/--output aliases accepted)
   Logging: INFO auto-suppressed in robot mode; add -v to re-enable
   Search contract: SQLite is source of truth; lexical is the required self-healing fast path; semantic is opportunistic enrichment.
   Pack contract: `cass pack "query" --robot` returns extractive, cited handoff evidence selected from search results; it does not call an external model or mutate source logs.

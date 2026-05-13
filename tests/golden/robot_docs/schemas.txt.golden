@@ -92,6 +92,7 @@ schemas: (auto-generated from contract)
       - status: string
       - total_candidate_count: integer
       - warnings: array
+    - capabilities_url: string
     - check_scope: object
     - checks: array
     - cleanup_apply: object
@@ -292,6 +293,7 @@ schemas: (auto-generated from contract)
         - safety_classification: string
         - status: string
     - doctor_command: object
+    - doctor_contract_version: integer
     - doctor_v2_contract: object
       - branch_order: array
       - common_branch_fields: array
@@ -570,6 +572,7 @@ schemas: (auto-generated from contract)
       - schema_version: integer
     - risk_level: string
     - safe_auto_eligibility: object
+    - schema_version: integer
     - semantic: object
       - availability: string
       - available: boolean
@@ -2621,6 +2624,7 @@ schemas: (auto-generated from contract)
       - schema_version: integer
       - sole_copy_warning_count: integer
       - status: string
+    - data_dir: string
     - db: object
       - conversations: ?
       - counts_skipped: boolean
@@ -2798,6 +2802,11 @@ schemas: (auto-generated from contract)
       - resource_policy: object
       - shrink_count: integer
       - ticks_total: integer
+    - runtime_optimizations: object
+      - config_source: string
+      - parallel_search: boolean
+      - preconvert_f16: boolean
+      - simd_dot: boolean
     - state: object
       - _meta: object
         - data_dir: string
@@ -3094,6 +3103,7 @@ schemas: (auto-generated from contract)
       - schema_version: integer
       - sole_copy_warning_count: integer
       - status: string
+    - data_dir: string
     - database: object
       - conversations: ?
       - counts_skipped: boolean
@@ -3377,6 +3387,21 @@ schemas: (auto-generated from contract)
       - oldest: ?
     - db_path: string
     - messages: integer
+    - raw_mirror: object
+      - initialized: boolean
+      - invalid_manifest_count: integer
+      - largest_blob_bytes: integer
+      - manifest_bytes: integer
+      - manifest_count: integer
+      - missing_blob_count: integer
+      - newest_capture_at_ms: ?
+      - newest_source_mtime_ms: ?
+      - oldest_capture_at_ms: ?
+      - oldest_source_mtime_ms: ?
+      - root_path: string
+      - total_blob_bytes: integer
+      - total_storage_bytes: integer
+      - unique_blob_count: integer
     - top_workspaces: array
   status:
     - _meta: object
@@ -3396,6 +3421,7 @@ schemas: (auto-generated from contract)
       - schema_version: integer
       - sole_copy_warning_count: integer
       - status: string
+    - data_dir: string
     - database: object
       - conversations: ?
       - counts_skipped: boolean
@@ -3676,6 +3702,7 @@ schemas: (auto-generated from contract)
       - data_dir: string
       - db_path: string
       - timestamp: string
+    - data_dir: string
     - discovery: object
       - api_version_command: string
       - capabilities_command: string

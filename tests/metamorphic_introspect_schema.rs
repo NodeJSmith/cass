@@ -241,6 +241,24 @@ fn surface_command(
         "models-check-update" => vec!["models", "check-update", "--json"],
         "models-status" => vec!["models", "status", "--json"],
         "models-verify" => vec!["models", "verify", "--json"],
+        "pack" => {
+            return Some((
+                vec![
+                    "pack".to_string(),
+                    "hello".to_string(),
+                    "--json".to_string(),
+                    "--limit".to_string(),
+                    "2".to_string(),
+                    "--max-evidence".to_string(),
+                    "2".to_string(),
+                    "--max-tokens".to_string(),
+                    "1200".to_string(),
+                    "--data-dir".to_string(),
+                    demo_data.to_string(),
+                ],
+                ExpectStatus::ExitOk,
+            ));
+        }
         "search" => {
             return Some((
                 vec![
@@ -292,6 +310,17 @@ fn surface_command(
             return Some((
                 vec![
                     "status".to_string(),
+                    "--json".to_string(),
+                    "--data-dir".to_string(),
+                    empty_data_dir.to_string(),
+                ],
+                ExpectStatus::ExitOk,
+            ));
+        }
+        "triage" => {
+            return Some((
+                vec![
+                    "triage".to_string(),
                     "--json".to_string(),
                     "--data-dir".to_string(),
                     empty_data_dir.to_string(),

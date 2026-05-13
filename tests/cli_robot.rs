@@ -433,6 +433,22 @@ fn capabilities_are_self_describing_for_agents() {
     assert!(
         recoveries
             .iter()
+            .any(|recovery| recovery["wrong"] == "cass help --json"
+                && recovery["canonical"] == "cass robot-docs guide"
+                && recovery["accepted"] == true),
+        "capabilities should advertise structured help recovery"
+    );
+    assert!(
+        recoveries
+            .iter()
+            .any(|recovery| recovery["wrong"] == "cass search --help --json"
+                && recovery["canonical"] == "cass robot-docs commands"
+                && recovery["accepted"] == true),
+        "capabilities should advertise structured command help recovery"
+    );
+    assert!(
+        recoveries
+            .iter()
             .any(|recovery| recovery["wrong"] == "cass current --json"
                 && recovery["canonical"] == "cass sessions --current --json"
                 && recovery["accepted"] == true),
@@ -1668,6 +1684,7 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
     let expected_runtime = serde_json::json!({
         "queue_depth": 3,
         "inflight_message_bytes": 65_536,
+        "max_message_bytes_in_flight": 262_144,
         "pending_batch_conversations": 9,
         "pending_batch_message_bytes": 131_072,
         "page_prep_workers": 6,
@@ -1727,6 +1744,14 @@ fn state_and_status_report_active_rebuild_pipeline_runtime() {
     assert_eq!(
         state_runtime["inflight_message_bytes"].as_u64(),
         Some(65_536)
+    );
+    assert_eq!(
+        state_runtime["max_message_bytes_in_flight"].as_u64(),
+        Some(262_144)
+    );
+    assert_eq!(
+        state_runtime["inflight_message_bytes_headroom"].as_u64(),
+        Some(196_608)
     );
     assert_eq!(
         state_runtime["producer_budget_wait_count"].as_u64(),
@@ -5237,6 +5262,9 @@ fn robot_docs_topic_shorthands_route_to_robot_docs() {
         ("schemas", "schemas:"),
         ("examples", "examples:"),
         ("example", "examples:"),
+        ("env", "env:"),
+        ("paths", "paths:"),
+        ("contracts", "contracts:"),
         ("exit-codes", "exit-codes:"),
         ("exit_codes", "exit-codes:"),
         ("guide", "guide:"),
@@ -5271,6 +5299,72 @@ fn robot_docs_topic_shorthands_route_to_robot_docs() {
         serde_json::from_str::<Value>(stdout.trim()).is_err(),
         "leading --json schemas should emit robot-docs text, not search JSON"
     );
+}
+
+#[test]
+fn structured_help_requests_route_to_robot_docs() {
+    for (args, expected) in [
+        (vec!["help", "--json", "--color=never"], "guide:"),
+        (
+            vec!["help", "commands", "--json", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["help", "--json", "commands", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["--json", "help", "schemas", "--color=never"],
+            "schemas:",
+        ),
+        (
+            vec!["help", "doctor", "--output", "json", "--color=never"],
+            "# cass doctor",
+        ),
+        (
+            vec!["help", "sources", "--output", "json", "--color=never"],
+            "sources:",
+        ),
+        (
+            vec!["help", "--output", "json", "doctor", "--color=never"],
+            "# cass doctor",
+        ),
+        (
+            vec!["sources", "--help", "--json", "--color=never"],
+            "sources:",
+        ),
+        (
+            vec!["search", "--help", "--json", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["search", "--json", "--help", "--color=never"],
+            "commands:",
+        ),
+        (
+            vec!["--json", "search", "--help", "--color=never"],
+            "commands:",
+        ),
+        (vec!["--help", "--json", "--color=never"], "guide:"),
+    ] {
+        let mut cmd = base_cmd();
+        cmd.args(args);
+        let output = cmd.assert().success().get_output().clone();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains(expected),
+            "structured help should route to {expected}, got: {stdout}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(stdout.trim()).is_err(),
+            "structured help recovery should emit robot-docs text, not JSON"
+        );
+        assert!(
+            !stdout.contains('\u{1b}'),
+            "structured help should honor hoisted --color=never"
+        );
+    }
 }
 
 /// Correction notices appear on stderr when auto-correcting
@@ -7335,18 +7429,24 @@ fn search_explicit_semantic_mode_errors_when_embedder_absent() {
         "semantic-unavailable must be reported as non-retryable so agents don't loop; got: {err:?}"
     );
 
-    // Invariant 4: hint names `--mode lexical` as the cheap recovery
-    // path. The exact hint text from src/lib.rs:8141 is
-    // "Run 'cass tui' and press Alt+S to set up semantic search, or use --mode lexical".
+    // Invariant 4: hint names the semantic setup path and avoids the
+    // legacy lexical override hint. Lexical is already the default fail-open
+    // behavior when the operator does not explicitly request semantic-only
+    // search, so the recovery is to drop the semantic-only request or build
+    // the semantic assets.
     let hint = err
         .get("hint")
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("error must include a `hint` operator can act on; got: {err:?}"));
     let hint_lower = hint.to_lowercase();
+    let legacy_lexical_hint = concat!("--mode ", "lexical");
     assert!(
-        hint_lower.contains("--mode lexical"),
-        "hint must name `--mode lexical` as the cheap recovery path so the operator can \
-         continue without installing the semantic model; got: {hint:?}"
+        !hint_lower.contains(legacy_lexical_hint),
+        "hint must not point operators at the legacy lexical override; got: {hint:?}"
+    );
+    assert!(
+        hint_lower.contains("index --semantic") && hint_lower.contains("omit --mode semantic"),
+        "hint must explain how to build semantic assets or drop semantic-only mode; got: {hint:?}"
     );
 
     // Invariant 5: non-empty message string (matches the 7k7pl contract

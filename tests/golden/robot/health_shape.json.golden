@@ -13,6 +13,9 @@
     "explanation": {
       "type": "string"
     },
+    "data_dir": {
+      "type": "string"
+    },
     "recommended_action": {
       "type": "string"
     },

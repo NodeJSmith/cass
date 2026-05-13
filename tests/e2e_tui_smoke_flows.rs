@@ -345,6 +345,27 @@ fn wait_for_output_growth(
     }
 }
 
+fn wait_for_rendered_output(
+    captured: &Arc<Mutex<Vec<u8>>>,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        {
+            let data = captured.lock().expect("capture lock");
+            let rendered = strip_terminal_control_sequences(&data);
+            if predicate(&rendered) {
+                return true;
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        thread::sleep(PTY_POLL);
+    }
+}
+
 fn send_key_sequence(writer: &mut (dyn Write + Send), bytes: &[u8]) {
     writer.write_all(bytes).expect("write to PTY");
     writer.flush().expect("flush PTY");
@@ -750,6 +771,12 @@ fn tui_pty_enter_selected_hit_opens_detail_modal() {
         wait_for_output_growth(&captured, 0, 32, PTY_STARTUP_TIMEOUT),
         "Did not observe startup output before Enter detail flow interaction"
     );
+    assert!(
+        wait_for_rendered_output(&captured, PTY_STARTUP_TIMEOUT, |rendered| {
+            rendered.contains("Search sessions, messages")
+        }),
+        "Did not observe rendered search input before Enter detail flow interaction"
+    );
 
     send_key_sequence(&mut *writer, b"hello");
     thread::sleep(Duration::from_millis(120));
@@ -758,6 +785,13 @@ fn tui_pty_enter_selected_hit_opens_detail_modal() {
     assert!(
         wait_for_output_growth(&captured, before_submit_len, 24, Duration::from_secs(6)),
         "Did not observe output growth after query submission in PTY Enter flow"
+    );
+    assert!(
+        wait_for_rendered_output(&captured, Duration::from_secs(6), |rendered| {
+            let rendered = rendered.to_ascii_lowercase();
+            rendered.contains("hello world") || rendered.contains("hi there, how can")
+        }),
+        "Did not observe fixture search result before Enter detail-open attempt"
     );
     thread::sleep(Duration::from_millis(180));
 

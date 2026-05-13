@@ -2,8 +2,11 @@
 
 use coding_agent_search::connectors::opencode::OpenCodeConnector;
 use coding_agent_search::connectors::{Connector, ScanContext};
+use frankensqlite::Connection;
+use frankensqlite::compat::ConnectionExt;
+use frankensqlite::params;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Helper to create a JSON-based OpenCode storage structure
@@ -103,6 +106,39 @@ struct TestPart {
     state: Option<String>,
 }
 
+fn create_drizzle_opencode_db(path: &Path) -> Connection {
+    let conn = Connection::open(path.to_string_lossy().as_ref()).expect("open opencode db");
+    conn.execute_batch(
+        "CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            title TEXT NOT NULL,
+            version TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL
+        );
+        CREATE TABLE message (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );
+        CREATE TABLE part (
+            id TEXT PRIMARY KEY,
+            message_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            data TEXT NOT NULL
+        );",
+    )
+    .expect("create opencode drizzle tables");
+    conn
+}
+
 #[test]
 fn opencode_parses_json_fixture() {
     let fixture_root = PathBuf::from("tests/fixtures/opencode_json");
@@ -118,6 +154,76 @@ fn opencode_parses_json_fixture() {
     assert_eq!(c.title.as_deref(), Some("OpenCode JSON Session"));
     assert_eq!(c.messages.len(), 2);
     assert_eq!(c.workspace, Some(PathBuf::from("/tmp/test-project")));
+}
+
+#[test]
+fn opencode_parses_drizzle_sqlite_schema() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("opencode.db");
+    let conn = create_drizzle_opencode_db(&db_path);
+
+    conn.execute_compat(
+        "INSERT INTO session (
+            id, project_id, slug, directory, title, version, time_created, time_updated
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            "ses_drizzle_1",
+            "proj_drizzle",
+            "drizzle-session",
+            "/work/opencode",
+            "Generate data-lib AGENTS.md",
+            "1.14.46",
+            1_769_920_193_873_i64,
+            1_769_920_194_000_i64
+        ],
+    )
+    .expect("insert session");
+    conn.execute_compat(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            "msg_user_1",
+            "ses_drizzle_1",
+            1_769_920_193_900_i64,
+            1_769_920_193_950_i64,
+            r#"{"role":"user","path":{"cwd":"/work/opencode","root":"/work/opencode"}}"#
+        ],
+    )
+    .expect("insert message");
+    conn.execute_compat(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            "part_text_1",
+            "msg_user_1",
+            "ses_drizzle_1",
+            1_769_920_193_910_i64,
+            1_769_920_193_910_i64,
+            r#"{"id":"part_text_1","type":"text","text":"Explain the current OpenCode Drizzle schema"}"#
+        ],
+    )
+    .expect("insert part");
+    drop(conn);
+
+    let connector = OpenCodeConnector::new();
+    let ctx = ScanContext {
+        data_dir: dir.path().to_path_buf(),
+        scan_roots: Vec::new(),
+        since_ts: None,
+    };
+    let convs = connector
+        .scan(&ctx)
+        .expect("opencode drizzle sqlite scan should succeed");
+
+    assert_eq!(convs.len(), 1);
+    let conv = &convs[0];
+    assert_eq!(conv.agent_slug, "opencode");
+    assert_eq!(conv.external_id.as_deref(), Some("ses_drizzle_1"));
+    assert_eq!(conv.title.as_deref(), Some("Generate data-lib AGENTS.md"));
+    assert_eq!(conv.workspace, Some(PathBuf::from("/work/opencode")));
+    assert_eq!(conv.messages.len(), 1);
+    assert_eq!(conv.messages[0].role, "user");
+    assert!(conv.messages[0].content.contains("OpenCode Drizzle schema"));
 }
 
 #[test]

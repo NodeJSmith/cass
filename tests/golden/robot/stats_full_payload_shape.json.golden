@@ -46,6 +46,53 @@
         }
       }
     },
+    "raw_mirror": {
+      "type": "object",
+      "properties": {
+        "initialized": {
+          "type": "boolean"
+        },
+        "root_path": {
+          "type": "string"
+        },
+        "total_storage_bytes": {
+          "type": "integer"
+        },
+        "manifest_count": {
+          "type": "integer"
+        },
+        "manifest_bytes": {
+          "type": "integer"
+        },
+        "unique_blob_count": {
+          "type": "integer"
+        },
+        "total_blob_bytes": {
+          "type": "integer"
+        },
+        "largest_blob_bytes": {
+          "type": "integer"
+        },
+        "missing_blob_count": {
+          "type": "integer"
+        },
+        "invalid_manifest_count": {
+          "type": "integer"
+        },
+        "oldest_capture_at_ms": {
+          "type": "null"
+        },
+        "newest_capture_at_ms": {
+          "type": "null"
+        },
+        "oldest_source_mtime_ms": {
+          "type": "null"
+        },
+        "newest_source_mtime_ms": {
+          "type": "null"
+        }
+      }
+    },
     "db_path": {
       "type": "string"
     }

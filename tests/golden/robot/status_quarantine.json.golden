@@ -3,6 +3,7 @@
   "healthy": false,
   "initialized": false,
   "explanation": "No cass database or search index exists in [TEST_HOME]/cass-data yet. This is expected on a fresh install or when using a brand-new --data-dir.",
+  "data_dir": "[TEST_HOME]/cass-data",
   "index": {
     "exists": false,
     "status": "missing",
@@ -122,7 +123,7 @@
     "hnsw_path": null,
     "hnsw_ready": false,
     "progressive_ready": false,
-    "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic', or keep using --mode lexical.",
+    "hint": "Run 'cass index --full' first. Optional later: run 'cass models install' and 'cass index --semantic'.",
     "fast_tier": {
       "present": false,
       "ready": false,

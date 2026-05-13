@@ -237,6 +237,138 @@ fn index_refresh_progress_controls_remain_scoped_to_data_dir() -> Result<(), Str
 }
 
 #[test]
+fn index_robot_trace_ingest_flag_parses_for_perf_bisection() -> Result<(), String> {
+    let cli = parse_cli_ok(
+        ["cass", "index", "--json", "--robot-trace-ingest"],
+        "parse ingest trace control",
+    );
+
+    match cli.command {
+        Some(Commands::Index {
+            json: true,
+            robot_trace_ingest: true,
+            ..
+        }) => Ok(()),
+        other => Err(format!(
+            "expected index --robot-trace-ingest to parse, got {other:?}"
+        )),
+    }
+}
+
+#[test]
+#[serial]
+fn index_robot_trace_ingest_emits_batch_ndjson_with_lookup_counters()
+-> Result<(), Box<dyn std::error::Error>> {
+    let tmp = TempDir::new()?;
+    let home = tmp.path();
+    let codex_home = home.join(".codex");
+    let data_dir = home.join("cass_data");
+    fs::create_dir_all(&data_dir)?;
+    let _guard_home = EnvGuard::set("HOME", home.to_string_lossy());
+    let _guard_codex = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy());
+
+    make_codex_session(
+        &codex_home,
+        "2026/05/13",
+        "trace-ingest.jsonl",
+        "trace_ingest_probe",
+    );
+
+    let mut seed = base_cmd(home);
+    seed.args([
+        "index",
+        "--full",
+        "--json",
+        "--no-progress-events",
+        "--data-dir",
+    ])
+    .arg(&data_dir);
+    let seed_output = seed.output()?;
+    assert!(
+        seed_output.status.success(),
+        "seed index should succeed. stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&seed_output.stdout),
+        String::from_utf8_lossy(&seed_output.stderr)
+    );
+
+    let mut traced = base_cmd(home);
+    traced
+        .args([
+            "index",
+            "--full",
+            "--json",
+            "--no-progress-events",
+            "--robot-trace-ingest",
+            "--data-dir",
+        ])
+        .arg(&data_dir);
+    let traced_output = traced.output()?;
+    let stdout = String::from_utf8_lossy(&traced_output.stdout);
+    let stderr = String::from_utf8_lossy(&traced_output.stderr);
+    assert!(
+        traced_output.status.success(),
+        "traced index should succeed. stdout: {stdout}, stderr: {stderr}"
+    );
+
+    let payload: serde_json::Value = serde_json::from_slice(&traced_output.stdout)?;
+    assert_eq!(
+        payload.get("success").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let trace = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|line| line.get("event").and_then(|value| value.as_str()) == Some("ingest_batch"))
+        .ok_or_else(|| format!("stderr should contain ingest_batch trace JSON; got: {stderr}"))?;
+    assert_eq!(trace["status"], "ok");
+    assert_eq!(
+        trace["lexical_strategy"],
+        "deferred_authoritative_db_rebuild"
+    );
+    assert!(
+        trace["batch_n"].as_u64().unwrap_or_default() >= 1,
+        "trace must include a stable batch number: {trace}"
+    );
+    assert!(
+        trace["batch_conversations"].as_u64().unwrap_or_default() >= 1,
+        "trace must include at least one normalized conversation: {trace}"
+    );
+    assert!(
+        trace["batch_msgs"].as_u64().unwrap_or_default() >= 2,
+        "trace must include normalized message count: {trace}"
+    );
+    assert!(
+        trace["wall_ms"].as_u64().is_some(),
+        "trace must include elapsed wall time: {trace}"
+    );
+    assert!(
+        trace["lookups_against_global"].as_u64().is_some(),
+        "trace must include global lookup work proxy: {trace}"
+    );
+    let lookup_trace = trace
+        .get("lookup_trace")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| format!("lookup_trace object missing from trace: {trace}"))?;
+    for field in [
+        "exact_idx_probes",
+        "bounded_lookup_queries",
+        "full_scan_queries",
+        "rows_materialized",
+    ] {
+        assert!(
+            lookup_trace
+                .get(field)
+                .and_then(|value| value.as_u64())
+                .is_some(),
+            "lookup_trace.{field} must be numeric: {trace}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn index_json_reports_entrypoint_contract_for_incremental_and_watch_once()
 -> Result<(), Box<dyn std::error::Error>> {
     let tmp = TempDir::new()?;

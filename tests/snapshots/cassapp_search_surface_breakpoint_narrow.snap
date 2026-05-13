@@ -1,4 +1,4 @@
- ▐ Search ▌  · Analytics   · Sources  | Alt+A=analytics  Ctrl+Shift+S=sources  
+ ▐ Search ▌  · Analytics   · Swarm   · Sources  | Alt+A=analytics  Alt+W=swarm
 ┌ ██ cass · hybrid · prefix ──────────────────────────────────────────────────┐
 │ ?? authenticatio│n regression                                               │
 │○ agent:✎any ○ ws:✎any ○ time:✎all ○ source:✎all                             │
@@ -20,5 +20,4 @@
 │                                                                             │
 │1 sessions │ 1 msgs                                                          │
 └─────────────────────────────────────────────────────────────────────────────┘
- hits 1 · view narrow/compact · query HYB / PFX · perf lat:— cache:cold        
-                                                                               
+ hits 1 · view narrow/compact · query HYB / PFX · perf lat:— cache:cold

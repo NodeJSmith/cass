@@ -21,6 +21,7 @@ use frankensearch::lexical::{
 };
 use frankensqlite::compat::{ConnectionExt, RowExt};
 use rusqlite::Connection as RusqliteConnection;
+use serial_test::serial;
 use std::fs;
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -365,6 +366,7 @@ struct SearchLoopStats {
 }
 
 #[test]
+#[serial]
 fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
     let tracker = tracker_for("duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes");
     let _trace_guard = tracker.trace_env_guard();
@@ -572,6 +574,7 @@ fn duplicate_fts_schema_rows_do_not_block_cli_reads_and_writes() {
 }
 
 #[test]
+#[serial]
 fn concurrent_search_processes_do_not_block_incremental_index_json() {
     let tracker = tracker_for("concurrent_search_processes_do_not_block_incremental_index_json");
     let _trace_guard = tracker.trace_env_guard();
@@ -888,6 +891,7 @@ fn concurrent_search_processes_do_not_block_incremental_index_json() {
 }
 
 #[test]
+#[serial]
 fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publish() {
     let tracker = tracker_for(
         "force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publish",
@@ -1073,12 +1077,18 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
         Some("Run cass index --full --force-rebuild while a direct reader and cass search poll the same live index"),
     );
     rebuild_running.store(true, Ordering::Relaxed);
+    let publish_pause_sentinel = home.join("atomic-publish-overlap-sentinel.json");
     let rebuild_output = cargo_bin_cmd!("cass")
         .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
         .arg(&data_dir)
         .current_dir(&home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
+        .env(
+            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
+            &publish_pause_sentinel,
+        )
+        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
         .timeout(Duration::from_secs(60))
         .output()
         .expect("run force rebuild under concurrent read/search load");
@@ -1205,6 +1215,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_atomic_publi
 }
 
 #[test]
+#[serial]
 fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_atomic_publish() {
     let tracker = tracker_for(
         "force_rebuild_preserves_search_results_and_reader_surface_during_federated_atomic_publish",
@@ -1413,12 +1424,18 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
     rebuild_running.store(true, Ordering::Relaxed);
     let mut rebuild = cargo_bin_cmd!("cass");
     force_federated_publish_env(&mut rebuild);
+    let publish_pause_sentinel = home.join("federated-atomic-publish-overlap-sentinel.json");
     let rebuild_output = rebuild
         .args(["index", "--full", "--force-rebuild", "--json", "--data-dir"])
         .arg(&data_dir)
         .current_dir(&home)
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
+        .env(
+            "CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SENTINEL",
+            &publish_pause_sentinel,
+        )
+        .env("CASS_TEST_LEXICAL_PUBLISH_KILL_RELAUNCH_SLEEP_MS", "2000")
         .timeout(Duration::from_secs(60))
         .output()
         .expect("run federated force rebuild under concurrent read/search load");
@@ -1557,6 +1574,7 @@ fn force_rebuild_preserves_search_results_and_reader_surface_during_federated_at
 }
 
 #[test]
+#[serial]
 fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
     let tracker =
         tracker_for("repeated_force_rebuild_preserves_federated_reader_and_search_stability");
@@ -1776,6 +1794,7 @@ fn repeated_force_rebuild_preserves_federated_reader_and_search_stability() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[serial]
 fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() {
     let tracker =
         tracker_for("force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain");
@@ -2072,6 +2091,7 @@ fn force_rebuild_recovers_cleanly_after_sigkill_between_linux_swap_and_retain() 
 
 /// Test: Full index pipeline - index --full creates DB and index
 #[test]
+#[serial]
 fn index_full_creates_artifacts() {
     verbose!("Starting index_full_creates_artifacts test");
     let tracker = tracker_for("index_full_creates_artifacts");
@@ -2170,6 +2190,7 @@ fn index_full_creates_artifacts() {
 
 /// Incremental re-index must preserve existing messages and ingest new ones from the same file.
 #[test]
+#[serial]
 fn incremental_reindex_preserves_and_appends_messages() {
     let tracker = tracker_for("incremental_reindex_preserves_and_appends_messages");
     let _trace_guard = tracker.trace_env_guard();
@@ -2340,6 +2361,7 @@ fn incremental_reindex_preserves_and_appends_messages() {
 
 /// Reindexing must never drop previously ingested messages in SQLite or Tantivy.
 #[test]
+#[serial]
 fn reindex_does_not_drop_messages_in_db_or_search() {
     let tracker = tracker_for("reindex_does_not_drop_messages_in_db_or_search");
     let _trace_guard = tracker.trace_env_guard();
@@ -2433,6 +2455,7 @@ fn reindex_does_not_drop_messages_in_db_or_search() {
 
 /// Test: Search returns hits with correct match_type
 #[test]
+#[serial]
 fn search_returns_hits_with_match_type() {
     let tracker = tracker_for("search_returns_hits_with_match_type");
     let _trace_guard = tracker.trace_env_guard();
@@ -2511,6 +2534,7 @@ fn search_returns_hits_with_match_type() {
 
 /// Test: Search aggregations include agent buckets
 #[test]
+#[serial]
 fn search_aggregations_include_agents() {
     let tracker = tracker_for("search_aggregations_include_agents");
     let _trace_guard = tracker.trace_env_guard();
@@ -2594,6 +2618,7 @@ fn search_aggregations_include_agents() {
 
 /// Test: Watch-once mode indexes specific paths
 #[test]
+#[serial]
 fn watch_once_indexes_specified_path() {
     let tracker = tracker_for("watch_once_indexes_specified_path");
     let _trace_guard = tracker.trace_env_guard();
@@ -2671,6 +2696,7 @@ fn watch_once_indexes_specified_path() {
 
 /// Test: Search with filters (agent, time range)
 #[test]
+#[serial]
 fn search_with_filters() {
     let tracker = tracker_for("search_with_filters");
     let _trace_guard = tracker.trace_env_guard();
@@ -2739,6 +2765,7 @@ fn search_with_filters() {
 
 /// Test: Search returns total_matches and pagination info
 #[test]
+#[serial]
 fn search_returns_pagination_info() {
     let tracker = tracker_for("search_returns_pagination_info");
     let _trace_guard = tracker.trace_env_guard();
@@ -2814,6 +2841,7 @@ fn search_returns_pagination_info() {
 
 /// Test: Force rebuild recreates index
 #[test]
+#[serial]
 fn force_rebuild_recreates_index() {
     let tracker = tracker_for("force_rebuild_recreates_index");
     let _trace_guard = tracker.trace_env_guard();
@@ -2937,6 +2965,7 @@ fn force_rebuild_recreates_index() {
 
 /// Test: JSON output mode (--json) for index command
 #[test]
+#[serial]
 fn index_json_output_mode() {
     let tracker = tracker_for("index_json_output_mode");
     let _trace_guard = tracker.trace_env_guard();
@@ -2989,6 +3018,7 @@ fn index_json_output_mode() {
 
 /// Test: Help text includes expected options
 #[test]
+#[serial]
 fn index_help_includes_options() {
     let tracker = tracker_for("index_help_includes_options");
     let _trace_guard = tracker.trace_env_guard();
@@ -3022,6 +3052,7 @@ fn index_help_includes_options() {
 
 /// Test: Search help includes expected options
 #[test]
+#[serial]
 fn search_help_includes_options() {
     let tracker = tracker_for("search_help_includes_options");
     let _trace_guard = tracker.trace_env_guard();
@@ -3044,6 +3075,7 @@ fn search_help_includes_options() {
 
 /// Test: Search with wildcard query
 #[test]
+#[serial]
 fn search_wildcard_query() {
     let tracker = tracker_for("search_wildcard_query");
     let _trace_guard = tracker.trace_env_guard();
@@ -3109,6 +3141,7 @@ fn search_wildcard_query() {
 
 /// Test: Trace logging works when enabled
 #[test]
+#[serial]
 fn trace_logging_to_file() {
     let tracker = tracker_for("trace_logging_to_file");
     let _trace_guard = tracker.trace_env_guard();
@@ -3149,6 +3182,7 @@ fn trace_logging_to_file() {
 
 /// Test: Empty query returns recent results
 #[test]
+#[serial]
 fn empty_query_returns_recent() {
     let tracker = tracker_for("empty_query_returns_recent");
     let _trace_guard = tracker.trace_env_guard();
@@ -3218,6 +3252,7 @@ fn empty_query_returns_recent() {
 }
 
 #[test]
+#[serial]
 fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
     let tracker = tracker_for("large_message_minimal_search_stays_on_the_tantivy_fast_path");
     let _trace_guard = tracker.trace_env_guard();
@@ -3322,6 +3357,7 @@ fn large_message_minimal_search_stays_on_the_tantivy_fast_path() {
 }
 
 #[test]
+#[serial]
 fn incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_new_files() {
     let tracker = tracker_for(
         "incremental_index_repairs_sparse_tantivy_from_canonical_db_before_scanning_new_files",

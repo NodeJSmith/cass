@@ -301,6 +301,17 @@
           ]
         },
         {
+          "name": "robot-trace-ingest",
+          "description": "Emit per-ingest-batch NDJSON timing and lookup counters on stderr for perf bisection",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
           "name": "robot-format",
           "description": "Output format for robot mode (overrides --json when specified)",
           "arg_type": "option",
@@ -2509,6 +2520,12 @@
         }
       ],
       "has_json_output": true
+    },
+    {
+      "name": "mirror",
+      "description": "Inspect and prune raw-mirror evidence under explicit operator control",
+      "arguments": [],
+      "has_json_output": false
     },
     {
       "name": "sources",
@@ -8735,6 +8752,15 @@
               "fix_applied"
             ]
           }
+        },
+        "schema_version": {
+          "type": "integer"
+        },
+        "doctor_contract_version": {
+          "type": "integer"
+        },
+        "capabilities_url": {
+          "type": "string"
         }
       },
       "required": [
@@ -26016,6 +26042,9 @@
             "null"
           ]
         },
+        "data_dir": {
+          "type": "string"
+        },
         "recommended_action": {
           "type": [
             "string",
@@ -27640,6 +27669,23 @@
             }
           }
         },
+        "runtime_optimizations": {
+          "type": "object",
+          "properties": {
+            "simd_dot": {
+              "type": "boolean"
+            },
+            "parallel_search": {
+              "type": "boolean"
+            },
+            "preconvert_f16": {
+              "type": "boolean"
+            },
+            "config_source": {
+              "type": "string"
+            }
+          }
+        },
         "parallel_wal_shadow": {
           "type": "object",
           "description": "Parallel-WAL shadow observer (Card 1, shadow-only phase). Activates under CASS_INDEXER_PARALLEL_WAL=shadow. Records per-chunk wall-clock on begin-concurrent writes so operators can assess what an epoch-ordered group-commit coordinator would have decided. NEVER changes commit semantics.",
@@ -28163,7 +28209,10 @@
               "type": "string"
             },
             "filters": {
-              "type": "object"
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
             }
           }
         },
@@ -28288,10 +28337,62 @@
               "type": "boolean"
             },
             "source_sync_gaps": {
-              "type": "array"
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "origin_kind": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "lag_seconds": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "last_synced_at_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "recommended_action": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                }
+              }
             },
             "source_readiness": {
-              "type": "array"
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "origin_kind": {
+                    "type": "string"
+                  },
+                  "readiness": {
+                    "type": "string"
+                  },
+                  "healthy": {
+                    "type": "boolean"
+                  },
+                  "evidence_count": {
+                    "type": "integer"
+                  }
+                }
+              }
             }
           }
         },
@@ -28328,13 +28429,76 @@
               "type": "string"
             },
             "answer_outline": {
-              "type": "array"
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "rank": {
+                    "type": "integer"
+                  },
+                  "heading": {
+                    "type": "string"
+                  },
+                  "evidence_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
             },
             "source_summary": {
-              "type": "array"
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "source_id": {
+                    "type": "string"
+                  },
+                  "origin_kind": {
+                    "type": "string"
+                  },
+                  "session_count": {
+                    "type": "integer"
+                  },
+                  "evidence_count": {
+                    "type": "integer"
+                  },
+                  "newest_evidence_at_ms": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "healthy": {
+                    "type": "boolean"
+                  }
+                }
+              }
             },
             "handoff": {
-              "type": "array"
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "rank": {
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "evidence_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
             }
           }
         },
@@ -28352,7 +28516,11 @@
               "type": "integer"
             },
             "items": {
-              "type": "array"
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true
+              }
             }
           }
         },
@@ -28372,7 +28540,10 @@
               "type": "boolean"
             },
             "redaction_counts": {
-              "type": "object"
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer"
+              }
             }
           }
         },
@@ -29783,6 +29954,9 @@
             "string",
             "null"
           ]
+        },
+        "data_dir": {
+          "type": "string"
         },
         "recommended_action": {
           "type": [
@@ -31407,6 +31581,65 @@
             }
           }
         },
+        "raw_mirror": {
+          "type": "object",
+          "properties": {
+            "initialized": {
+              "type": "boolean"
+            },
+            "root_path": {
+              "type": "string"
+            },
+            "total_storage_bytes": {
+              "type": "integer"
+            },
+            "manifest_count": {
+              "type": "integer"
+            },
+            "manifest_bytes": {
+              "type": "integer"
+            },
+            "unique_blob_count": {
+              "type": "integer"
+            },
+            "total_blob_bytes": {
+              "type": "integer"
+            },
+            "largest_blob_bytes": {
+              "type": "integer"
+            },
+            "missing_blob_count": {
+              "type": "integer"
+            },
+            "invalid_manifest_count": {
+              "type": "integer"
+            },
+            "oldest_capture_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "newest_capture_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "oldest_source_mtime_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "newest_source_mtime_ms": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        },
         "db_path": {
           "type": "string"
         }
@@ -31429,6 +31662,9 @@
             "string",
             "null"
           ]
+        },
+        "data_dir": {
+          "type": "string"
         },
         "recommended_action": {
           "type": [
@@ -33023,6 +33259,9 @@
             "string",
             "null"
           ]
+        },
+        "data_dir": {
+          "type": "string"
         },
         "recommended_action": {
           "type": [

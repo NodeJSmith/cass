@@ -15,7 +15,7 @@
 //! changes won't break.
 
 use coding_agent_search::ui::style_system::{StyleContext, StyleOptions, UiThemePreset};
-use ftui::{PackedRgba, Style, StyleFlags};
+use ftui::{ColorProfile, PackedRgba, Style, StyleFlags};
 
 fn fg_of(style: &Style) -> Option<PackedRgba> {
     style.fg
@@ -39,6 +39,7 @@ fn markdown_theme_dark_produces_distinct_fg_colors() {
     let opts = StyleOptions {
         dark_mode: true,
         preset: UiThemePreset::TokyoNight,
+        color_profile: ColorProfile::TrueColor,
         ..StyleOptions::default()
     };
     let ctx = StyleContext::from_options(opts);
@@ -75,6 +76,7 @@ fn markdown_theme_light_produces_distinct_fg_colors() {
     let opts = StyleOptions {
         dark_mode: false,
         preset: UiThemePreset::Daylight,
+        color_profile: ColorProfile::TrueColor,
         ..StyleOptions::default()
     };
     let ctx = StyleContext::from_options(opts);
@@ -105,6 +107,7 @@ fn markdown_theme_code_block_has_distinct_background() {
     let opts = StyleOptions {
         dark_mode: true,
         preset: UiThemePreset::TokyoNight,
+        color_profile: ColorProfile::TrueColor,
         ..StyleOptions::default()
     };
     let ctx = StyleContext::from_options(opts);
@@ -127,6 +130,7 @@ fn markdown_theme_h1_through_h6_distinct_or_styled() {
     let opts = StyleOptions {
         dark_mode: true,
         preset: UiThemePreset::TokyoNight,
+        color_profile: ColorProfile::TrueColor,
         ..StyleOptions::default()
     };
     let ctx = StyleContext::from_options(opts);
@@ -168,6 +172,7 @@ fn markdown_theme_handles_empty_render_input_safely() {
     // theme construction.)
     let opts = StyleOptions {
         dark_mode: true,
+        color_profile: ColorProfile::TrueColor,
         ..StyleOptions::default()
     };
     let _ctx = StyleContext::from_options(opts);

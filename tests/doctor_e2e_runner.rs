@@ -2343,6 +2343,68 @@ fn doctor_e2e_runner_cleanup_low_disk_prunes_only_derived_and_logs() {
         );
     }
 
+    // Pass-13 structural refactor: every successful cleanup-apply mutation
+    // is now appended to <data_dir>/doctor/runs/<run-id>/actions.jsonl so
+    // `cass doctor --undo`, `--diff`, and `--ls` see real production
+    // mutations. The before-tree must not contain any journal artifacts
+    // (clean fixture); the after-tree must contain at least one
+    // `doctor/runs/<run-id>/actions.jsonl` because the test pruned a real
+    // failed-reclaimable derived generation.
+    assert!(
+        !before_data
+            .keys()
+            .any(|path| path.starts_with("doctor/runs/")),
+        "fixture must not preseed a doctor-runs journal: {before_tree:#}"
+    );
+    let journal_paths: Vec<&String> = after_data
+        .keys()
+        .filter(|path| path.starts_with("doctor/runs/") && path.ends_with("/actions.jsonl"))
+        .collect();
+    assert_eq!(
+        journal_paths.len(),
+        1,
+        "pass-13 cleanup-apply must journal exactly one run dir; got: {journal_paths:?}"
+    );
+    // Deeper assertion: read the on-disk journal file and verify it carries
+    // the canonical schema_version=1 RunStarted record, a Mutation record
+    // with the pass-13 `prune-cleanup-target` op label, and a RunEnded
+    // record whose `exit_code_kind` reflects the applied outcome.
+    let journal_relative = journal_paths[0].clone();
+    let fixture_data_dir = temp
+        .path()
+        .join("run")
+        .join("fixtures")
+        .join("artifact-cleanup-low-disk")
+        .join("cass-data");
+    let journal_path = fixture_data_dir.join(&journal_relative);
+    let journal_body = std::fs::read_to_string(&journal_path).unwrap_or_else(|err| {
+        panic!(
+            "must be able to read pass-13 journal at {}: {err}",
+            journal_path.display()
+        )
+    });
+    assert!(
+        journal_body.contains("\"kind\":\"run-started\""),
+        "pass-13 journal must contain RunStarted: {journal_body}"
+    );
+    assert!(
+        journal_body.contains("\"mode\":\"cleanup-apply\""),
+        "pass-13 RunStarted record must report mode=cleanup-apply: {journal_body}"
+    );
+    assert!(
+        journal_body.contains("\"kind\":\"mutation\""),
+        "pass-13 journal must contain at least one Mutation record: {journal_body}"
+    );
+    assert!(
+        journal_body.contains("\"op\":\"prune-cleanup-target\""),
+        "pass-13 Mutation record must use canonical op label `prune-cleanup-target`: {journal_body}"
+    );
+    assert!(
+        journal_body.contains("\"kind\":\"run-ended\"")
+            && journal_body.contains("\"exit_code_kind\":\"success\""),
+        "pass-13 journal must end with RunEnded reporting success: {journal_body}"
+    );
+
     let raw_mirror_before = filtered_hashes(&before_data, "raw-mirror/v1/");
     let raw_mirror_after = filtered_hashes(&after_data, "raw-mirror/v1/");
     assert!(

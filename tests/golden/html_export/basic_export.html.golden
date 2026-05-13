@@ -880,8 +880,12 @@ tr:hover td {
   border-style: solid;
 }
 
-/* Expanded state for overflow - show all badges */
-.message-header-right.expanded .tool-badge {
+/* Overflowed badges stay in the DOM so expansion can reveal them. */
+.tool-badge.tool-overflow-extra {
+  display: none;
+}
+
+.message-header-right.expanded .tool-overflow-extra {
   display: inline-flex;
 }
 
@@ -1506,6 +1510,7 @@ pre:hover .copy-code-btn { opacity: 1; }
 .agent-windsurf .message-assistant { border-left-color: oklch(0.7 0.2 205); }
 .agent-amp .message-assistant { border-left-color: oklch(0.7 0.18 270); }
 .agent-grok .message-assistant { border-left-color: oklch(0.7 0.22 350); }
+.agent-hermes .message-assistant { border-left-color: oklch(0.78 0.16 95); }
 
 /* Print styles */
 @media print {

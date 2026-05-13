@@ -9,7 +9,7 @@
     "can_search": false,
     "fallback_mode": "lexical",
     "embedder_id": "minilm-384",
-    "hint": "Run 'cass index --semantic' to finish backfilling current semantic assets, or keep using --mode lexical.",
+    "hint": "Run 'cass index --semantic' to finish backfilling current semantic assets; search will use lexical fallback until then.",
     "fast_tier": {
       "present": false,
       "ready": false,
