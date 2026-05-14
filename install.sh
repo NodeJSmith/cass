@@ -108,12 +108,14 @@ archive_member_allowed() {
   member="${1#./}"
 
   case "$member" in
-    cass|cass.exe|coding-agent-search) return 0 ;;
+    cass|cass.exe|coding-agent-search|coding-agent-search.exe) return 0 ;;
   esac
 
   if [ -n "$TARGET" ]; then
     case "$member" in
-      "cass-${TARGET}"|"cass-${TARGET}/"|"cass-${TARGET}/cass"|"cass-${TARGET}/cass.exe") return 0 ;;
+      "cass-${TARGET}"|"cass-${TARGET}/") return 0 ;;
+      "cass-${TARGET}/cass"|"cass-${TARGET}/cass.exe") return 0 ;;
+      "cass-${TARGET}/coding-agent-search"|"cass-${TARGET}/coding-agent-search.exe") return 0 ;;
     esac
   fi
 
@@ -125,12 +127,13 @@ archive_member_is_installable_binary() {
   member="${1#./}"
 
   case "$member" in
-    cass|cass.exe|coding-agent-search) return 0 ;;
+    cass|cass.exe|coding-agent-search|coding-agent-search.exe) return 0 ;;
   esac
 
   if [ -n "$TARGET" ]; then
     case "$member" in
       "cass-${TARGET}/cass"|"cass-${TARGET}/cass.exe") return 0 ;;
+      "cass-${TARGET}/coding-agent-search"|"cass-${TARGET}/coding-agent-search.exe") return 0 ;;
     esac
   fi
 
@@ -441,6 +444,12 @@ if [ ! -x "$BIN" ]; then
    BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search" -perm -111 | head -n 1)
    if [ -x "$BIN" ]; then
       warn "Found 'coding-agent-search' binary instead of 'cass'; installing as 'cass'"
+   fi
+fi
+if [ ! -x "$BIN" ]; then
+   BIN=$(find "$TMP" -maxdepth 3 -type f -name "coding-agent-search.exe" -perm -111 | head -n 1)
+   if [ -x "$BIN" ]; then
+      warn "Found 'coding-agent-search.exe' binary instead of 'cass'; installing as 'cass'"
    fi
 fi
 
