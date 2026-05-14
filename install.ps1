@@ -312,9 +312,12 @@ try {
   $extractDir = Join-Path $tmp "extract"
   [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile, $extractDir)
 
-  $bin = Get-ChildItem -Path $extractDir -Recurse -File |
-    Where-Object { $_.Name -in @("cass.exe", "coding-agent-search.exe") } |
+  $bin = Get-ChildItem -Path $extractDir -Recurse -File -Filter "cass.exe" |
     Select-Object -First 1
+  if (-not $bin) {
+    $bin = Get-ChildItem -Path $extractDir -Recurse -File -Filter "coding-agent-search.exe" |
+      Select-Object -First 1
+  }
   if (-not $bin) { Write-Error "Binary not found in zip"; exit 1 }
   if ($bin.Name -ne "cass.exe") {
     Write-Warning "Found legacy binary name '$($bin.Name)'; installing it as cass.exe"
