@@ -326,20 +326,21 @@ jobs:
           # Delete only leftover draft releases for this tag. A published
           # release may have been repaired manually after a runner outage; do
           # not overwrite it from a delayed workflow run.
-          EXISTING_RELEASE=$(gh api "repos/${{ github.repository }}/releases" \
-            --paginate --jq ".[] | select(.tag_name == \"${TAG}\") | {id, draft, html_url}" 2>/dev/null | head -n 1 || true)
-          if [[ -n "$EXISTING_RELEASE" ]]; then
-            EXISTING_ID=$(jq -r '.id' <<<"$EXISTING_RELEASE")
-            EXISTING_DRAFT=$(jq -r '.draft' <<<"$EXISTING_RELEASE")
-            EXISTING_URL=$(jq -r '.html_url' <<<"$EXISTING_RELEASE")
-            if [[ "$EXISTING_DRAFT" == "true" ]]; then
-              echo "Deleting existing draft release id=${EXISTING_ID} for tag ${TAG}"
-              gh api -X DELETE "repos/${{ github.repository }}/releases/${EXISTING_ID}" || true
-            else
-              echo "::error::Published release already exists for ${TAG}: ${EXISTING_URL}"
+          EXISTING_RELEASES=$(gh api "repos/${{ github.repository }}/releases" \
+            --paginate --jq ".[] | select(.tag_name == \"${TAG}\") | {id, draft, html_url}" 2>/dev/null || true)
+          if [[ -n "$EXISTING_RELEASES" ]]; then
+            PUBLISHED_RELEASES=$(jq -s -c '[.[] | select(.draft == false)]' <<<"$EXISTING_RELEASES")
+            if [[ "$PUBLISHED_RELEASES" != "[]" ]]; then
+              jq -r '.[] | "::error::Published release already exists: \(.html_url)"' <<<"$PUBLISHED_RELEASES"
               echo "::error::Refusing to delete or overwrite a published release from a delayed workflow run."
               exit 1
             fi
+
+            jq -r 'select(.draft == true) | .id' <<<"$EXISTING_RELEASES" | while read -r EXISTING_ID; do
+              [[ -n "$EXISTING_ID" ]] || continue
+              echo "Deleting existing draft release id=${EXISTING_ID} for tag ${TAG}"
+              gh api -X DELETE "repos/${{ github.repository }}/releases/${EXISTING_ID}" || true
+            done
           fi
 
           # Build release body
