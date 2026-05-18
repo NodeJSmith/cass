@@ -26295,7 +26295,13 @@ mod tests {
             snapshot.tantivy_writer_threads,
             snapshot.available_parallelism.min(2)
         );
-        assert_eq!(snapshot.steady_batch_fetch_conversations, 1024);
+        assert_eq!(
+            snapshot.steady_batch_fetch_conversations,
+            lexical_rebuild_default_batch_fetch_conversation_limit(
+                LEXICAL_REBUILD_PAGE_SIZE,
+                snapshot.tantivy_writer_threads
+            )
+        );
         assert_eq!(snapshot.page_prep_workers, 6);
         assert_eq!(snapshot.staged_merge_workers, 3);
     }

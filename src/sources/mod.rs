@@ -92,7 +92,12 @@ pub(crate) const HOST_KEY_VERIFICATION_FAILED: &str = "Host key verification fai
 /// The returned vector contains full `ssh` argument tokens:
 /// `-o BatchMode=yes -o ConnectTimeout=<secs> -o StrictHostKeyChecking=yes`.
 pub(crate) fn strict_ssh_cli_tokens(connect_timeout_secs: u64) -> Vec<String> {
-    vec![
+    let mut tokens = Vec::new();
+    if let Some(config_path) = ssh_config_override() {
+        tokens.push("-F".to_string());
+        tokens.push(config_path);
+    }
+    tokens.extend([
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
@@ -103,14 +108,36 @@ pub(crate) fn strict_ssh_cli_tokens(connect_timeout_secs: u64) -> Vec<String> {
         "ServerAliveCountMax=3".to_string(),
         "-o".to_string(),
         "StrictHostKeyChecking=yes".to_string(),
-    ]
+    ]);
+    tokens
 }
 
 /// Build strict SSH command string for tools that require a single shell fragment.
 pub(crate) fn strict_ssh_command_for_rsync(connect_timeout_secs: u64) -> String {
+    let config_arg = ssh_config_override()
+        .map(|path| format!(" -F {}", shell_quote_ssh_arg(&path)))
+        .unwrap_or_default();
     format!(
-        "ssh -o BatchMode=yes -o ConnectTimeout={connect_timeout_secs} -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes"
+        "ssh{config_arg} -o BatchMode=yes -o ConnectTimeout={connect_timeout_secs} -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes"
     )
+}
+
+fn ssh_config_override() -> Option<String> {
+    dotenvy::var("CASS_SSH_CONFIG")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn shell_quote_ssh_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ':' | '@'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn drain_child_pipe<R>(mut pipe: R) -> Receiver<std::io::Result<Vec<u8>>>
@@ -237,3 +264,75 @@ pub use interactive::{
 
 // Re-export commonly used setup types
 pub use setup::{SetupError, SetupOptions, SetupResult, SetupState, run_setup};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = dotenvy::var(key).ok();
+            // SAFETY: test helper toggles a process-local env var for isolation.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                // SAFETY: test helper restores prior process env for isolation.
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                // SAFETY: test helper restores prior process env for isolation.
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn strict_ssh_cli_tokens_include_config_override() {
+        let _guard = EnvGuard::set("CASS_SSH_CONFIG", "/tmp/cass ssh/config");
+
+        let tokens = strict_ssh_cli_tokens(5);
+
+        assert_eq!(tokens[0], "-F");
+        assert_eq!(tokens[1], "/tmp/cass ssh/config");
+        assert!(tokens.contains(&"StrictHostKeyChecking=yes".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn strict_ssh_command_for_rsync_quotes_config_override() {
+        let _guard = EnvGuard::set("CASS_SSH_CONFIG", "/tmp/cass'ssh/config");
+
+        let command = strict_ssh_command_for_rsync(5);
+
+        assert!(command.starts_with("ssh -F '/tmp/cass'\\''ssh/config' "));
+        assert!(command.contains("StrictHostKeyChecking=yes"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn strict_ssh_helpers_ignore_empty_config_override() {
+        let _guard = EnvGuard::set("CASS_SSH_CONFIG", "   ");
+
+        let tokens = strict_ssh_cli_tokens(5);
+        let command = strict_ssh_command_for_rsync(5);
+
+        assert!(!tokens.contains(&"-F".to_string()));
+        assert!(!command.contains(" -F "));
+    }
+}

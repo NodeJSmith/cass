@@ -208,6 +208,35 @@ EOF
     let _guard_home = EnvGuard::set("HOME", home_dir.to_string_lossy());
     let _guard_config = EnvGuard::set("XDG_CONFIG_HOME", config_dir.to_string_lossy());
     let _guard_data = EnvGuard::set("CASS_DATA_DIR", data_dir.to_string_lossy());
+    let _guard_ssh_config = EnvGuard::set("CASS_SSH_CONFIG", ssh_config_path.to_string_lossy());
+
+    let ssh_probe = std::process::Command::new("ssh")
+        .args([
+            "-F",
+            ssh_config_path.to_str().unwrap(),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "--",
+            "root@cass-test",
+            "echo",
+            "ok",
+        ])
+        .env("HOME", &home_dir)
+        .output()
+        .expect("ssh alias probe");
+    assert!(
+        ssh_probe.status.success(),
+        "test ssh alias should connect before cass sources add: {}",
+        String::from_utf8_lossy(&ssh_probe.stderr)
+    );
 
     // 1) Sync with no sources configured should return a friendly JSON status.
     let no_sources = cargo_bin_cmd!("cass")
@@ -236,6 +265,7 @@ EOF
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_SSH_CONFIG", &ssh_config_path)
         .output()
         .expect("sources add");
     assert!(
@@ -280,6 +310,7 @@ EOF
         .env("HOME", &home_dir)
         .env("XDG_CONFIG_HOME", &config_dir)
         .env("CASS_DATA_DIR", &data_dir)
+        .env("CASS_SSH_CONFIG", &ssh_config_path)
         .output()
         .expect("sources sync");
     assert!(
