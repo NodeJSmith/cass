@@ -67,7 +67,7 @@ use crate::sources::provenance::{LOCAL_SOURCE_ID, Origin, Source, SourceKind};
 use crate::sources::sync::path_to_safe_dirname;
 use crate::storage::sqlite::{
     DailyStatsRebuildResult, FrankenStorage, FtsConsistencyRepair, HistoricalSalvageOutcome,
-    MigrationError, StatsAggregator, StatsDelta, seed_canonical_from_best_historical_bundle,
+    StatsAggregator, StatsDelta, seed_canonical_from_best_historical_bundle,
 };
 use semantic::{
     EmbeddingInput, SemanticIndexer, packet_embedding_inputs_from_storage,
@@ -9996,6 +9996,7 @@ pub fn run_index(
     }
 
     let index_path = index_dir(&opts.data_dir)?;
+    ensure_index_storage_headroom(&opts.data_dir, &opts.db_path)?;
     if should_try_readonly_nonresumable_lexical_resume(&opts) {
         match nonresumable_pending_lexical_rebuild_status_from_readonly_db(
             &index_path,
@@ -10049,12 +10050,9 @@ pub fn run_index(
         }
     }
 
-    let (storage, canonical_storage_rebuilt, opened_fresh_for_full) =
+    let (mut storage, canonical_storage_rebuilt, opened_fresh_for_full) =
         open_storage_for_index(&opts.db_path, opts.full)?;
     let defer_checkpoints = !opts.watch;
-    let mut storage = storage;
-    let mut canonical_storage_rebuilt = canonical_storage_rebuilt;
-    let mut opened_fresh_for_full = opened_fresh_for_full;
     let mut reopened_after_writable_preflight = false;
 
     // CASS #162 item 2: Verify the connection is writable early, before the
@@ -10096,16 +10094,16 @@ pub fn run_index(
         && !opened_fresh_for_full
         && let Some(reason) = full_rebuild_existing_storage_integrity_problem(&storage)?
     {
-        tracing::warn!(
+        tracing::error!(
             db_path = %opts.db_path.display(),
             reason = %reason,
-            "full rebuild detected an unhealthy current-schema canonical db; backing it up and starting from a fresh archive"
+            "full rebuild detected an unhealthy current-schema canonical db; refusing to replace the canonical archive"
         );
-        storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
-        canonical_storage_rebuilt = true;
-        opened_fresh_for_full = true;
-        persist::apply_index_writer_busy_timeout(&storage);
-        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+        storage.close_best_effort_in_place();
+        return Err(canonical_archive_unhealthy_for_index_error(
+            &opts.db_path,
+            &reason,
+        ));
     }
 
     if can_skip_unchanged_explicit_watch_once_index_run(&opts, &storage, &index_path)? {
@@ -10132,27 +10130,22 @@ pub fn run_index(
 
     // cass#202 self-heal: a Connection dropped mid-transaction (the
     // `drop_close` warning) can leave child rows persisted without a matching
-    // parent — specifically `messages` referencing a `conversation_id` that
-    // does not exist, and the `message_metrics`/`token_usage` cascades that
-    // follow. With FK enforcement on, every subsequent indexer pass would then
-    // trip `FOREIGN KEY constraint failed` on the next write and the pending
-    // backlog grows without bound. Sweep before the indexer touches the DB so
-    // one bad commit cannot poison every future run. Skipped on full rebuilds
-    // because the canonical DB will be replaced anyway. The function logs its
-    // own WARN on a successful cleanup; the caller only needs to surface the
-    // failure mode so the index run continues rather than aborting.
-    if !opts.full
-        && let Err(err) = storage.cleanup_orphan_fk_rows()
-    {
+    // parent. Sweep before the indexer touches the DB so one bad commit cannot
+    // poison every future run. A failed sweep is now fatal for this run:
+    // continuing after OOM/corruption can reuse a poisoned connection and make
+    // the canonical archive worse.
+    if let Err(err) = storage.cleanup_orphan_fk_rows() {
         tracing::warn!(
             target: "cass::fk_repair",
             db_path = %opts.db_path.display(),
             error = %err,
-            "cass#202: orphan FK self-heal failed; continuing index run (cleanup will retry next pass)"
+            "cass#202: orphan FK self-heal failed; aborting index run before further writes"
         );
+        storage.close_best_effort_in_place();
+        return Err(orphan_fk_cleanup_failed_index_error(&opts.db_path, &err));
     }
 
-    let mut initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+    let initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
     if opts.full
         && !opened_fresh_for_full
         && full_rebuild_requires_historical_restart(
@@ -10161,17 +10154,16 @@ pub fn run_index(
             initial_canonical_sessions_before_salvage,
         )?
     {
-        tracing::info!(
+        tracing::error!(
             db_path = %opts.db_path.display(),
             conversations = initial_canonical_sessions_before_salvage,
-            "full rebuild detected incomplete historical salvage state; restarting from a fresh canonical database"
+            "full rebuild detected incomplete historical salvage state; refusing to replace the canonical archive"
         );
-        storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
-        canonical_storage_rebuilt = true;
-        opened_fresh_for_full = true;
-        persist::apply_index_writer_busy_timeout(&storage);
-        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
-        initial_canonical_sessions_before_salvage = count_total_conversations_exact(&storage)?;
+        storage.close_best_effort_in_place();
+        return Err(canonical_archive_unhealthy_for_index_error(
+            &opts.db_path,
+            "historical salvage restart would require replacing canonical SQLite",
+        ));
     }
     // canonical_only_full_rebuild: when --force-rebuild is set and we already
     // have canonical sessions in the DB, skip the expensive filesystem rescan
@@ -10456,16 +10448,12 @@ pub fn run_index(
         let mut t_index: Option<TantivyIndex> = None;
 
         if opts.full && !opened_fresh_for_full && initial_canonical_sessions_before_salvage == 0 {
-            storage = reopen_fresh_storage_for_full_rebuild(storage, &opts.db_path)?;
-            persist::apply_index_writer_busy_timeout(&storage);
-            persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
-            // NOTE: We deliberately do NOT call delete_all() here. The Tantivy
-            // index will be atomically replaced by rebuild_tantivy_from_db() at
-            // the end of a successful --full rebuild.  Eagerly deleting is both
-            // redundant (rebuild_tantivy_from_db removes + recreates the dir)
-            // and dangerous: if the scan or rebuild OOMs / hits a constraint
-            // error, the user is left with a 0-segment empty index and no
-            // automatic recovery path.  (CASS #164)
+            // NOTE: We deliberately do NOT reset either SQLite or Tantivy here.
+            // An empty canonical archive can be populated in place, and the
+            // Tantivy index will be atomically replaced by rebuild_tantivy_from_db()
+            // at the end of a successful --full rebuild. Eagerly deleting or
+            // replacing anything is both redundant and dangerous if the scan or
+            // rebuild OOMs / hits a constraint error. (CASS #164)
         } else if opts.full {
             // Same rationale — skip eager delete_all(); rebuild_tantivy_from_db()
             // handles starting fresh after the scan succeeds.  (CASS #164)
@@ -11754,14 +11742,42 @@ fn incremental_semantic_embed(
     )
 }
 
-/// Open frankensqlite storage for indexing with forward-compatibility recovery.
+/// Open frankensqlite storage for indexing without replacing canonical data.
 ///
-/// Returns `(storage, rebuilt)` where `rebuilt=true` means we detected an
-/// incompatible/future schema, backed up + recreated the DB, and reopened it.
+/// Returns `(storage, rebuilt, opened_fresh_for_full)`. `rebuilt` and
+/// `opened_fresh_for_full` are retained for progress metadata compatibility;
+/// this path now fails closed on existing unreadable/incompatible archives
+/// instead of backing them up and creating an empty replacement.
 fn open_storage_for_index(
     db_path: &Path,
-    allow_full_recovery: bool,
+    full_index: bool,
 ) -> Result<(FrankenStorage, bool, bool)> {
+    if db_path.exists() {
+        match non_destructive_meta_schema_version(db_path) {
+            Ok(Some(version)) if version > crate::storage::sqlite::CURRENT_SCHEMA_VERSION => {
+                return Err(canonical_archive_unhealthy_for_index_error(
+                    db_path,
+                    &format!(
+                        "schema_version {version} is newer than supported version {}",
+                        crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
+                return Err(anyhow::anyhow!(
+                    "canonical db is busy/locked during index open; refusing to replace it: {err:#}"
+                ));
+            }
+            Err(err) => {
+                return Err(canonical_archive_unhealthy_for_index_error(
+                    db_path,
+                    &format!("{err:#}"),
+                ));
+            }
+        }
+    }
+
     if db_path.exists() {
         match crate::storage::sqlite::open_current_schema_storage_with_timeout(
             db_path,
@@ -11772,92 +11788,74 @@ fn open_storage_for_index(
             Err(err) => tracing::warn!(
                 db_path = %db_path.display(),
                 error = ?err,
-                "single-open current-schema storage path failed; falling back to compatibility recovery"
+                "single-open current-schema storage path failed; attempting non-destructive compatibility open"
             ),
         }
     }
 
-    match FrankenStorage::open_or_rebuild(db_path) {
-        Ok(storage) => Ok((storage, false, false)),
-        Err(MigrationError::RebuildRequired {
-            reason,
-            backup_path,
-        }) => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                reason = %reason,
-                backup_path = ?backup_path.as_ref().map(|p| p.display().to_string()),
-                "storage schema incompatible; rebuilt database before indexing"
-            );
-            // `open_or_rebuild` has already backed up and `remove_database_files`'d
-            // the incompatible DB before returning `RebuildRequired`, so the path
-            // no longer exists. Use `FrankenStorage::open` (which creates +
-            // migrates a fresh DB) rather than `open_franken_storage_with_timeout`
-            // (which bails on missing-file).
-            let storage = FrankenStorage::open(db_path).with_context(|| {
-                format!(
-                    "opening fresh frankensqlite db after schema rebuild at {}",
-                    db_path.display()
-                )
-            })?;
-            Ok((storage, true, true))
-        }
-        Err(err) if allow_full_recovery && migration_error_is_retryable_open_contention(&err) => {
-            Err(anyhow::anyhow!(
-                "canonical db is busy/locked during full rebuild open; refusing to replace it: {err}"
-            ))
-        }
-        Err(err) if allow_full_recovery => {
-            tracing::warn!(
-                db_path = %db_path.display(),
-                error = %err,
-                "full rebuild storage open failed; backing up and reopening with a fresh canonical db"
-            );
-            let backup_path =
-                crate::storage::sqlite::create_backup(db_path).map_err(|backup_err| {
-                    anyhow::anyhow!(
-                        "backing up busy/corrupt canonical db before full rebuild: {backup_err}"
-                    )
-                })?;
-            if db_path.exists() {
-                crate::storage::sqlite::remove_database_files(db_path).with_context(|| {
-                    format!(
-                        "removing busy/corrupt canonical db bundle before full rebuild: {}",
-                        db_path.display()
-                    )
-                })?;
+    if db_path.exists() {
+        match FrankenStorage::open(db_path) {
+            Ok(storage) => Ok((storage, false, false)),
+            Err(err) if anyhow_chain_indicates_retryable_storage_contention(&err) => {
+                Err(anyhow::anyhow!(
+                    "canonical db is busy/locked during index open; refusing to replace it: {err}"
+                ))
             }
-            if let Some(path) = backup_path {
-                tracing::info!(
-                    db_path = %db_path.display(),
-                    backup_path = %path.display(),
-                    "backed up canonical db after full-rebuild open failure"
-                );
-            }
-            // Same rationale as the `RebuildRequired` branch: we just removed
-            // the DB, so we need `FrankenStorage::open` to create+migrate it.
-            let storage = FrankenStorage::open(db_path).with_context(|| {
-                format!(
-                    "opening fresh frankensqlite db after full-rebuild recovery at {}",
-                    db_path.display()
-                )
-            })?;
-            Ok((storage, true, true))
+            Err(err) => Err(canonical_archive_unhealthy_for_index_error(
+                db_path,
+                &format!("{err:#}"),
+            )),
         }
-        Err(err) => Err(anyhow::anyhow!(
-            "failed to open frankensqlite storage: {err:#}"
-        )),
+    } else {
+        FrankenStorage::open(db_path)
+            .map(|storage| (storage, false, full_index))
+            .with_context(|| format!("creating frankensqlite storage at {}", db_path.display()))
     }
 }
 
-fn migration_error_is_retryable_open_contention(err: &MigrationError) -> bool {
-    match err {
-        MigrationError::Database(err) => crate::storage::sqlite::retryable_franken_error(err),
-        MigrationError::Other(message) => {
-            crate::storage::sqlite::retryable_storage_error_message(message)
-        }
-        MigrationError::RebuildRequired { .. } | MigrationError::Io(_) => false,
+fn non_destructive_meta_schema_version(db_path: &Path) -> Result<Option<i64>> {
+    let mut conn = crate::storage::sqlite::open_franken_raw_readonly_connection_with_timeout(
+        db_path,
+        Duration::from_secs(10),
+    )
+    .with_context(|| {
+        format!(
+            "opening canonical archive read-only before index: {}",
+            db_path.display()
+        )
+    })?;
+
+    let result = match conn.query("SELECT value FROM meta WHERE key = 'schema_version';") {
+        Ok(rows) => Ok(rows
+            .first()
+            .and_then(|row| row.get_typed::<String>(0).ok())
+            .and_then(|raw| raw.parse::<i64>().ok())),
+        Err(err) if storage_error_mentions_missing_table_or_column(&err) => Ok(None),
+        Err(err) => Err(anyhow::anyhow!(
+            "reading canonical archive schema_version before index: {err}"
+        )),
+    };
+
+    if let Err(close_err) = conn.close_without_checkpoint_in_place() {
+        tracing::debug!(
+            error = %close_err,
+            db_path = %db_path.display(),
+            "non_destructive_meta_schema_version: close_without_checkpoint_in_place failed"
+        );
+        conn.close_best_effort_in_place();
     }
+
+    result
+}
+
+fn storage_error_mentions_missing_table_or_column(err: &impl std::fmt::Display) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("no such table") || message.contains("no such column")
+}
+
+fn anyhow_chain_indicates_retryable_storage_contention(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| crate::storage::sqlite::retryable_storage_error_message(&cause.to_string()))
 }
 
 fn full_rebuild_existing_storage_integrity_problem(
@@ -11907,6 +11905,152 @@ fn full_rebuild_existing_storage_integrity_problem(
     Ok(None)
 }
 
+fn canonical_archive_unhealthy_for_index_error(db_path: &Path, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "canonical cass archive at {} is not safe for indexing: {reason}. \
+         cass index will not replace or truncate the SQLite source of truth. \
+         Run 'cass doctor check --json' to inspect the archive, then use the \
+         doctor repair plan or recover from an explicit backup before indexing again.",
+        db_path.display()
+    )
+}
+
+fn orphan_fk_cleanup_failed_index_error(db_path: &Path, err: &anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "orphan FK self-heal failed for canonical cass archive at {}: {err:#}. \
+         cass stopped before counting or writing because the archive connection may be OOM-poisoned or corrupt. \
+         Run 'cass doctor check --json' and free disk/memory pressure before retrying.",
+        db_path.display()
+    )
+}
+
+const INDEX_MIN_FREE_SPACE_BYTES: u64 = 512 * 1024 * 1024;
+
+fn ensure_index_storage_headroom(data_dir: &Path, db_path: &Path) -> Result<()> {
+    if index_disk_headroom_check_disabled() {
+        return Ok(());
+    }
+
+    let required = required_index_headroom_bytes(db_path);
+    for probe_path in existing_headroom_probe_paths(data_dir, db_path) {
+        let available = fs2::available_space(&probe_path).with_context(|| {
+            format!(
+                "checking free disk space for cass index at {}",
+                probe_path.display()
+            )
+        })?;
+        if available >= required {
+            continue;
+        }
+
+        return Err(anyhow::anyhow!(
+            "canonical archive disk headroom check failed for {}: available={} bytes, required={} bytes. \
+             Free space before running cass index so SQLite, WAL, and lexical scratch writes cannot fail mid-commit. \
+             Run 'cass doctor check --json' for a read-only health report.",
+            probe_path.display(),
+            available,
+            required
+        ));
+    }
+
+    Ok(())
+}
+
+fn index_disk_headroom_check_disabled() -> bool {
+    dotenvy::var("CASS_INDEX_SKIP_DISK_HEADROOM_CHECK")
+        .map(|value| env_value_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn env_value_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn existing_headroom_probe_paths(data_dir: &Path, db_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(2);
+    for candidate in [data_dir, db_path.parent().unwrap_or(db_path)] {
+        if let Some(existing) = nearest_existing_path(candidate) {
+            push_unique_headroom_probe_path(&mut paths, existing);
+        }
+    }
+    if paths.is_empty() {
+        paths.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    }
+    paths
+}
+
+fn push_unique_headroom_probe_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if paths
+        .iter()
+        .any(|existing| same_headroom_probe_path(existing, &candidate))
+    {
+        return;
+    }
+    paths.push(candidate);
+}
+
+fn same_headroom_probe_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            let current = Path::new(".");
+            if current.exists() {
+                return Some(current.to_path_buf());
+            }
+            continue;
+        }
+        if ancestor.exists() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn required_index_headroom_bytes(db_path: &Path) -> u64 {
+    let db_bundle_bytes = database_bundle_size_bytes(db_path);
+    INDEX_MIN_FREE_SPACE_BYTES.max(db_bundle_bytes.saturating_mul(2))
+}
+
+fn database_bundle_size_bytes(db_path: &Path) -> u64 {
+    let mut total = file_size_bytes(db_path);
+    for sidecar in database_sidecar_paths(db_path) {
+        total = total.saturating_add(file_size_bytes(&sidecar));
+    }
+    total
+}
+
+fn database_sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
+    [
+        database_path_with_suffix(db_path, "-wal"),
+        database_path_with_suffix(db_path, "-shm"),
+    ]
+}
+
+fn database_path_with_suffix(db_path: &Path, suffix: &str) -> PathBuf {
+    let Some(file_name) = db_path.file_name() else {
+        return PathBuf::from(format!("{}{}", db_path.display(), suffix));
+    };
+    let mut sidecar_name = file_name.to_os_string();
+    sidecar_name.push(suffix);
+    db_path.with_file_name(sidecar_name)
+}
+
+fn file_size_bytes(path: &Path) -> u64 {
+    fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
 #[cfg(test)]
 fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     let mut storage = FrankenStorage::open_readonly(db_path)
@@ -11930,44 +12074,6 @@ fn current_schema_fast_probe(db_path: &Path) -> Result<bool> {
     }
 
     Ok(version == Some(crate::storage::sqlite::CURRENT_SCHEMA_VERSION))
-}
-
-fn reopen_fresh_storage_for_full_rebuild(
-    storage: FrankenStorage,
-    db_path: &Path,
-) -> Result<FrankenStorage> {
-    storage.close().with_context(|| {
-        format!(
-            "closing canonical db before replacing it for full rebuild: {}",
-            db_path.display()
-        )
-    })?;
-
-    let backup_path = crate::storage::sqlite::create_backup(db_path)
-        .map_err(|err| anyhow::anyhow!("backing up canonical db before full rebuild: {err}"))?;
-    if db_path.exists() {
-        crate::storage::sqlite::remove_database_files(db_path).with_context(|| {
-            format!(
-                "removing existing canonical db bundle before full rebuild: {}",
-                db_path.display()
-            )
-        })?;
-    }
-
-    if let Some(path) = backup_path {
-        tracing::info!(
-            db_path = %db_path.display(),
-            backup_path = %path.display(),
-            "replaced canonical db with a fresh empty database for full rebuild"
-        );
-    }
-
-    FrankenStorage::open(db_path).with_context(|| {
-        format!(
-            "opening fresh canonical db for full rebuild: {}",
-            db_path.display()
-        )
-    })
 }
 
 fn quarantine_failed_seed_bundle(db_path: &Path) -> Result<Option<PathBuf>> {
@@ -30027,7 +30133,7 @@ mod tests {
     }
 
     #[test]
-    fn open_storage_for_index_recovers_from_newer_schema() {
+    fn open_storage_for_index_refuses_newer_schema_without_replacing_db() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("future-schema.db");
 
@@ -30045,16 +30151,18 @@ mod tests {
                 .unwrap();
         }
 
-        let (storage, rebuilt, opened_fresh_for_full) =
-            open_storage_for_index(&db_path, false).unwrap();
-        assert!(rebuilt, "newer schema should trigger rebuild recovery");
-        assert!(opened_fresh_for_full);
-        assert_eq!(
-            storage.schema_version().unwrap(),
-            crate::storage::sqlite::CURRENT_SCHEMA_VERSION
+        let err = match open_storage_for_index(&db_path, false) {
+            Ok(_) => panic!("newer schema must fail closed before indexing"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("newer than supported"),
+            "diagnostic should name the schema mismatch: {err}"
         );
+        assert!(db_path.exists(), "canonical DB must remain in place");
 
-        // Rebuild path should preserve an on-disk backup.
+        // The index open path must not create backup-and-replace artifacts; a
+        // real repair plan belongs to doctor or an explicit operator restore.
         let backup_count = std::fs::read_dir(tmp.path())
             .unwrap()
             .flatten()
@@ -30067,56 +30175,79 @@ mod tests {
             })
             .count();
         assert!(
-            backup_count >= 1,
-            "expected backup artifact for rebuilt schema"
+            backup_count == 0,
+            "index open must not backup-and-replace a future-schema archive"
         );
     }
 
     #[test]
-    fn full_rebuild_open_failure_gate_refuses_retryable_contention() {
-        let retryable_errors = [
-            MigrationError::Database(frankensqlite::FrankenError::Busy),
-            MigrationError::Database(frankensqlite::FrankenError::BusyRecovery),
-            MigrationError::Database(frankensqlite::FrankenError::BusySnapshot {
-                conflicting_pages: "1,2".to_string(),
-            }),
-            MigrationError::Database(frankensqlite::FrankenError::DatabaseLocked {
-                path: PathBuf::from("/tmp/cass-busy.db"),
-            }),
-            MigrationError::Database(frankensqlite::FrankenError::WriteConflict {
-                page: 4,
-                holder: 7,
-            }),
-            MigrationError::Other("database is locked by another indexer".to_string()),
-            MigrationError::Other("temporarily unavailable while writer holds lock".to_string()),
-        ];
-
-        for err in retryable_errors {
-            assert!(
-                migration_error_is_retryable_open_contention(&err),
-                "retryable open failure must not allow canonical DB replacement: {err}"
-            );
-        }
+    fn open_storage_retryable_classifier_reads_anyhow_error_chain() {
+        let err = anyhow::anyhow!("database is locked by another indexer")
+            .context("opening canonical archive read-only before index");
+        assert!(
+            anyhow_chain_indicates_retryable_storage_contention(&err),
+            "retryable storage contention can be hidden below contextual anyhow wrappers: {err:#}"
+        );
     }
 
     #[test]
-    fn full_rebuild_open_failure_gate_allows_non_retryable_recovery_errors() {
-        let non_retryable_errors = [
-            MigrationError::Database(frankensqlite::FrankenError::DatabaseCorrupt {
-                detail: "bad page checksum".to_string(),
-            }),
-            MigrationError::Other("schema migration failed permanently".to_string()),
-            MigrationError::RebuildRequired {
-                reason: "future schema".to_string(),
-                backup_path: None,
-            },
-            MigrationError::Io(std::io::Error::other("permission denied")),
-        ];
+    fn open_storage_retryable_classifier_rejects_corruption() {
+        let err = anyhow::anyhow!("database disk image is malformed")
+            .context("opening canonical archive read-only before index");
+        assert!(
+            !anyhow_chain_indicates_retryable_storage_contention(&err),
+            "corruption must stay on the fail-closed archive-health path: {err:#}"
+        );
+    }
 
-        for err in non_retryable_errors {
+    #[test]
+    fn headroom_probe_uses_existing_ancestor_for_missing_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let missing_data_dir = tmp.path().join("missing").join("cass-data");
+        let missing_db_path = missing_data_dir.join("agent_search.db");
+
+        assert_eq!(
+            existing_headroom_probe_paths(&missing_data_dir, &missing_db_path),
+            vec![tmp.path().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn headroom_probe_checks_data_dir_and_custom_db_parent_when_distinct() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("cass-data");
+        let db_parent = tmp.path().join("custom-db");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&db_parent).unwrap();
+
+        assert_eq!(
+            existing_headroom_probe_paths(&data_dir, &db_parent.join("agent_search.db")),
+            vec![data_dir, db_parent]
+        );
+    }
+
+    #[test]
+    fn database_sidecar_paths_preserve_filename_bytes_without_display_roundtrip() {
+        let db_path = PathBuf::from("/tmp/cass.db");
+        let [wal, shm] = database_sidecar_paths(&db_path);
+
+        assert_eq!(wal, PathBuf::from("/tmp/cass.db-wal"));
+        assert_eq!(shm, PathBuf::from("/tmp/cass.db-shm"));
+    }
+
+    #[test]
+    fn disk_headroom_skip_env_value_parser_is_truthy_not_presence_based() {
+        for truthy in ["1", "true", "YES", "on"] {
             assert!(
-                !migration_error_is_retryable_open_contention(&err),
-                "non-retryable recovery failure should keep existing recovery semantics: {err}"
+                env_value_truthy(truthy),
+                "expected {truthy:?} to disable the headroom check"
+            );
+        }
+
+        for falsy in ["0", "false", "No", "off", "", "maybe"] {
+            assert!(
+                !env_value_truthy(falsy),
+                "expected {falsy:?} to keep the headroom check enabled"
             );
         }
     }
@@ -31161,64 +31292,25 @@ mod tests {
     }
 
     #[test]
-    fn reopen_fresh_storage_for_full_rebuild_preserves_backup_and_starts_empty() {
+    fn open_storage_for_index_refuses_corrupt_archive_without_replacing_db() {
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("db.sqlite");
-        let storage = FrankenStorage::open(&db_path).unwrap();
-        ensure_fts_schema(&storage);
+        let original = b"not a sqlite database";
+        std::fs::write(&db_path, original).unwrap();
 
-        let agent = crate::model::types::Agent {
-            id: None,
-            slug: "tester".into(),
-            name: "Tester".into(),
-            version: None,
-            kind: crate::model::types::AgentKind::Cli,
+        let err = match open_storage_for_index(&db_path, true) {
+            Ok(_) => panic!("corrupt existing archive must fail closed"),
+            Err(err) => err.to_string(),
         };
-        let agent_id = storage.ensure_agent(&agent).unwrap();
-        let conv = norm_conv(Some("c1"), vec![norm_msg(0, 10)]);
-        storage
-            .insert_conversation_tree(
-                agent_id,
-                None,
-                &crate::model::types::Conversation {
-                    id: None,
-                    agent_slug: conv.agent_slug.clone(),
-                    workspace: conv.workspace.clone(),
-                    external_id: conv.external_id.clone(),
-                    title: conv.title.clone(),
-                    source_path: conv.source_path.clone(),
-                    started_at: conv.started_at,
-                    ended_at: conv.ended_at,
-                    approx_tokens: None,
-                    metadata_json: conv.metadata.clone(),
-                    messages: conv
-                        .messages
-                        .iter()
-                        .map(|m| crate::model::types::Message {
-                            id: None,
-                            idx: m.idx,
-                            role: crate::model::types::MessageRole::User,
-                            author: m.author.clone(),
-                            created_at: m.created_at,
-                            content: m.content.clone(),
-                            extra_json: m.extra.clone(),
-                            snippets: Vec::new(),
-                        })
-                        .collect(),
-                    source_id: "local".to_string(),
-                    origin_host: None,
-                },
-            )
-            .unwrap();
-
-        let reopened = reopen_fresh_storage_for_full_rebuild(storage, &db_path).unwrap();
-        let msg_count: i64 = reopened
-            .raw()
-            .query_row_map("SELECT COUNT(*) FROM messages", &[] as &[ParamValue], |r| {
-                r.get_typed(0)
-            })
-            .unwrap();
-        assert_eq!(msg_count, 0);
+        assert!(
+            err.contains("will not replace or truncate"),
+            "diagnostic should explain archive preservation: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            original,
+            "corrupt archive bytes must be preserved for recovery"
+        );
 
         let backup_count = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -31232,8 +31324,8 @@ mod tests {
             })
             .count();
         assert!(
-            backup_count >= 1,
-            "expected preserved backup before opening a fresh full-rebuild db"
+            backup_count == 0,
+            "index open must not create backup artifacts for corrupt archive"
         );
     }
 

@@ -4029,14 +4029,14 @@ impl FrankenStorage {
             report.record("messages", orphan_message_ids.len() as i64);
         }
 
-        let mut direct_orphan_batches: SmallVec<[(&'static OrphanFkTable, Vec<i64>); 8]> =
-            SmallVec::new();
+        if !orphan_message_ids.is_empty() {
+            delete_orphan_message_ids_bisecting_oom(&self.conn, &orphan_message_ids)
+                .context("deleting orphan message rows and dependent children")?;
+        }
+
         for entry in ORPHAN_DIRECT_CHILD_TABLES {
-            let ids: Vec<i64> =
-                match self
-                    .conn
-                    .query_map_collect(entry.orphan_id_sql, fparams![], |row| row.get_typed(0))
-                {
+            loop {
+                let ids = match collect_direct_orphan_id_page(&self.conn, entry) {
                     Ok(ids) => ids,
                     Err(err)
                         if error_indicates_missing_table(&err)
@@ -4051,7 +4051,7 @@ impl FrankenStorage {
                             error = %err,
                             "skipping orphan probe (table or column unavailable)"
                         );
-                        continue;
+                        break;
                     }
                     Err(err) => {
                         return Err(err).with_context(|| {
@@ -4059,23 +4059,24 @@ impl FrankenStorage {
                         });
                     }
                 };
-            if !ids.is_empty() {
-                report.record(entry.child_table, ids.len() as i64);
-                direct_orphan_batches.push((entry, ids));
+                if ids.is_empty() {
+                    break;
+                }
+
+                let deleted = delete_direct_orphan_ids_bisecting_oom(&self.conn, entry, &ids)
+                    .with_context(|| format!("deleting orphan rows from {}", entry.child_table))?;
+                if deleted == 0 {
+                    break;
+                }
+                report.record(
+                    entry.child_table,
+                    i64::try_from(deleted).unwrap_or(i64::MAX),
+                );
             }
         }
 
-        if orphan_message_ids.is_empty() && direct_orphan_batches.is_empty() {
+        if report.total == 0 {
             return Ok(report);
-        }
-
-        if !orphan_message_ids.is_empty() {
-            delete_orphan_message_ids_bisecting_oom(&self.conn, &orphan_message_ids)
-                .context("deleting orphan message rows and dependent children")?;
-        }
-        for (entry, ids) in &direct_orphan_batches {
-            delete_direct_orphan_ids_bisecting_oom(&self.conn, entry, ids)
-                .with_context(|| format!("deleting orphan rows from {}", entry.child_table))?;
         }
 
         // WARN only fires after a successful commit so the message accurately
@@ -5445,6 +5446,17 @@ fn delete_orphan_message_id_chunk_once(conn: &FrankenConnection, ids: &[i64]) ->
     Ok(deleted)
 }
 
+fn collect_direct_orphan_id_page(
+    conn: &FrankenConnection,
+    entry: &'static OrphanFkTable,
+) -> Result<Vec<i64>> {
+    Ok(conn.query_map_collect(
+        entry.orphan_id_page_sql,
+        fparams![i64::try_from(ORPHAN_FK_ID_CHUNK_SIZE).unwrap_or(i64::MAX)],
+        |row| row.get_typed(0),
+    )?)
+}
+
 fn delete_direct_orphan_ids_bisecting_oom(
     conn: &FrankenConnection,
     entry: &'static OrphanFkTable,
@@ -5493,9 +5505,30 @@ fn delete_direct_orphan_id_chunk_once(
     ids: &[i64],
 ) -> Result<usize> {
     let mut tx = conn.transaction()?;
-    let deleted = delete_rows_by_i64_chunks(&tx, entry.delete_sql, ids)?;
+    let deleted = delete_rows_by_i64_chunk_bulk(&tx, entry.delete_many_sql_prefix, ids)?;
     tx.commit()?;
     Ok(deleted)
+}
+
+fn delete_rows_by_i64_chunk_bulk(
+    tx: &FrankenTransaction<'_>,
+    delete_many_sql_prefix: &'static str,
+    ids: &[i64],
+) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let placeholders = (1..=ids.len())
+        .map(|idx| format!("?{idx}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("{delete_many_sql_prefix} ({placeholders})");
+    let params = ids
+        .iter()
+        .map(|id| SqliteValue::from(*id))
+        .collect::<Vec<_>>();
+    Ok(tx.execute_with_params(&sql, &params)?)
 }
 
 /// Tables whose FK parent rows can go missing when an index transaction is
@@ -5505,34 +5538,42 @@ fn delete_direct_orphan_id_chunk_once(
 /// yields the integer FK key used by the matching chunked delete.
 struct OrphanFkTable {
     child_table: &'static str,
-    orphan_id_sql: &'static str,
-    delete_sql: &'static str,
+    orphan_id_page_sql: &'static str,
+    delete_many_sql_prefix: &'static str,
 }
 
 const ORPHAN_DIRECT_CHILD_TABLES: &[OrphanFkTable] = &[
     OrphanFkTable {
         child_table: "message_metrics",
-        orphan_id_sql: "SELECT message_id FROM message_metrics \
-                        WHERE message_id NOT IN (SELECT id FROM messages)",
-        delete_sql: "DELETE FROM message_metrics WHERE message_id = ?1",
+        orphan_id_page_sql: "SELECT message_id FROM message_metrics \
+                             WHERE message_id NOT IN (SELECT id FROM messages) \
+                             ORDER BY message_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM message_metrics WHERE message_id IN",
     },
     OrphanFkTable {
         child_table: "token_usage",
-        orphan_id_sql: "SELECT message_id FROM token_usage \
-                        WHERE message_id NOT IN (SELECT id FROM messages)",
-        delete_sql: "DELETE FROM token_usage WHERE message_id = ?1",
+        orphan_id_page_sql: "SELECT message_id FROM token_usage \
+                             WHERE message_id NOT IN (SELECT id FROM messages) \
+                             ORDER BY message_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM token_usage WHERE message_id IN",
     },
     OrphanFkTable {
         child_table: "snippets",
-        orphan_id_sql: "SELECT message_id FROM snippets \
-                        WHERE message_id NOT IN (SELECT id FROM messages)",
-        delete_sql: "DELETE FROM snippets WHERE message_id = ?1",
+        orphan_id_page_sql: "SELECT message_id FROM snippets \
+                             WHERE message_id NOT IN (SELECT id FROM messages) \
+                             ORDER BY message_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM snippets WHERE message_id IN",
     },
     OrphanFkTable {
         child_table: "conversation_tags",
-        orphan_id_sql: "SELECT conversation_id FROM conversation_tags \
-                        WHERE conversation_id NOT IN (SELECT id FROM conversations)",
-        delete_sql: "DELETE FROM conversation_tags WHERE conversation_id = ?1",
+        orphan_id_page_sql: "SELECT conversation_id FROM conversation_tags \
+                             WHERE conversation_id NOT IN (SELECT id FROM conversations) \
+                             ORDER BY conversation_id \
+                             LIMIT ?1",
+        delete_many_sql_prefix: "DELETE FROM conversation_tags WHERE conversation_id IN",
     },
 ];
 
@@ -5558,15 +5599,14 @@ const ORPHAN_MESSAGE_DEPENDENT_TABLES: &[OrphanMessageDependentTable] = &[
 
 /// Summary of orphan rows detected and removed by `cleanup_orphan_fk_rows`.
 ///
-/// Counts come from the probe phase rather than from the `DELETE`'s
-/// rows-changed return, so they reflect "orphans observed before cleanup
-/// started." Under the function's intended use — a
-/// single indexer-startup pass holding the index run lock — no concurrent
-/// writers exist, so these counts match the primary orphan roots identified
-/// before the delete transaction starts. Dependent rows below an orphan
-/// message (`message_metrics` / `token_usage` / `snippets`) are an expected
-/// consequence of removing that root orphan and are *not* separately counted in
-/// `total` or `per_table`.
+/// Message-root counts come from the probe phase, while direct child counts
+/// come from bounded page deletes. Under the function's intended use — a single
+/// indexer-startup pass holding the index run lock — no concurrent writers
+/// exist, so these counts match the primary orphan roots identified and
+/// removed during cleanup. Dependent rows below an orphan message
+/// (`message_metrics` / `token_usage` / `snippets`) are an expected consequence
+/// of removing that root orphan and are *not* separately counted in `total` or
+/// `per_table`.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OrphanFkCleanupReport {
     pub total: i64,
@@ -5575,7 +5615,15 @@ pub(crate) struct OrphanFkCleanupReport {
 
 impl OrphanFkCleanupReport {
     fn record(&mut self, child_table: &'static str, count: i64) {
-        self.per_table.push((child_table, count));
+        if let Some((_, existing)) = self
+            .per_table
+            .iter_mut()
+            .find(|(table, _)| *table == child_table)
+        {
+            *existing = existing.saturating_add(count);
+        } else {
+            self.per_table.push((child_table, count));
+        }
         self.total = self.total.saturating_add(count);
     }
 }
@@ -25072,20 +25120,18 @@ mod tests {
         let orphan_count = ORPHAN_FK_ID_CHUNK_SIZE + 3;
 
         storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
-        for idx in 0..orphan_count {
-            let message_id = 10_000_i64 + i64::try_from(idx).unwrap();
-            let conversation_id = 20_000_i64 + i64::try_from(idx).unwrap();
-            storage
-                .raw()
-                .execute_compat(
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            for idx in 0..orphan_count {
+                let message_id = 10_000_i64 + i64::try_from(idx).unwrap();
+                let conversation_id = 20_000_i64 + i64::try_from(idx).unwrap();
+                tx.execute_compat(
                     "INSERT INTO messages(id, conversation_id, idx, role, content) \
                      VALUES(?1, ?2, 0, 'user', 'orphan message')",
                     fparams![message_id, conversation_id],
                 )
                 .unwrap();
-            storage
-                .raw()
-                .execute_compat(
+                tx.execute_compat(
                     "INSERT INTO message_metrics(
                          message_id, created_at_ms, hour_id, day_id, agent_slug,
                          role, content_chars, content_tokens_est
@@ -25093,6 +25139,8 @@ mod tests {
                     fparams![message_id],
                 )
                 .unwrap();
+            }
+            tx.commit().unwrap();
         }
         storage.raw().execute("PRAGMA foreign_keys = ON").unwrap();
 
@@ -25112,6 +25160,59 @@ mod tests {
             })
             .unwrap();
         assert_eq!(messages_after, 0);
+        let metrics_after: i64 = storage
+            .raw()
+            .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {
+                row.get_typed(0)
+            })
+            .unwrap();
+        assert_eq!(metrics_after, 0);
+    }
+
+    #[test]
+    fn cleanup_orphan_fk_rows_pages_direct_child_orphans() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("direct_orphan_fk_paged_self_heal.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let orphan_count = (ORPHAN_FK_ID_CHUNK_SIZE * 2) + 5;
+
+        storage.raw().execute("PRAGMA foreign_keys = OFF").unwrap();
+        {
+            let mut tx = storage.raw().transaction().unwrap();
+            for idx in 0..orphan_count {
+                let message_id = 50_000_i64 + i64::try_from(idx).unwrap();
+                tx.execute_compat(
+                    "INSERT INTO message_metrics(
+                         message_id, created_at_ms, hour_id, day_id, agent_slug,
+                         role, content_chars, content_tokens_est
+                     ) VALUES(?1, 0, 0, 0, 'test-agent', 'user', 21, 3)",
+                    fparams![message_id],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        storage.raw().execute("PRAGMA foreign_keys = ON").unwrap();
+
+        let report = storage.cleanup_orphan_fk_rows().unwrap();
+
+        assert_eq!(report.total, i64::try_from(orphan_count).unwrap());
+        let metrics_count = report
+            .per_table
+            .iter()
+            .filter(|(table, _)| *table == "message_metrics")
+            .map(|(_, count)| *count)
+            .sum::<i64>();
+        assert_eq!(metrics_count, i64::try_from(orphan_count).unwrap());
+        assert_eq!(
+            report
+                .per_table
+                .iter()
+                .filter(|(table, _)| *table == "message_metrics")
+                .count(),
+            1,
+            "paged cleanup should aggregate report entries by table: {report:?}"
+        );
         let metrics_after: i64 = storage
             .raw()
             .query_row_map("SELECT COUNT(*) FROM message_metrics", fparams![], |row| {

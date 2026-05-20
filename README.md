@@ -97,7 +97,7 @@ cass sources agents include openclaw
 **Quarantine, GC, and the doctor/diag surface**
 - Corrupt or failed-validation assets are quarantined rather than auto-deleted. `cass diag --json --quarantine` enumerates every quarantined artifact (failed seed bundles, retained publish backups, quarantined lexical generations) with `size_bytes`, `age_seconds`, `safe_to_gc`, and a human-readable `gc_reason`. The `safe_to_gc` flag is **advisory** — it reflects retention policy + cleanup dry-run eligibility and is not wired to any automatic deletion path.
 - `cass doctor --json` surfaces the same quarantine summary plus `checks[]` status for every diagnostic the tool runs. Without `--fix`, doctor is read-only (`auto_fix_applied=false`, `auto_fix_actions=[]`, `issues_fixed=0`); with `--fix` it applies only the repairs whose dry-run plans are proven safe (currently: Track A analytics rebuild, Track B rollup rebuild via `rebuild_token_daily_stats` when the `token_usage` ledger is intact).
-- Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit `cass models backfill` / `cass index --full --force-rebuild` replaces the source data.
+- Lexical generation cleanup uses a dispositions + inspection-required-first policy. Operators running `cass doctor --fix` never have a generation reclaimed silently — every quarantine stays on disk until an explicit derived-asset rebuild (`cass models backfill` or an index refresh recommended by `cass health --json`) supersedes it.
 
 **Schema stability guarantees**
 - The JSON contract surfaces (`triage`, `capabilities`, `health`, `status`, `diag`, `models status`, `models verify`, `models check-update`, `introspect`, `doctor`, `api-version`, `stats`, `sessions`, `search`, `pack`) are pinned by golden-file regression tests under `tests/golden/robot/`. A change to any field name, type, or nullability fails the golden test suite and requires a deliberate regeneration pass (`UPDATE_GOLDENS=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs`).
@@ -936,7 +936,7 @@ Errors are structured, actionable, and include recovery hints. A real sample fro
 | 2 | Usage error | Fix syntax (hint provided) |
 | 3 | Index/DB missing | Run `cass index --full` (retryable: true) |
 | 4 | Network error | Check connectivity |
-| 5 | Data corruption | Run `cass index --full --force-rebuild` |
+| 5 | Data corruption | Run `cass doctor check --json`; repair or restore the canonical SQLite archive before indexing |
 | 6 | Incompatible version | Update cass |
 | 7 | Lock/busy | Retry later |
 | 8 | Partial result | Increase `--timeout` or reduce scope |
@@ -2235,7 +2235,7 @@ This ensures that version upgrades with schema changes can rebuild the lexical d
 | Schema version change | Hash mismatch in `schema_hash.json` | Full rebuild |
 | Missing `meta.json` | Tantivy can't open index | Rebuild and publish a fresh derivative |
 | Corrupted index files | `Index::open_in_dir()` fails | Rebuild and publish a fresh derivative |
-| Explicit request | `--force-rebuild` flag | Clean slate rebuild |
+| Explicit request | `--force-rebuild` flag | Rebuild derived search assets from the canonical SQLite archive |
 
 **SQLite as Ground Truth**:
 The SQLite database serves as the authoritative data store. Lexical rebuilds reconstruct the Tantivy index from SQLite:

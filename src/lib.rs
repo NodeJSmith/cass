@@ -10640,7 +10640,7 @@ fn run_analytics_validate(
                                 "kind": "rebuild_track_b_failed",
                                 "check_ids": decision.check_ids,
                                 "reason": format!(
-                                    "rebuild_token_daily_stats returned error: {e}. The token_usage ledger may itself be corrupt — try 'cass index --full --force-rebuild'."
+                                    "rebuild_token_daily_stats returned error: {e}. The token_usage ledger may itself be corrupt — run 'cass doctor check --json' and repair or restore the canonical archive before rebuilding derived assets."
                                 ),
                             }));
                         }
@@ -11276,6 +11276,18 @@ fn error_chain_indicates_retryable_storage_contention(chain: &str) -> bool {
     crate::storage::sqlite::retryable_storage_error_message(chain)
 }
 
+fn error_chain_indicates_index_disk_headroom_blocked(chain: &str) -> bool {
+    chain.contains("canonical archive disk headroom check failed")
+}
+
+fn error_chain_indicates_orphan_fk_cleanup_blocked(chain: &str) -> bool {
+    chain.contains("orphan FK self-heal failed for canonical cass archive")
+}
+
+fn error_chain_indicates_archive_health_blocked(chain: &str) -> bool {
+    chain.contains("will not replace or truncate the SQLite source of truth")
+}
+
 fn index_storage_contention_cli_error(chain: &str) -> CliError {
     CliError {
         code: 7,
@@ -11286,6 +11298,89 @@ fn index_storage_contention_cli_error(chain: &str) -> CliError {
                 .to_string(),
         ),
         retryable: true,
+    }
+}
+
+fn index_archive_health_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index refused to modify an unhealthy canonical archive: {chain}"),
+        hint: Some(
+            "Run 'cass doctor check --json' for a read-only diagnosis; do not use index --full/--force-rebuild as a corruption repair path."
+                .to_string(),
+        ),
+        retryable: false,
+    }
+}
+
+fn index_disk_headroom_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 14,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index refused to start because disk headroom is too low: {chain}"),
+        hint: Some(
+            "Free space on the filesystem that holds the cass data directory, then retry indexing. Run 'cass doctor check --json' for a read-only health report."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+fn index_orphan_fk_cleanup_cli_error(chain: &str) -> CliError {
+    CliError {
+        code: 5,
+        kind: CliErrorKind::Storage.kind_str(),
+        message: format!("index stopped before writing because orphan-FK cleanup failed: {chain}"),
+        hint: Some(
+            "Run 'cass doctor check --json', free disk/memory pressure if reported, then retry indexing after the canonical archive is readable."
+                .to_string(),
+        ),
+        retryable: true,
+    }
+}
+
+#[cfg(test)]
+mod index_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn orphan_fk_cleanup_failure_is_retryable_after_operator_remediation() {
+        let err = index_orphan_fk_cleanup_cli_error(
+            "orphan FK self-heal failed for canonical cass archive at /tmp/cass.db: out of memory",
+        );
+
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(err.retryable);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("free disk/memory pressure")),
+            "hint should name the resource-pressure retry path: {err:?}"
+        );
+    }
+
+    #[test]
+    fn archive_health_failure_remains_non_retryable_index_repair() {
+        let err = index_archive_health_cli_error(
+            "canonical cass archive at /tmp/cass.db is not safe for indexing: malformed. cass index will not replace or truncate the SQLite source of truth.",
+        );
+
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(!err.retryable);
+    }
+
+    #[test]
+    fn disk_headroom_failure_is_retryable_after_space_is_freed() {
+        let err = index_disk_headroom_cli_error(
+            "canonical archive disk headroom check failed for /data: available=1 bytes, required=2 bytes",
+        );
+
+        assert_eq!(err.code, 14);
+        assert_eq!(err.kind, CliErrorKind::Storage.kind_str());
+        assert!(err.retryable);
     }
 }
 
@@ -15342,7 +15437,10 @@ fn run_cli_search(
                     index_path.display(),
                     db_path.display()
                 ),
-                Some("Run 'cass index --full' to recreate the local archive database.".to_string()),
+                Some(
+                    "Restore the canonical archive from backup if historical coverage matters; otherwise run 'cass index --full' to create a new archive from currently available source sessions."
+                        .to_string(),
+                ),
             )
         } else {
             (
@@ -16540,7 +16638,10 @@ fn pack_missing_index_error(
                 index_path.display(),
                 db_path.display()
             ),
-            Some("Run 'cass index --full' to recreate the local archive database.".to_string()),
+            Some(
+                "Restore the canonical archive from backup if historical coverage matters; otherwise run 'cass index --full' to create a new archive from currently available source sessions."
+                    .to_string(),
+            ),
         )
     } else {
         (
@@ -60125,7 +60226,7 @@ fn run_status(
     } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
-        Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
+        Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_empty_with_messages {
@@ -60486,7 +60587,7 @@ fn run_triage(
     } else if !db_exists {
         Some("Run 'cass index --full' to create the database".to_string())
     } else if !db_available {
-        Some("Run 'cass doctor --fix' or 'cass index --full' to recover the database".to_string())
+        Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database".to_string())
     } else if !index_exists {
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_empty_with_messages {
@@ -60687,11 +60788,11 @@ fn run_health(
     } else if not_initialized {
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
-        Some("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string())
+        Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string())
     } else if healthy && quarantined_conversations > 0 {
         ingest_quarantine_recommended_action
     } else if !healthy {
-        Some("Run 'cass index --full' to rebuild the index/database.".to_string())
+        Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
     } else {
         semantic_recommended_action(&state, not_initialized)
     };
@@ -60876,7 +60977,13 @@ fn run_health(
         for err in &errors {
             println!("  - {err}");
         }
-        println!("Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.");
+        if let Some(action) = &recommended_action {
+            println!("{action}");
+        } else {
+            println!(
+                "Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database."
+            );
+        }
     } else {
         println!("✗ Unhealthy ({latency_ms}ms)");
         if !db_exists {
@@ -60891,7 +60998,11 @@ fn run_health(
         if index_empty_with_messages {
             println!("  - index has 0 documents but database has messages");
         }
-        println!("Run 'cass index --full' or 'cass index --watch' to create index.");
+        if let Some(action) = &recommended_action {
+            println!("{action}");
+        } else {
+            println!("Run 'cass status --json' for the exact readiness gap.");
+        }
     }
 
     let final_error = if healthy {
@@ -60923,7 +61034,7 @@ fn run_health(
                     .unwrap_or("could not open database")
             ),
             hint: Some(
-                "Run 'cass doctor --fix' or 'cass index --full' to attempt recovery.".to_string(),
+                "Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string(),
             ),
             retryable: false,
         })
@@ -60932,7 +61043,10 @@ fn run_health(
             code: 1,
             kind: CliErrorKind::Health.kind_str(),
             message: "Health check failed".to_string(),
-            hint: Some("Run 'cass index --full' to rebuild the index/database.".to_string()),
+            hint: Some(
+                "Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets."
+                    .to_string(),
+            ),
             retryable: true,
         })
     };
@@ -74712,6 +74826,15 @@ fn run_index_with_data(
                 active_index_error = Some(details);
                 return err;
             }
+            if error_chain_indicates_index_disk_headroom_blocked(&chain) {
+                return index_disk_headroom_cli_error(&chain);
+            }
+            if error_chain_indicates_orphan_fk_cleanup_blocked(&chain) {
+                return index_orphan_fk_cleanup_cli_error(&chain);
+            }
+            if error_chain_indicates_archive_health_blocked(&chain) {
+                return index_archive_health_cli_error(&chain);
+            }
             if error_chain_indicates_retryable_storage_contention(&chain) {
                 return index_storage_contention_cli_error(&chain);
             }
@@ -84704,7 +84827,10 @@ fn run_models_backfill(
                 "Failed to fingerprint cass database {}: {e}",
                 db_path.display()
             ),
-            hint: Some("Run 'cass index --full --force-rebuild' if the archive is corrupt".into()),
+            hint: Some(
+                "Run 'cass doctor check --json' if the archive is corrupt; index --force-rebuild only rebuilds derived assets from a healthy canonical archive."
+                    .into(),
+            ),
             retryable: true,
         })?;
     let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {

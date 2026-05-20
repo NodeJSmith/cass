@@ -195,14 +195,11 @@ fn health_json_surfaces_runtime_queue_and_byte_budget_headroom() {
 // `cass index --full` (which would stampede the advisory lock at
 // src/lib.rs::probe_index_run_lock).
 //
-// KNOWN DIVERGENCE — bead coding_agent_session_search-k0bzk:
-// `cass health --json` exposes the same rebuild_progress.active=true
-// signal but its `recommended_action` currently emits the stampede
-// text "Run 'cass index --full' to rebuild the index/database." because
-// run_health (src/lib.rs:12051) forgot to add the rebuild_active arm
-// that run_status has. That's tracked as a separate bug; this test
-// pins the correct surface (status) to prevent its regression and
-// leaves the incorrect health surface to the bug fix.
+// Historical divergence — bead coding_agent_session_search-k0bzk:
+// older `cass health --json` builds exposed rebuild_progress.active=true
+// but still emitted stampede advice telling the operator to rebuild while a
+// rebuild was already active. This status test pins the correct surface so the
+// bug cannot regress.
 // ========================================================================
 
 #[test]
@@ -286,8 +283,8 @@ fn status_recommended_action_during_active_rebuild_says_wait_not_reindex() {
 // but exercises `cass health --json` instead of `cass status --json`.
 //
 // Pre-fix (commits before the k0bzk fix), run_health (src/lib.rs:~12082)
-// fell through to the !healthy branch and emitted "Run 'cass index --full'
-// to rebuild the index/database." while a rebuild was already in flight.
+// fell through to the !healthy branch and emitted rebuild advice while a rebuild
+// was already in flight.
 // Polling agents reading that text would either lock-stampede via
 // probe_index_run_lock or, in the worst case, kick a concurrent pipeline.
 //

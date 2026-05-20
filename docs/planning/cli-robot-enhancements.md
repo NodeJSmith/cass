@@ -664,7 +664,7 @@ for "is everything working correctly?"
 4. **Issue detection with suggestions**:
    ```
    ⚠️  ISSUE: Schema version mismatch (expected v4, found v3)
-   💡 FIX: Run `cass index --full --force-rebuild` to rebuild index
+   💡 FIX: Run `cass doctor check --json`; only rebuild derived indexes after the canonical archive is healthy
 
    ⚠️  ISSUE: Claude Code directory not found (~/.claude)
    💡 FIX: This is normal if you don't use Claude Code
@@ -818,4 +818,3 @@ Based on the review, many features already exist. Here's the updated plan:
 - [ ] Add QUERY_SYNTAX.md with full documentation
 - [ ] Update man page
 - [ ] Add examples to --help output for new flags
-

@@ -227,7 +227,7 @@ fn repair_reason(kind: RepairKind) -> &'static str {
             "Track B rollups are derivable from the intact token_usage ledger and can be rebuilt safely via rebuild_token_daily_stats()."
         }
         RepairKind::TrackAllRebuildUnavailable => {
-            "Track B ledger or cross-track precondition is missing; a full canonical replay is required and is not implemented by --fix. Rebuild manually from source sessions via 'cass index --full --force-rebuild'."
+            "Track B ledger or cross-track precondition is missing; a full canonical replay is required and is not implemented by --fix. Run 'cass doctor check --json' and restore or repair the canonical archive before rebuilding derived assets."
         }
         RepairKind::ManualReview => {
             "This validation failure does not have a proven automatic repair path."

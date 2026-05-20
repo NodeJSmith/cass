@@ -522,13 +522,22 @@ fn swarm_surface_renders_empty_queue_with_no_ready_action() {
 
     let text = render_app_text(&app, 110, 24);
 
-    assert!(text.contains("ready:0"), "empty-queue header must show zero ready beads");
+    assert!(
+        text.contains("ready:0"),
+        "empty-queue header must show zero ready beads"
+    );
     assert!(text.contains("agents:0"));
     assert!(text.contains("reservations:0"));
     assert!(text.contains("in-progress 0"));
     assert!(text.contains("blocked 0"));
-    assert!(text.contains("no-ready-work"), "footer/header must surface the no-ready-work recommendation");
-    assert!(text.contains("Safety"), "safety line must remain present in every state");
+    assert!(
+        text.contains("no-ready-work"),
+        "footer/header must surface the no-ready-work recommendation"
+    );
+    assert!(
+        text.contains("Safety"),
+        "safety line must remain present in every state"
+    );
 }
 
 #[test]
@@ -567,10 +576,22 @@ fn swarm_surface_renders_evidence_gap_summary_state() {
 
     let text = render_app_text(&app, 120, 24);
 
-    assert!(text.contains("gaps:3"), "evidence-gap header must report the gap count");
-    assert!(text.contains("missing-rch-proof"), "first evidence-gap kind must appear");
-    assert!(text.contains("stale-baseline"), "second evidence-gap kind must appear");
-    assert!(text.contains("close-evidence-gaps"), "recommended action must surface the gap remediation");
+    assert!(
+        text.contains("gaps:3"),
+        "evidence-gap header must report the gap count"
+    );
+    assert!(
+        text.contains("missing-rch-proof"),
+        "first evidence-gap kind must appear"
+    );
+    assert!(
+        text.contains("stale-baseline"),
+        "second evidence-gap kind must appear"
+    );
+    assert!(
+        text.contains("close-evidence-gaps"),
+        "recommended action must surface the gap remediation"
+    );
     assert!(text.contains("Safety"), "safety line must remain present");
 }
 

@@ -156,8 +156,9 @@ Concurrent Tests:
 ### Index Corruption
 
 1. Run `cass health --json` to diagnose
-2. Rebuild with `cass index --full --force-rebuild`
-3. Check disk space availability
+2. If only derived search assets are stale or corrupt, run the index refresh recommended by health
+3. Run `cass doctor check --json` if the canonical SQLite archive is unreadable or malformed
+4. Check disk space availability
 
 ## Version History
 
