@@ -1286,7 +1286,12 @@ fn execute_query_with_lazy_exact_count(
     limit: usize,
     offset: usize,
 ) -> Result<FsLexicalSearchResult> {
-    let top_docs = searcher.search(query, &TopDocs::with_limit(limit).and_offset(offset))?;
+    let top_docs = searcher.search(
+        query,
+        &TopDocs::with_limit(limit)
+            .and_offset(offset)
+            .order_by_score(),
+    )?;
     let page_saturated = top_docs.len() == limit;
     let total_count = if page_saturated {
         searcher.search(query, &Count)?
@@ -7040,7 +7045,7 @@ fn maybe_spawn_warm_worker(
                 }
                 if !clauses.is_empty() {
                     let q: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
-                    let _ = searcher.search(&q, &TopDocs::with_limit(1));
+                    let _ = searcher.search(&q, &TopDocs::with_limit(1).order_by_score());
                 }
             }
         })
