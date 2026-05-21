@@ -17,6 +17,30 @@ Repository: <https://github.com/Dicklesworthstone/coding_agent_session_search>
 
 ## Unreleased
 
+## [v0.5.1] -- 2026-05-21
+
+**Watch-mode reliability: no more silent crash-loops, redundant salvage re-scans, or unrecoverable rebuild loops.**
+
+Fixes for three field-reported `cass index --watch` failures on large archives:
+
+- **Silent code-9 exits are gone (#250).** Index failures were logged at `debug!`
+  (hidden by default), so a failing watch cycle exited with code 9 and left
+  nothing in the log but a `drop_close` warning. Index failures now log at
+  **ERROR** with the exit code and full message, and swallowed watch-cycle
+  failures log the full error chain plus a "since_ts not advanced this cycle"
+  note that explains the frozen-watermark / backlog-re-scan loop.
+- **Historical salvage no longer re-scans fully-imported backups (#247).** A
+  bundle whose progress checkpoint already covered the backup's entire
+  conversation row-id space (daemon OOM-killed before the completion ledger
+  marker landed) was re-scanned O(n) on every cycle — 5-12 min per batch with
+  `imported=0`. It is now detected via the checkpoint, ledgered, and skipped.
+- **Sparse-index rebuilds self-heal instead of looping after OOM (#248).** When
+  the live lexical index reads sparse, cass repairs it from the canonical SQLite
+  (the source of truth) per the Search Asset Contract; combined with staged-shard
+  memory throttling, the repair completes within the host memory budget instead
+  of OOM-looping. A completed checkpoint that disagrees with a sparse live index
+  now emits a diagnostic warning.
+
 ## [v0.5.0] -- 2026-05-20
 
 **`cass index` now protects the canonical SQLite archive instead of silently replacing it.**
