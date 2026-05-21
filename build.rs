@@ -128,8 +128,8 @@ const CONTRACTS: &[DependencyContract] = &[
         expected_git: "https://github.com/Dicklesworthstone/frankensearch",
         // Bumped from 831b3b13 to pick up bounded cass content-prefix
         // indexing plus the self-contained Git dependency packaging fix.
-        expected_rev: "c8fd66544614b434f82eab86e86e189ea284dada",
-        expected_version: "0.3.1",
+        expected_rev: "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        expected_version: "0.3.2",
         expected_features: &["ann", "fastembed-reranker", "hash", "lexical"],
         expected_default_features: Some(false),
         repo_rel: "../frankensearch",

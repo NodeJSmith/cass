@@ -81,7 +81,7 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 memmap2 = "0.9.10"
 bytemuck = "1.25.0"
 fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls"] }
-frankensearch = { version = "0.3.1", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "c8fd66544614b434f82eab86e86e189ea284dada", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
+frankensearch = { version = "0.3.2", git = "https://github.com/Dicklesworthstone/frankensearch", rev = "2cad158f4468ece7076e3fe529c8e5c20b2e020e", default-features = false, features = ["hash", "lexical", "ann", "fastembed-reranker"] }
 franken-agent-detection = { version = "0.1.8", git = "https://github.com/Dicklesworthstone/franken_agent_detection", rev = "b62d859709aa6f8e772759efa2c13da9e3c088c9", features = ["connectors", "cursor", "chatgpt", "opencode", "crush", "hermes"] }
 wide = "1.4.0"  # Portable SIMD for P0 Opt 2: SIMD dot product
 arrayvec = "0.7.6"  # Stack-based arrays for P1 Opt 1.4: Edge N-gram optimization
