@@ -63,9 +63,9 @@ const LOW_SIGNAL_CONTENT: &[&str] = &[
 /// is pure ASCII and contains no markdown discriminators.
 ///
 /// For the dominant tool-output message shape (short plain-ASCII strings
-/// without backticks, asterisks, underscores, headers, or link brackets),
-/// this skips NFC normalization, markdown line-by-line stripping, and
-/// code-block collapse — the expensive parts of the slow path — and just
+/// without inline markdown markers, headers, links, blockquotes, or list
+/// markers), this skips NFC normalization, markdown line-by-line stripping,
+/// and code-block collapse — the expensive parts of the slow path — and just
 /// does whitespace collapse + low-signal filter + truncation.
 fn canonicalize_fast_path(text: &str) -> Option<String> {
     // Pure-ASCII check implies NFC is a no-op; any non-ASCII byte must
@@ -81,6 +81,9 @@ fn canonicalize_fast_path(text: &str) -> Option<String> {
         .bytes()
         .any(|b| matches!(b, b'`' | b'*' | b'_' | b'#' | b'['))
     {
+        return None;
+    }
+    if has_markdown_line_prefix(text) {
         return None;
     }
 
@@ -117,6 +120,27 @@ fn canonicalize_fast_path(text: &str) -> Option<String> {
     }
 
     Some(collapsed)
+}
+
+fn has_markdown_line_prefix(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('>')
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("+ ")
+            || has_ordered_list_marker(trimmed)
+    })
+}
+
+fn has_ordered_list_marker(line: &str) -> bool {
+    let mut bytes = line.bytes().peekable();
+    let mut saw_digit = false;
+
+    while bytes.next_if(u8::is_ascii_digit).is_some() {
+        saw_digit = true;
+    }
+
+    saw_digit && bytes.next() == Some(b'.') && bytes.next() == Some(b' ')
 }
 
 /// Canonicalize text for embedding.
@@ -322,6 +346,10 @@ mod tests {
             "# A Header",
             "list [link](url)",
             "_italic_ too",
+            "> quoted text",
+            ">> nested quoted text",
+            "1. First item\n2. Second item",
+            "  - dash item\n  + plus item",
             // Non-ASCII — fall through (NFC must run)
             "café au lait",
             "caf\u{0065}\u{0301}",
