@@ -623,6 +623,18 @@
         "quarantined_conversations": {
           "type": "integer"
         },
+        "recent_quarantined_conversations": {
+          "type": "integer"
+        },
+        "recent_window_seconds": {
+          "type": "integer"
+        },
+        "circuit_breaker_limit": {
+          "type": "integer"
+        },
+        "circuit_breaker_active": {
+          "type": "boolean"
+        },
         "quarantine_files": {
           "type": "array",
           "items": {
@@ -1269,6 +1281,18 @@
             },
             "quarantined_conversations": {
               "type": "integer"
+            },
+            "recent_quarantined_conversations": {
+              "type": "integer"
+            },
+            "recent_window_seconds": {
+              "type": "integer"
+            },
+            "circuit_breaker_limit": {
+              "type": "integer"
+            },
+            "circuit_breaker_active": {
+              "type": "boolean"
             },
             "quarantine_files": {
               "type": "array",

@@ -142,31 +142,39 @@ fn isolated_cass_cmd(temp_home: &Path) -> Command {
 }
 
 fn write_ingest_quarantine_record(data_dir: &Path) {
+    write_ingest_quarantine_records(data_dir, 1);
+}
+
+fn write_ingest_quarantine_records(data_dir: &Path, count: usize) {
     let quarantine_dir = data_dir.join("quarantine");
     fs::create_dir_all(&quarantine_dir).expect("create ingest quarantine dir");
-    let record = json!({
-        "schema_version": 1,
-        "conversation_id": "tester|/logs/demo.jsonl|/workspace/demo|poison|1|2|1",
-        "schema_version_at_quarantine": CURRENT_SCHEMA_VERSION,
-        "first_quarantined_at_ms": 10,
-        "last_attempt_at_ms": 20,
-        "attempt_count": 1,
-        "reason": "index-ingest-out-of-memory",
-        "error_kind": "out-of-memory",
-        "last_error": "out of memory",
-        "agent_slug": "tester",
-        "external_id": "poison",
-        "source_path": "/logs/demo.jsonl",
-        "workspace": "/workspace/demo",
-        "started_at": 1,
-        "ended_at": 2,
-        "message_count": 1
-    });
-    fs::write(
-        quarantine_dir.join("index_ingest_poison.jsonl"),
-        format!("{record}\n"),
-    )
-    .expect("write ingest quarantine record");
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut lines = String::new();
+    for idx in 0..count {
+        let started_at = i64::try_from(idx).expect("idx fits i64") + 1;
+        let ended_at = started_at + 1;
+        let record = json!({
+            "schema_version": 1,
+            "conversation_id": format!("tester|/logs/demo-{idx}.jsonl|/workspace/demo|poison-{idx}|{started_at}|{ended_at}|1"),
+            "schema_version_at_quarantine": CURRENT_SCHEMA_VERSION,
+            "first_quarantined_at_ms": now_ms,
+            "last_attempt_at_ms": now_ms,
+            "attempt_count": 1,
+            "reason": "index-ingest-out-of-memory",
+            "error_kind": "out-of-memory",
+            "last_error": "out of memory",
+            "agent_slug": "tester",
+            "external_id": format!("poison-{idx}"),
+            "source_path": format!("/logs/demo-{idx}.jsonl"),
+            "workspace": "/workspace/demo",
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "message_count": 1
+        });
+        lines.push_str(&format!("{record}\n"));
+    }
+    fs::write(quarantine_dir.join("index_ingest_poison.jsonl"), lines)
+        .expect("write ingest quarantine record");
 }
 
 fn seed_active_rebuild_runtime(data_dir: &Path) -> std::fs::File {
@@ -344,6 +352,88 @@ fn status_and_health_json_surface_ingest_quarantine_as_nonfatal_degraded() {
             .as_array()
             .is_some_and(|warnings| !warnings.is_empty()),
         "health should expose a nonfatal ingest-quarantine warning: {health_payload}"
+    );
+}
+
+#[test]
+fn status_and_health_json_escalate_recent_ingest_quarantine_bursts() {
+    let test_home = tempfile::tempdir().expect("tempdir");
+    let data_dir = test_home.path().join("cass-data");
+    fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let index_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "index",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+            "--no-progress-events",
+        ])
+        .output()
+        .expect("run cass index --json");
+    assert!(
+        index_out.status.success(),
+        "cass index --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&index_out.stdout),
+        String::from_utf8_lossy(&index_out.stderr)
+    );
+
+    write_ingest_quarantine_records(&data_dir, 3);
+
+    let status_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "status",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", "3")
+        .output()
+        .expect("run cass status --json");
+    assert!(
+        status_out.status.success(),
+        "cass status --json failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&status_out.stdout),
+        String::from_utf8_lossy(&status_out.stderr)
+    );
+    let status_payload: serde_json::Value =
+        serde_json::from_slice(&status_out.stdout).expect("status JSON");
+    assert_eq!(status_payload["status"].as_str(), Some("unhealthy"));
+    assert_eq!(status_payload["healthy"].as_bool(), Some(false));
+    assert_eq!(status_payload["health_level"].as_str(), Some("critical"));
+    assert_eq!(
+        status_payload["ingest_quarantine"]["circuit_breaker_active"].as_bool(),
+        Some(true)
+    );
+
+    let health_out = isolated_cass_cmd(test_home.path())
+        .args([
+            "health",
+            "--data-dir",
+            data_dir.to_str().expect("utf8"),
+            "--json",
+        ])
+        .env("CASS_INGEST_QUARANTINE_CIRCUIT_LIMIT", "3")
+        .output()
+        .expect("run cass health --json");
+    assert!(
+        !health_out.status.success(),
+        "cass health --json should exit nonzero for critical ingest quarantine readiness: stdout={} stderr={}",
+        String::from_utf8_lossy(&health_out.stdout),
+        String::from_utf8_lossy(&health_out.stderr)
+    );
+    let health_payload: serde_json::Value =
+        serde_json::from_slice(&health_out.stdout).expect("health JSON");
+    assert_eq!(health_payload["status"].as_str(), Some("unhealthy"));
+    assert_eq!(health_payload["healthy"].as_bool(), Some(false));
+    assert_eq!(health_payload["health_level"].as_str(), Some("critical"));
+    assert!(
+        health_payload["errors"]
+            .as_array()
+            .is_some_and(|errors| errors.iter().any(|err| err
+                .as_str()
+                .is_some_and(|msg| msg.contains("quarantine circuit breaker")))),
+        "health should expose the circuit breaker as an error: {health_payload}"
     );
 }
 

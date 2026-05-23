@@ -60205,13 +60205,27 @@ fn run_status(
         .and_then(|q| q.get("quarantined_conversations"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let recent_quarantined_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("recent_quarantined_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ingest_quarantine_critical = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("circuit_breaker_active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let mut warnings = Vec::<String>::new();
-    if quarantined_conversations > 0 {
+    if ingest_quarantine_critical {
+        warnings.push(format!(
+            "{recent_quarantined_conversations} recent conversation quarantine(s) triggered the ingest quarantine circuit breaker; search coverage is suspect until the watcher/source path is inspected"
+        ));
+    } else if quarantined_conversations > 0 {
         warnings.push(format!(
             "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; search remains usable for the rest of the archive"
         ));
@@ -60226,9 +60240,12 @@ fn run_status(
         && index_exists
         && index_fresh
         && !rebuild_active
-        && !index_empty_with_messages;
+        && !index_empty_with_messages
+        && !ingest_quarantine_critical;
     let status = if rebuild_active {
         "rebuilding"
+    } else if ingest_quarantine_critical {
+        "unhealthy"
     } else if healthy {
         "healthy"
     } else if not_initialized {
@@ -60256,6 +60273,8 @@ fn run_status(
         Some("Run 'cass index --full' to rebuild the search index".to_string())
     } else if index_empty_with_messages {
         Some("Run 'cass index --full' to populate the empty search index".to_string())
+    } else if ingest_quarantine_critical {
+        ingest_quarantine_recommended_action
     } else if is_stale || pending_sessions > 0 {
         let pending_msg = if pending_sessions > 0 {
             format!(" ({pending_sessions} sessions pending)")
@@ -60356,7 +60375,7 @@ fn run_status(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
-            "health_level": if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
@@ -60774,13 +60793,27 @@ fn run_health(
         .and_then(|q| q.get("quarantined_conversations"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
+    let recent_quarantined_conversations = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("recent_quarantined_conversations"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let ingest_quarantine_critical = state
+        .get("ingest_quarantine")
+        .and_then(|q| q.get("circuit_breaker_active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let ingest_quarantine_recommended_action = state
         .get("ingest_quarantine")
         .and_then(|q| q.get("recommended_action"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let mut warnings = Vec::<String>::new();
-    if quarantined_conversations > 0 {
+    if ingest_quarantine_critical {
+        warnings.push(format!(
+            "{recent_quarantined_conversations} recent conversation quarantine(s) triggered the ingest quarantine circuit breaker; lexical search coverage is suspect until the watcher/source path is inspected"
+        ));
+    } else if quarantined_conversations > 0 {
         warnings.push(format!(
             "{quarantined_conversations} conversation(s) are quarantined after irreducible ingest OOM; lexical search remains usable for non-quarantined sessions"
         ));
@@ -60795,7 +60828,8 @@ fn run_health(
         && index_exists
         && index_fresh
         && !rebuild_active
-        && !index_empty_with_messages;
+        && !index_empty_with_messages
+        && !ingest_quarantine_critical;
     let explanation = if not_initialized {
         Some(cass_not_initialized_explanation(&data_dir))
     } else {
@@ -60814,7 +60848,7 @@ fn run_health(
         Some(cass_not_initialized_recommended_action())
     } else if db_degraded {
         Some("Run 'cass doctor check --json' before any repair; indexing will not replace an unreadable canonical database.".to_string())
-    } else if healthy && quarantined_conversations > 0 {
+    } else if ingest_quarantine_critical || (healthy && quarantined_conversations > 0) {
         ingest_quarantine_recommended_action
     } else if !healthy {
         Some("Run 'cass status --json' for the exact readiness gap; run 'cass index --full' only for missing or stale derived search assets.".to_string())
@@ -60850,10 +60884,15 @@ fn run_health(
     if index_empty_with_messages {
         errors.push("index empty but database has messages — run 'cass index --full'".to_string());
     }
+    if ingest_quarantine_critical {
+        errors.push("ingest quarantine circuit breaker active".to_string());
+    }
 
     // Determine status string for structured output.
     let status = if rebuild_active {
         "rebuilding"
+    } else if ingest_quarantine_critical {
+        "unhealthy"
     } else if healthy {
         "healthy"
     } else if not_initialized {
@@ -60933,7 +60972,7 @@ fn run_health(
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
-            "health_level": if healthy && quarantined_conversations > 0 { "degraded" } else { status },
+            "health_level": if ingest_quarantine_critical { "critical" } else if healthy && quarantined_conversations > 0 { "degraded" } else { status },
             "initialized": !not_initialized,
             "explanation": explanation,
             "warnings": warnings,
