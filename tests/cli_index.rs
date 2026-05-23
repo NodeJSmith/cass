@@ -2,9 +2,11 @@ use assert_cmd::Command;
 use clap::Parser;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use coding_agent_search::{Cli, Commands};
+use fs2::FileExt;
 use predicates::str::contains;
 use serial_test::serial;
 use std::fs;
+use std::fs::OpenOptions;
 use tempfile::TempDir;
 
 mod util;
@@ -103,6 +105,61 @@ fn index_creates_db_and_index() {
     // Index dir should exist
     let index_path = data_dir.join("index");
     assert!(index_path.exists(), "index dir created");
+}
+
+#[test]
+#[serial]
+fn index_watch_once_skips_advisory_locked_active_source_without_quarantine() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("data");
+    let source_dir = tmp.path().join("amp");
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::create_dir_all(&source_dir).unwrap();
+    let source_path = source_dir.join("thread-active-source.json");
+    fs::write(
+        &source_path,
+        r#"{"id":"thread-active-source","messages":[{"role":"user","text":"still being written","createdAt":1700000000100}]}"#,
+    )
+    .unwrap();
+    let locked_source = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&source_path)
+        .unwrap();
+    locked_source.lock_exclusive().unwrap();
+
+    let output = base_cmd(tmp.path())
+        .args([
+            "index",
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--watch-once",
+            source_path.to_str().unwrap(),
+            "--json",
+            "--no-progress-events",
+        ])
+        .output()
+        .expect("run cass index --watch-once");
+    assert!(
+        output.status.success(),
+        "watch-once should skip active source successfully: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("watch-once JSON payload");
+    assert_eq!(
+        payload.get("conversations").and_then(|v| v.as_i64()),
+        Some(0)
+    );
+    assert!(
+        !data_dir
+            .join("quarantine/watch_ingest_poison.jsonl")
+            .exists(),
+        "active source skip must not create watch poison quarantine"
+    );
+
+    locked_source.unlock().unwrap();
 }
 
 #[test]
@@ -971,10 +1028,10 @@ fn index_full_persists_lexical_rebuild_equivalence_ledger() {
     // conversations and exercises the streaming accumulator beyond a trivial
     // single-conversation path.
     for (idx, content) in [
-        "equivalence-ledger-alpha",
-        "equivalence-ledger-bravo",
-        "equivalence-ledger-charlie",
-        "equivalence-ledger-delta",
+        "equivalenceledgeralpha",
+        "equivalenceledgerbravo",
+        "equivalenceledgercharlie",
+        "equivalenceledgerdelta",
     ]
     .iter()
     .enumerate()
@@ -1074,7 +1131,7 @@ fn index_full_persists_lexical_rebuild_equivalence_ledger() {
     // evidence ledger is paired with a user-visible correctness signal.
     let mut search_cmd = base_cmd(home);
     search_cmd
-        .args(["search", "equivalence-ledger-alpha", "--data-dir"])
+        .args(["search", "equivalenceledgeralpha", "--data-dir"])
         .arg(&data_dir);
     let search_output = search_cmd.output().expect("run cass search");
     assert!(
@@ -1085,7 +1142,7 @@ fn index_full_persists_lexical_rebuild_equivalence_ledger() {
     );
     let search_stdout = String::from_utf8_lossy(&search_output.stdout);
     assert!(
-        search_stdout.contains("equivalence-ledger-alpha"),
+        search_stdout.contains("equivalenceledgeralpha"),
         "search should surface the seeded content; got stdout:\n{search_stdout}"
     );
 }

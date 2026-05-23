@@ -221,12 +221,18 @@ impl RefreshLedger {
 
     /// Total items processed across all phases.
     pub fn total_items_processed(&self) -> u64 {
-        self.phases.iter().map(|p| p.items_processed).sum()
+        self.phases
+            .iter()
+            .map(|p| p.items_processed)
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Total errors across all phases.
     pub fn total_errors(&self) -> u64 {
-        self.phases.iter().map(|p| p.errors).sum()
+        self.phases
+            .iter()
+            .map(|p| p.errors)
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Whether all phases succeeded.
@@ -367,8 +373,8 @@ impl LedgerBuilder {
     /// Record items processed in the current phase.
     pub fn record_items(&mut self, processed: u64, skipped: u64) {
         if let Some(ref mut record) = self.current_record {
-            record.items_processed += processed;
-            record.items_skipped += skipped;
+            record.items_processed = record.items_processed.saturating_add(processed);
+            record.items_skipped = record.items_skipped.saturating_add(skipped);
         }
     }
 
@@ -377,7 +383,7 @@ impl LedgerBuilder {
     /// Multiple errors are joined with "; " so no diagnostic info is lost.
     pub fn record_error(&mut self, message: &str) {
         if let Some(ref mut record) = self.current_record {
-            record.errors += 1;
+            record.errors = record.errors.saturating_add(1);
             match &mut record.error_message {
                 Some(existing) => {
                     existing.push_str("; ");
@@ -410,7 +416,8 @@ impl LedgerBuilder {
     /// Increment a custom counter in the current phase.
     pub fn inc_counter(&mut self, key: &str, delta: u64) {
         if let Some(ref mut record) = self.current_record {
-            *record.counters.entry(key.to_owned()).or_insert(0) += delta;
+            let entry = record.counters.entry(key.to_owned()).or_insert(0);
+            *entry = entry.saturating_add(delta);
         }
     }
 
@@ -1241,6 +1248,24 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(ledger.total_duration_ms >= max_phase_duration);
+    }
+
+    #[test]
+    fn ledger_builder_saturates_counter_arithmetic() {
+        let mut builder = RefreshLedger::start("pathological", true);
+
+        builder.begin_phase(RefreshPhase::Scan);
+        builder.record_items(u64::MAX, u64::MAX);
+        builder.record_items(1, 1);
+        builder.inc_counter("bytes_scanned", u64::MAX);
+        builder.inc_counter("bytes_scanned", 1);
+
+        let ledger = builder.finish();
+        let scan = ledger.phase(RefreshPhase::Scan).unwrap();
+        assert_eq!(scan.items_processed, u64::MAX);
+        assert_eq!(scan.items_skipped, u64::MAX);
+        assert_eq!(scan.counters.get("bytes_scanned"), Some(&u64::MAX));
+        assert_eq!(ledger.total_items_processed(), u64::MAX);
     }
 
     #[test]

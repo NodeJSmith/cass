@@ -7,7 +7,7 @@
   "paths": {
     "data_dir": "[TEST_HOME]/cass-data",
     "db_path": "[TEST_HOME]/cass-data/agent_search.db",
-    "index_path": "[TEST_HOME]/cass-data/index/v7"
+    "index_path": "[TEST_HOME]/cass-data/index/v8"
   },
   "database": {
     "exists": false,

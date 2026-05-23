@@ -24,11 +24,12 @@
 //! - **[`model_manager`]**: Detects model availability; this module records
 //!   which model was used to build each artifact.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use super::policy::{
@@ -390,11 +391,11 @@ impl SemanticShardManifest {
         let json = serde_json::to_string_pretty(self).map_err(|e| ManifestError::Serialize {
             source: e.to_string(),
         })?;
-        let tmp_path = unique_manifest_temp_path(&path);
-        let mut file = fs::File::create(&tmp_path).map_err(|e| ManifestError::Io {
-            path: tmp_path.clone(),
-            source: e.to_string(),
-        })?;
+        let (tmp_path, mut file) =
+            create_unique_manifest_temp_file(&path).map_err(|e| ManifestError::Io {
+                path: path.clone(),
+                source: e.to_string(),
+            })?;
         file.write_all(json.as_bytes())
             .map_err(|e| ManifestError::Io {
                 path: tmp_path.clone(),
@@ -775,11 +776,11 @@ impl SemanticManifest {
         })?;
 
         // Atomic write: temp file → rename.
-        let tmp_path = unique_manifest_temp_path(&path);
-        let mut file = fs::File::create(&tmp_path).map_err(|e| ManifestError::Io {
-            path: tmp_path.clone(),
-            source: e.to_string(),
-        })?;
+        let (tmp_path, mut file) =
+            create_unique_manifest_temp_file(&path).map_err(|e| ManifestError::Io {
+                path: path.clone(),
+                source: e.to_string(),
+            })?;
         file.write_all(json.as_bytes())
             .map_err(|e| ManifestError::Io {
                 path: tmp_path.clone(),
@@ -1082,7 +1083,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn unique_manifest_temp_path(path: &Path) -> PathBuf {
+fn unique_manifest_temp_path(path: &Path, attempt: u32, random: u64) -> PathBuf {
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let file_name = path
@@ -1091,15 +1092,39 @@ fn unique_manifest_temp_path(path: &Path) -> PathBuf {
         .unwrap_or(MANIFEST_FILENAME);
     let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     path.with_file_name(format!(
-        ".{file_name}.tmp.{}.{}.{}",
-        std::process::id(),
+        ".{file_name}.tmp.{attempt}.{}.{}.{random:016x}",
         now_ms(),
         nonce
     ))
 }
 
+fn create_unique_manifest_temp_file(path: &Path) -> std::io::Result<(PathBuf, fs::File)> {
+    for attempt in 0..100 {
+        let random = random_manifest_path_nonce()?;
+        let tmp_path = unique_manifest_temp_path(path, attempt, random);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => return Ok((tmp_path, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create a unique temporary manifest file for {} after 100 attempts",
+            path.display()
+        ),
+    ))
+}
+
 #[cfg(windows)]
-fn unique_manifest_backup_path(path: &Path) -> PathBuf {
+fn unique_manifest_backup_path(path: &Path) -> std::io::Result<PathBuf> {
+    let random = random_manifest_path_nonce()?;
     static NEXT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     let file_name = path
@@ -1107,12 +1132,18 @@ fn unique_manifest_backup_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or(MANIFEST_FILENAME);
     let nonce = NEXT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_file_name(format!(
-        ".{file_name}.bak.{}.{}.{}",
-        std::process::id(),
-        now_ms(),
-        nonce
-    ))
+    Ok(path.with_file_name(format!(
+        ".{file_name}.bak.{}.{nonce}.{random:016x}",
+        now_ms()
+    )))
+}
+
+fn random_manifest_path_nonce() -> std::io::Result<u64> {
+    let mut random_bytes = [0u8; 8];
+    SystemRandom::new()
+        .fill(&mut random_bytes)
+        .map_err(|_| std::io::Error::other("failed to generate manifest temp path nonce"))?;
+    Ok(u64::from_le_bytes(random_bytes))
 }
 
 fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
@@ -1127,7 +1158,7 @@ fn replace_file_from_temp(temp_path: &Path, final_path: &Path) -> std::io::Resul
                         std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
                     ) =>
             {
-                let backup_path = unique_manifest_backup_path(final_path);
+                let backup_path = unique_manifest_backup_path(final_path)?;
                 fs::rename(final_path, &backup_path).map_err(|backup_err| {
                     let _ = fs::remove_file(temp_path);
                     std::io::Error::other(format!(
@@ -1388,6 +1419,55 @@ mod tests {
         assert!(loaded.fast_tier.is_none());
         assert!(loaded.quality_tier.is_some());
         assert_eq!(loaded.backlog.total_conversations, 99);
+    }
+
+    #[test]
+    fn manifest_temp_file_creation_is_exclusive_and_unique() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let final_path = SemanticManifest::path(temp.path());
+        let manifest_dir = final_path
+            .parent()
+            .ok_or_else(|| "semantic manifest path should have a parent directory".to_string())?;
+        fs::create_dir_all(manifest_dir).map_err(|e| e.to_string())?;
+
+        let (first_path, mut first_file) =
+            create_unique_manifest_temp_file(&final_path).map_err(|e| e.to_string())?;
+        first_file.write_all(b"first").map_err(|e| e.to_string())?;
+        let (second_path, mut second_file) =
+            create_unique_manifest_temp_file(&final_path).map_err(|e| e.to_string())?;
+        second_file
+            .write_all(b"second")
+            .map_err(|e| e.to_string())?;
+
+        if first_path == second_path {
+            return Err("exclusive temp creation reused the same path".to_string());
+        }
+        if !first_path.exists() {
+            return Err(format!(
+                "first temp file is missing: {}",
+                first_path.display()
+            ));
+        }
+        if !second_path.exists() {
+            return Err(format!(
+                "second temp file is missing: {}",
+                second_path.display()
+            ));
+        }
+        if first_path.parent() != Some(manifest_dir) {
+            return Err(format!(
+                "first temp path escaped manifest directory: {}",
+                first_path.display()
+            ));
+        }
+        if second_path.parent() != Some(manifest_dir) {
+            return Err(format!(
+                "second temp path escaped manifest directory: {}",
+                second_path.display()
+            ));
+        }
+
+        Ok(())
     }
 
     #[test]

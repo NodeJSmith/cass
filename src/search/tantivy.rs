@@ -380,6 +380,36 @@ fn cass_document_for_packet_message(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_packet_message_into_pending<F>(
+    inner: &mut FsCassTantivyIndex,
+    context: &CassDocContext,
+    msg: &ConversationPacketMessage,
+    docs: &mut Vec<FsCassDocument>,
+    pending_chars: &mut usize,
+    max_messages: usize,
+    max_chars: usize,
+    on_batch_flushed: &mut F,
+) -> Result<()>
+where
+    F: FnMut(usize) -> Result<()>,
+{
+    let Some(doc) = cass_document_for_packet_message(context, msg) else {
+        return Ok(());
+    };
+    push_cass_document_into_pending(docs, pending_chars, doc);
+    if docs.len() >= max_messages || *pending_chars >= max_chars {
+        let flushed_docs = docs.len();
+        inner
+            .add_cass_documents(docs.as_slice())
+            .map_err(map_fs_err)?;
+        on_batch_flushed(flushed_docs)?;
+        docs.clear();
+        *pending_chars = 0;
+    }
+    Ok(())
+}
+
 /// Returns true if the given stored hash matches the current schema hash.
 pub fn schema_hash_matches(stored: &str) -> bool {
     cass_schema_hash_matches(stored)
@@ -1551,33 +1581,38 @@ impl TantivyIndex {
 
         let messages = &packet.payload.messages;
         let total = messages.len();
-        let indices_owned;
-        let indices: &[usize] = match message_indices {
-            Some(slice) => slice,
-            None => {
-                indices_owned = (0..total).collect::<Vec<_>>();
-                &indices_owned
+        if let Some(indices) = message_indices {
+            for &i in indices {
+                let Some(msg) = messages.get(i) else {
+                    anyhow::bail!(
+                        "packet message index {} out of range for packet with {} messages",
+                        i,
+                        total
+                    );
+                };
+                push_packet_message_into_pending(
+                    &mut self.inner,
+                    &context,
+                    msg,
+                    &mut docs,
+                    &mut pending_chars,
+                    max_messages,
+                    max_chars,
+                    &mut on_batch_flushed,
+                )?;
             }
-        };
-
-        for &i in indices {
-            let Some(msg) = messages.get(i) else {
-                anyhow::bail!(
-                    "packet message index {} out of range for packet with {} messages",
-                    i,
-                    total
-                );
-            };
-            let Some(doc) = cass_document_for_packet_message(&context, msg) else {
-                continue;
-            };
-            push_cass_document_into_pending(&mut docs, &mut pending_chars, doc);
-            if docs.len() >= max_messages || pending_chars >= max_chars {
-                let flushed_docs = docs.len();
-                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
-                on_batch_flushed(flushed_docs)?;
-                docs.clear();
-                pending_chars = 0;
+        } else {
+            for msg in messages {
+                push_packet_message_into_pending(
+                    &mut self.inner,
+                    &context,
+                    msg,
+                    &mut docs,
+                    &mut pending_chars,
+                    max_messages,
+                    max_chars,
+                    &mut on_batch_flushed,
+                )?;
             }
         }
 
@@ -1603,9 +1638,15 @@ impl TantivyIndex {
             if batch_len >= max_messages || pending_chars >= max_chars {
                 let batch_end = idx + 1;
                 indexed_docs = indexed_docs.saturating_add(batch_end - batch_start);
-                self.inner
-                    .add_cass_documents(&documents[batch_start..batch_end])
-                    .map_err(map_fs_err)?;
+                let Some(batch) = documents.get(batch_start..batch_end) else {
+                    anyhow::bail!(
+                        "invalid Tantivy prebuilt document batch range {}..{} for {} documents",
+                        batch_start,
+                        batch_end,
+                        documents.len()
+                    );
+                };
+                self.inner.add_cass_documents(batch).map_err(map_fs_err)?;
                 batch_start = batch_end;
                 pending_chars = 0;
             }
@@ -1613,9 +1654,14 @@ impl TantivyIndex {
 
         if batch_start < documents.len() {
             indexed_docs = indexed_docs.saturating_add(documents.len() - batch_start);
-            self.inner
-                .add_cass_documents(&documents[batch_start..])
-                .map_err(map_fs_err)?;
+            let Some(batch) = documents.get(batch_start..) else {
+                anyhow::bail!(
+                    "invalid Tantivy prebuilt document tail range {}.. for {} documents",
+                    batch_start,
+                    documents.len()
+                );
+            };
+            self.inner.add_cass_documents(batch).map_err(map_fs_err)?;
         }
 
         Ok(indexed_docs)
@@ -1637,8 +1683,16 @@ impl TantivyIndex {
             if batch_len >= max_messages || pending_chars >= max_chars {
                 let batch_end = idx + 1;
                 indexed_docs = indexed_docs.saturating_add(batch_end - batch_start);
+                let Some(batch) = documents.get(batch_start..batch_end) else {
+                    anyhow::bail!(
+                        "invalid Tantivy prebuilt document ref batch range {}..{} for {} documents",
+                        batch_start,
+                        batch_end,
+                        documents.len()
+                    );
+                };
                 self.inner
-                    .add_cass_document_refs(&documents[batch_start..batch_end])
+                    .add_cass_document_refs(batch)
                     .map_err(map_fs_err)?;
                 batch_start = batch_end;
                 pending_chars = 0;
@@ -1647,8 +1701,15 @@ impl TantivyIndex {
 
         if batch_start < documents.len() {
             indexed_docs = indexed_docs.saturating_add(documents.len() - batch_start);
+            let Some(batch) = documents.get(batch_start..) else {
+                anyhow::bail!(
+                    "invalid Tantivy prebuilt document ref tail range {}.. for {} documents",
+                    batch_start,
+                    documents.len()
+                );
+            };
             self.inner
-                .add_cass_document_refs(&documents[batch_start..])
+                .add_cass_document_refs(batch)
                 .map_err(map_fs_err)?;
         }
 
@@ -1659,8 +1720,29 @@ impl TantivyIndex {
     where
         I: IntoIterator<Item = FsCassDocument>,
     {
-        let docs = documents.into_iter().collect::<Vec<_>>();
-        self.add_prebuilt_documents_slice(&docs)
+        let max_messages = tantivy_prebuilt_add_batch_max_messages();
+        let max_chars = tantivy_add_batch_max_chars();
+        let mut docs = Vec::new();
+        let mut pending_chars = 0usize;
+        let mut indexed_docs = 0usize;
+
+        for doc in documents {
+            pending_chars = pending_chars.saturating_add(doc.content.len());
+            docs.push(doc);
+            if docs.len() >= max_messages || pending_chars >= max_chars {
+                indexed_docs = indexed_docs.saturating_add(docs.len());
+                self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+                docs.clear();
+                pending_chars = 0;
+            }
+        }
+
+        if !docs.is_empty() {
+            indexed_docs = indexed_docs.saturating_add(docs.len());
+            self.inner.add_cass_documents(&docs).map_err(map_fs_err)?;
+        }
+
+        Ok(indexed_docs)
     }
 
     pub fn add_conversations_with_ids<'a, I>(&mut self, conversations: I) -> Result<usize>
@@ -2240,10 +2322,12 @@ mod tests {
         shard_index.commit().expect("commit shard");
         drop(shard_index);
 
-        let error = match TantivyIndex::merge_compatible_index_directories(&merged, &[&shard]) {
-            Ok(_) => panic!("non-empty merge output dir should be rejected"),
-            Err(error) => error,
-        };
+        let result = TantivyIndex::merge_compatible_index_directories(&merged, &[&shard]);
+        assert!(
+            result.is_err(),
+            "non-empty merge output dir should be rejected"
+        );
+        let error = result.err().expect("merge result should contain an error");
         assert!(
             format!("{error:#}").contains("must be empty"),
             "unexpected error: {error:#}"
@@ -2492,7 +2576,11 @@ mod tests {
         );
 
         let mut manifest = base_manifest;
-        manifest.shards[0].relative_path = "../escape".to_string();
+        manifest
+            .shards
+            .first_mut()
+            .expect("test manifest should contain a shard")
+            .relative_path = "../escape".to_string();
         write_federated_manifest_for_test(&published, &manifest);
         let error = load_federated_search_manifest_internal(&published).unwrap_err();
         assert!(
@@ -2508,13 +2596,19 @@ mod tests {
         let mut manifest = load_federated_search_manifest_internal(&published)
             .expect("load manifest")
             .expect("manifest present");
-        manifest.shards[0].meta_fingerprint = "0".repeat(64);
+        manifest
+            .shards
+            .first_mut()
+            .expect("test manifest should contain a shard")
+            .meta_fingerprint = "0".repeat(64);
         write_federated_manifest_for_test(&published, &manifest);
 
-        let error = match open_federated_search_readers(&published, FsReloadPolicy::Manual) {
-            Ok(_) => panic!("corrupt federated shard fingerprint should be rejected"),
-            Err(error) => error,
-        };
+        let result = open_federated_search_readers(&published, FsReloadPolicy::Manual);
+        assert!(
+            result.is_err(),
+            "corrupt federated shard fingerprint should be rejected"
+        );
+        let error = result.err().expect("open result should contain an error");
         assert!(
             format!("{error:#}").contains("federated lexical shard fingerprint mismatch"),
             "unexpected fingerprint error: {error:#}"
@@ -2934,12 +3028,15 @@ mod tests {
         // Sanity check the remote-host provenance actually round-tripped:
         // a regression in normalization on either side would silently
         // pass the per-doc compare unless we pin the expected value too.
+        let first_packet_doc = packet_docs
+            .first()
+            .expect("packet fixture should emit at least one doc");
         assert_eq!(
-            packet_docs[0].source_id, "remote-host",
+            first_packet_doc.source_id, "remote-host",
             "metadata.cass.origin.source_id must be the canonical value"
         );
         assert_eq!(
-            packet_docs[0].origin_host.as_deref(),
+            first_packet_doc.origin_host.as_deref(),
             Some("ws-42.example"),
             "metadata.cass.origin.host must surface as origin_host"
         );
