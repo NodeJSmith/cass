@@ -1373,19 +1373,23 @@ mod tests {
     fn load_conversation_cache_is_scoped_by_database_path() {
         use crate::storage::sqlite::FrankenStorage;
 
-        CONVERSATION_CACHE.invalidate_all();
-
+        let shared_path = "/shared/cross-db-session.jsonl";
         let tmp_a = tempfile::TempDir::new().expect("tempdir a");
         let db_path_a = tmp_a.path().join("cass-a.db");
         let storage_a = FrankenStorage::open(&db_path_a).expect("open storage a");
         let conn_a = storage_a.raw();
+        let scope_a =
+            storage_cache_scope(&storage_a).unwrap_or_else(|| db_path_a.display().to_string());
 
         let tmp_b = tempfile::TempDir::new().expect("tempdir b");
         let db_path_b = tmp_b.path().join("cass-b.db");
         let storage_b = FrankenStorage::open(&db_path_b).expect("open storage b");
         let conn_b = storage_b.raw();
+        let scope_b =
+            storage_cache_scope(&storage_b).unwrap_or_else(|| db_path_b.display().to_string());
 
-        let shared_path = "/shared/cross-db-session.jsonl";
+        CONVERSATION_CACHE.invalidate_scoped(&scope_a, None, shared_path);
+        CONVERSATION_CACHE.invalidate_scoped(&scope_b, None, shared_path);
 
         for conn in [&conn_a, &conn_b] {
             conn.execute("INSERT INTO agents (id, slug, name, kind, created_at, updated_at) VALUES (1, 'claude_code', 'Claude Code', 'local', 0, 0)")
@@ -1427,7 +1431,8 @@ mod tests {
         assert_eq!(from_b.convo.title.as_deref(), Some("DB B Session"));
         assert_eq!(from_b.messages[0].content, "db b body");
 
-        CONVERSATION_CACHE.invalidate_all();
+        CONVERSATION_CACHE.invalidate_scoped(&scope_a, None, shared_path);
+        CONVERSATION_CACHE.invalidate_scoped(&scope_b, None, shared_path);
     }
 
     #[test]

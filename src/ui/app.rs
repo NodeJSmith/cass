@@ -148,7 +148,7 @@ use ftui::widgets::hint_ranker::{HintContext, HintRanker, RankerConfig};
 use ftui::widgets::json_view::{JsonToken, JsonView};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::{RenderItem, StatefulWidget, VirtualizedList, VirtualizedListState};
-use ftui_extras::markdown::MarkdownRenderer;
+use ftui_extras::markdown::{MarkdownRenderer, is_likely_markdown};
 
 // ---------------------------------------------------------------------------
 // Re-export ftui primitives through the adapter
@@ -9696,12 +9696,10 @@ impl CassApp {
         // If we have a cached conversation, render full messages
         if let Some(cv) = cached_detail {
             let md_width = inner_width.saturating_sub(4);
-            let md_renderer = MarkdownRenderer::new(styles.markdown_theme())
-                .with_syntax_theme(styles.syntax_highlight_theme())
-                .rule_width(md_width)
-                .table_max_width(md_width);
+            let mut md_renderer = None;
 
             let msg_count = cv.messages.len();
+            let plain_text_style = styles.style(style_system::STYLE_TEXT_PRIMARY);
             let subtle_style = styles.style(style_system::STYLE_TEXT_SUBTLE);
             let mut msg_offsets: Vec<(u32, crate::model::types::MessageRole)> =
                 Vec::with_capacity(msg_count);
@@ -9823,11 +9821,27 @@ impl CassApp {
                     // A trim() here breaks valid leading-indented markdown such as code blocks.
                     let content = msg.content.as_str();
                     if !content.trim().is_empty() {
-                        let rendered = md_renderer.render(content);
-                        for line in rendered.into_iter() {
+                        if is_likely_markdown(content).indicators == 0 {
                             let mut spans = vec![ftui::text::Span::styled("\u{258c} ", gutter_s)];
-                            spans.extend(line.spans().iter().cloned());
-                            lines.push(ftui::text::Line::from_spans(spans));
+                            for line in content.lines() {
+                                spans.push(ftui::text::Span::styled(line, plain_text_style));
+                                lines.push(ftui::text::Line::from_spans(spans));
+                                spans = vec![ftui::text::Span::styled("\u{258c} ", gutter_s)];
+                            }
+                        } else {
+                            let renderer = md_renderer.get_or_insert_with(|| {
+                                MarkdownRenderer::new(styles.markdown_theme())
+                                    .with_syntax_theme(styles.syntax_highlight_theme())
+                                    .rule_width(md_width)
+                                    .table_max_width(md_width)
+                            });
+                            let rendered = renderer.render(content);
+                            for line in rendered.into_iter() {
+                                let mut spans =
+                                    vec![ftui::text::Span::styled("\u{258c} ", gutter_s)];
+                                spans.extend(line.spans().iter().cloned());
+                                lines.push(ftui::text::Line::from_spans(spans));
+                            }
                         }
                     }
                 }
