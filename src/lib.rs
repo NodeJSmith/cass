@@ -1370,6 +1370,28 @@ pub enum SwarmCommand {
         #[arg(long, default_value = "healthy")]
         fixture_id: String,
     },
+    /// Build a read-only advisory work packet for one ready bead.
+    WorkPacket {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Read provider input from a single swarm fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+
+        /// Read provider input from a swarm fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+
+        /// Fixture id within --fixture-dir. Defaults to healthy for the pinned command shape.
+        #[arg(long, default_value = "healthy")]
+        fixture_id: String,
+
+        /// Build the packet for a specific bead id instead of the first ready bead.
+        #[arg(long)]
+        bead: Option<String>,
+    },
     /// Assemble verification evidence for recent commits or a named bead.
     Evidence {
         /// Output as JSON (`--robot` also works)
@@ -7417,6 +7439,20 @@ fn run_swarm_command(cmd: SwarmCommand, cli: &Cli) -> CliResult<()> {
             fixture_dir.as_deref(),
             &fixture_id,
         ),
+        SwarmCommand::WorkPacket {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            bead,
+        } => run_swarm_work_packet(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            bead.as_deref(),
+        ),
         SwarmCommand::Evidence {
             json,
             fixture,
@@ -7482,6 +7518,63 @@ fn run_swarm_status(
             .and_then(serde_json::Value::as_str)
         {
             println!("Recommended action: {action}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_swarm_work_packet(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    bead: Option<&str>,
+) -> CliResult<()> {
+    let structured_format = resolve_subcommand_structured_format(cli, json).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    let payload = if let Some(path) = resolve_swarm_fixture_path(fixture, fixture_dir, fixture_id)?
+    {
+        let set = crate::swarm_status::FixtureSwarmAdapterSet::from_fixture_path(&path).map_err(
+            |err| CliError {
+                code: 10,
+                kind: CliErrorKind::Config.kind_str(),
+                message: err.to_string(),
+                hint: Some("Use --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in swarm fixture.".to_string()),
+                retryable: false,
+            },
+        )?;
+        let privacy_probe = swarm_fixture_privacy_probe(&path)?;
+        let collection = set.collect_required();
+        render_swarm_work_packet_fixture(set.input(), &collection, privacy_probe.as_ref(), bead)
+    } else {
+        render_swarm_work_packet_live_partial(bead)
+    };
+
+    if let Some(fmt) = structured_format {
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!(
+            "Swarm work packet: {}",
+            payload
+                .get("summary")
+                .and_then(|summary| summary.get("recommended_action"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        );
+        if let Some(bead_id) = payload
+            .get("summary")
+            .and_then(|summary| summary.get("bead_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            println!("Bead: {bead_id}");
         }
     }
 
@@ -7641,6 +7734,27 @@ fn render_swarm_status_fixture(
         privacy_probe,
         false,
     )
+}
+
+fn render_swarm_work_packet_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
+    let status = render_swarm_status_live_partial();
+    render_swarm_work_packet_from_status(&status, bead_filter)
+}
+
+fn render_swarm_work_packet_fixture(
+    input: &crate::swarm_status::SwarmFixtureInput,
+    collection: &crate::swarm_status::SwarmSourceCollection,
+    privacy_probe: Option<&serde_json::Value>,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let status = render_swarm_status_payload(
+        input.fixture_id(),
+        input.description().unwrap_or("swarm work-packet fixture"),
+        collection,
+        privacy_probe,
+        false,
+    );
+    render_swarm_work_packet_from_status(&status, bead_filter)
 }
 
 fn render_swarm_evidence_live_partial(bead_filter: Option<&str>) -> serde_json::Value {
@@ -9421,6 +9535,490 @@ fn swarm_recommendations(
         }),
     };
     vec![recommendation]
+}
+
+fn render_swarm_work_packet_from_status(
+    status: &serde_json::Value,
+    bead_filter: Option<&str>,
+) -> serde_json::Value {
+    let selected = swarm_work_packet_select_bead(status, bead_filter);
+    let selected_bead = selected.as_ref().map(|(_, bead)| *bead);
+    let bead_id = selected_bead
+        .and_then(|bead| bead.get("id"))
+        .and_then(serde_json::Value::as_str);
+    let safe_bead_arg = bead_id.and_then(swarm_work_packet_safe_arg);
+    let build_pressure = status
+        .get("summary")
+        .and_then(|summary| summary.get("build_pressure"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let provider_partial = status
+        .get("_meta")
+        .and_then(|meta| meta.get("partial"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let safe_to_claim = selected_bead.is_some_and(|bead| {
+        bead.get("safe_to_claim")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
+    let claim_blockers = selected_bead
+        .and_then(|bead| bead.get("claim_blockers"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let readiness_state = swarm_work_packet_readiness_state(
+        selected.is_some(),
+        bead_filter.is_some() && selected.is_none(),
+        provider_partial,
+        safe_to_claim,
+        build_pressure,
+        &claim_blockers,
+    );
+    let safe_to_start = readiness_state == "ready";
+    let recommended_action =
+        swarm_work_packet_recommended_action(readiness_state, safe_bead_arg.is_some());
+    let readiness_reasons = swarm_work_packet_readiness_reasons(
+        readiness_state,
+        selected_bead,
+        build_pressure,
+        provider_partial,
+        &claim_blockers,
+    );
+    let evidence_refs = swarm_work_packet_evidence_refs(
+        readiness_state,
+        selected.as_ref().map(|(section, _)| *section),
+    );
+    let selected_bead_json = selected_bead
+        .map(swarm_work_packet_bead_summary)
+        .unwrap_or_else(|| serde_json::json!(null));
+    let suggested_reservations = if safe_to_start {
+        selected_bead
+            .map(swarm_work_packet_suggested_reservations)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let verification = selected_bead
+        .map(|bead| swarm_work_packet_verification(bead, build_pressure))
+        .unwrap_or_else(swarm_work_packet_empty_verification);
+    let coordination = swarm_work_packet_coordination(bead_id, safe_to_start);
+    let closeout = swarm_work_packet_closeout(bead_id);
+    let fallback_actions = swarm_work_packet_fallback_actions(
+        readiness_state,
+        bead_filter,
+        safe_bead_arg,
+        build_pressure,
+    );
+    let meta = status.get("_meta").unwrap_or(&serde_json::Value::Null);
+
+    serde_json::json!({
+        "schema_version": "cass.swarm.work_packet.v1",
+        "status": status.get("status").cloned().unwrap_or_else(|| serde_json::json!("partial")),
+        "_meta": {
+            "request_id": meta
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|request_id| format!("{request_id}:work-packet"))
+                .unwrap_or_else(|| "work-packet".to_string()),
+            "generated_at_ms": meta.get("generated_at_ms").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "elapsed_ms": meta.get("elapsed_ms").cloned().unwrap_or_else(|| serde_json::json!(1)),
+            "repo": meta.get("repo").cloned().unwrap_or_else(|| serde_json::json!("[UNKNOWN_REPO]")),
+            "project_key": meta.get("project_key").cloned().unwrap_or_else(|| serde_json::json!("[UNKNOWN_REPO]")),
+            "hostname": meta.get("hostname").cloned().unwrap_or_else(|| serde_json::json!("unknown-host")),
+            "partial": provider_partial,
+            "source_schema_version": status.get("schema_version").cloned().unwrap_or_else(|| serde_json::json!("unknown")),
+            "warnings": meta.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([]))
+        },
+        "filter": {
+            "bead_id": bead_filter
+        },
+        "summary": {
+            "bead_id": bead_id,
+            "safe_to_start": safe_to_start,
+            "readiness_state": readiness_state,
+            "recommended_action": recommended_action,
+            "requires_coordination": !safe_to_start,
+            "claim_blocker_count": claim_blockers.len(),
+            "suggested_reservation_count": suggested_reservations.len(),
+            "proof_command_count": verification
+                .get("commands")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+        },
+        "work_packet": {
+            "bead": selected_bead_json,
+            "readiness": {
+                "state": readiness_state,
+                "safe_to_start": safe_to_start,
+                "requires_human_confirmation": !safe_to_start,
+                "reasons": readiness_reasons,
+                "evidence_refs": evidence_refs,
+            },
+            "suggested_reservations": suggested_reservations,
+            "coordination": coordination,
+            "verification": verification,
+            "closeout": closeout,
+            "fallback_actions": fallback_actions,
+        },
+        "source_status": {
+            "summary": status.get("summary").cloned().unwrap_or_else(|| serde_json::json!({})),
+            "providers": status.get("providers").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "recommendations": status.get("recommendations").cloned().unwrap_or_else(|| serde_json::json!([])),
+        },
+        "privacy": status.get("privacy").cloned().unwrap_or_else(|| serde_json::json!({
+            "raw_session_content_included": false,
+            "mail_body_snippets_included": false,
+            "redaction_policy": "strict",
+            "redaction_applied": false
+        })),
+    })
+}
+
+fn swarm_work_packet_select_bead<'a>(
+    status: &'a serde_json::Value,
+    bead_filter: Option<&str>,
+) -> Option<(&'static str, &'a serde_json::Value)> {
+    let sections = [
+        ("beads.ready", &["beads", "ready"][..]),
+        ("beads.in_progress", &["beads", "in_progress"][..]),
+        ("beads.blocked", &["beads", "blocked"][..]),
+        ("beads.stale_candidates", &["beads", "stale_candidates"][..]),
+    ];
+
+    if let Some(filter) = bead_filter {
+        return sections.iter().find_map(|(section, path)| {
+            swarm_work_packet_array_at(status, path)?
+                .iter()
+                .find(|bead| {
+                    bead.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id == filter)
+                })
+                .map(|bead| (*section, bead))
+        });
+    }
+
+    let ready = swarm_work_packet_array_at(status, &["beads", "ready"])?;
+    ready
+        .iter()
+        .find(|bead| {
+            bead.get("safe_to_claim")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .or_else(|| ready.first())
+        .map(|bead| ("beads.ready", bead))
+}
+
+fn swarm_work_packet_array_at<'a>(
+    value: &'a serde_json::Value,
+    path: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_array()
+}
+
+fn swarm_work_packet_readiness_state(
+    has_bead: bool,
+    requested_missing: bool,
+    provider_partial: bool,
+    safe_to_claim: bool,
+    build_pressure: &str,
+    claim_blockers: &[serde_json::Value],
+) -> &'static str {
+    if requested_missing {
+        "bead-not-found"
+    } else if !has_bead {
+        "no-ready-work"
+    } else if provider_partial {
+        "provider-partial"
+    } else if build_pressure == "high" {
+        "build-pressure-high"
+    } else if safe_to_claim && claim_blockers.is_empty() {
+        "ready"
+    } else {
+        "blocked"
+    }
+}
+
+fn swarm_work_packet_recommended_action(
+    readiness_state: &str,
+    has_safe_bead_arg: bool,
+) -> &'static str {
+    match readiness_state {
+        "ready" if has_safe_bead_arg => "claim-ready-bead",
+        "ready" => "inspect-bead-id",
+        "blocked" => "coordinate-before-claim",
+        "build-pressure-high" => "wait-for-rch-capacity",
+        "provider-partial" => "inspect-unavailable-providers",
+        "bead-not-found" => "inspect-bead",
+        _ => "no-ready-work",
+    }
+}
+
+fn swarm_work_packet_readiness_reasons(
+    readiness_state: &str,
+    bead: Option<&serde_json::Value>,
+    build_pressure: &str,
+    provider_partial: bool,
+    claim_blockers: &[serde_json::Value],
+) -> Vec<serde_json::Value> {
+    let mut reasons = Vec::new();
+    if bead.is_none() {
+        reasons.push(serde_json::json!("no-selected-bead"));
+    }
+    if provider_partial {
+        reasons.push(serde_json::json!("provider-status-partial"));
+    }
+    if build_pressure == "high" {
+        reasons.push(serde_json::json!("build-pressure-high"));
+    }
+    reasons.extend(claim_blockers.iter().cloned());
+    if readiness_state == "ready" {
+        reasons.push(serde_json::json!("ready-bead-without-claim-blockers"));
+    }
+    reasons
+}
+
+fn swarm_work_packet_evidence_refs(
+    readiness_state: &str,
+    section: Option<&'static str>,
+) -> Vec<serde_json::Value> {
+    let mut refs = Vec::new();
+    if let Some(section) = section {
+        refs.push(serde_json::json!(format!("{section}[0]")));
+    }
+    refs.push(serde_json::json!("summary.build_pressure"));
+    refs.push(serde_json::json!("providers"));
+    if matches!(readiness_state, "blocked" | "build-pressure-high") {
+        refs.push(serde_json::json!("reservations"));
+        refs.push(serde_json::json!("git.dirty_paths"));
+    }
+    refs
+}
+
+fn swarm_work_packet_bead_summary(bead: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": bead.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "title": bead.get("title").cloned().unwrap_or(serde_json::Value::Null),
+        "status": bead.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "priority": bead.get("priority").cloned().unwrap_or(serde_json::Value::Null),
+        "issue_type": bead.get("issue_type").cloned().unwrap_or(serde_json::Value::Null),
+        "labels": bead.get("labels").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "safe_to_claim": bead.get("safe_to_claim").cloned().unwrap_or_else(|| serde_json::json!(false)),
+        "claim_blockers": bead.get("claim_blockers").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "recommended_action": bead.get("recommended_action").cloned().unwrap_or(serde_json::Value::Null),
+        "owners": bead.get("owners").cloned().unwrap_or_else(|| serde_json::json!([])),
+    })
+}
+
+fn swarm_work_packet_suggested_reservations(bead: &serde_json::Value) -> Vec<serde_json::Value> {
+    let labels = swarm_work_packet_labels(bead);
+    let bead_id = bead
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("selected-bead");
+    let mut reservations = Vec::new();
+    if labels.iter().any(|label| label == "docs") {
+        reservations.push(swarm_work_packet_reservation("docs/**", bead_id, "medium"));
+    }
+    if labels.iter().any(|label| label == "robot-json") {
+        reservations.push(swarm_work_packet_reservation(
+            "tests/golden/robot*/**",
+            bead_id,
+            "medium",
+        ));
+    }
+    if labels.iter().any(|label| label == "swarm") {
+        reservations.push(swarm_work_packet_reservation("src/lib.rs", bead_id, "low"));
+        reservations.push(swarm_work_packet_reservation(
+            "tests/swarm_status_contract.rs",
+            bead_id,
+            "medium",
+        ));
+        reservations.push(swarm_work_packet_reservation(
+            "tests/fixtures/swarm_status/**",
+            bead_id,
+            "medium",
+        ));
+    }
+    if labels
+        .iter()
+        .any(|label| matches!(label.as_str(), "testing" | "e2e"))
+    {
+        reservations.push(swarm_work_packet_reservation("tests/**", bead_id, "low"));
+    }
+    reservations
+}
+
+fn swarm_work_packet_reservation(
+    path_pattern: &str,
+    bead_id: &str,
+    confidence: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "path_pattern": path_pattern,
+        "exclusive": true,
+        "reason": bead_id,
+        "source": "label-heuristic",
+        "confidence": confidence,
+    })
+}
+
+fn swarm_work_packet_labels(bead: &serde_json::Value) -> Vec<String> {
+    bead.get("labels")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn swarm_work_packet_verification(
+    bead: &serde_json::Value,
+    build_pressure: &str,
+) -> serde_json::Value {
+    let labels = swarm_work_packet_labels(bead);
+    let mut commands = Vec::new();
+    if labels.iter().any(|label| label == "swarm") {
+        commands.push("rch exec -- env CARGO_TARGET_DIR=/tmp/cass-swarm-work-packet-target cargo test --test swarm_status_contract -- --nocapture".to_string());
+    }
+    if labels.iter().any(|label| label == "robot-json") {
+        commands.push("rch exec -- env CARGO_TARGET_DIR=/tmp/cass-golden-target cargo test --test golden_robot_json --test golden_robot_docs".to_string());
+    }
+    if commands.is_empty() {
+        commands.push(
+            "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo check --all-targets"
+                .to_string(),
+        );
+    }
+    commands.push(
+        "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo clippy --all-targets -- -D warnings"
+            .to_string(),
+    );
+    commands.push(
+        "rch exec -- env CARGO_TARGET_DIR=/tmp/cass-check-target cargo fmt --check".to_string(),
+    );
+
+    serde_json::json!({
+        "commands": commands,
+        "expected_artifacts": [
+            "stdout/stderr transcript",
+            "exit status",
+            "git diff --check result",
+            "proof summary in bead closeout"
+        ],
+        "rch_required": true,
+        "target_dir_hint": "/tmp/cass-work-packet-target",
+        "rationale": if build_pressure == "high" {
+            "Defer expensive verification until build pressure drops; keep commands for the later proof pass."
+        } else {
+            "Use focused swarm contract proof first, then standard all-target gates when code changed."
+        },
+    })
+}
+
+fn swarm_work_packet_empty_verification() -> serde_json::Value {
+    serde_json::json!({
+        "commands": [],
+        "expected_artifacts": [],
+        "rch_required": true,
+        "target_dir_hint": "/tmp/cass-work-packet-target",
+        "rationale": "No bead was selected, so no verification plan was generated.",
+    })
+}
+
+fn swarm_work_packet_coordination(bead_id: Option<&str>, safe_to_start: bool) -> serde_json::Value {
+    let bead_arg = bead_id
+        .and_then(swarm_work_packet_safe_arg)
+        .unwrap_or("[BEAD_ID]");
+    serde_json::json!({
+        "agent_mail_subject": format!("[coord] Claiming {bead_arg}"),
+        "body_template": format!(
+            "Claiming `{bead_arg}`. Scope, file reservations, and proof commands come from `cass swarm work-packet --json --bead {bead_arg}`."
+        ),
+        "ack_required": false,
+        "send_before_editing": safe_to_start,
+        "evidence_refs": ["work_packet.readiness", "work_packet.suggested_reservations"],
+    })
+}
+
+fn swarm_work_packet_closeout(bead_id: Option<&str>) -> serde_json::Value {
+    let bead_arg = bead_id
+        .and_then(swarm_work_packet_safe_arg)
+        .unwrap_or("[BEAD_ID]");
+    serde_json::json!({
+        "beads_command": format!("br close {bead_arg} --json"),
+        "agent_mail_required": true,
+        "proof_refs_required": true,
+        "commit_subject_template": format!("type(scope): summary ({bead_arg})"),
+    })
+}
+
+fn swarm_work_packet_fallback_actions(
+    readiness_state: &str,
+    bead_filter: Option<&str>,
+    safe_bead_arg: Option<&str>,
+    build_pressure: &str,
+) -> Vec<serde_json::Value> {
+    match readiness_state {
+        "ready" => vec![serde_json::json!({
+            "kind": "claim",
+            "command": safe_bead_arg
+                .map(|bead| format!("br update {bead} --status in_progress --json"))
+                .unwrap_or_else(|| "br show [BEAD_ID] --json".to_string()),
+            "requires_human_confirmation": false,
+        })],
+        "blocked" => vec![serde_json::json!({
+            "kind": "coordinate",
+            "command": safe_bead_arg
+                .map(|bead| format!("br show {bead} --json"))
+                .unwrap_or_else(|| "br ready --json".to_string()),
+            "requires_human_confirmation": true,
+        })],
+        "build-pressure-high" => vec![serde_json::json!({
+            "kind": "wait-for-capacity",
+            "command": "rch status",
+            "requires_human_confirmation": false,
+            "observed_build_pressure": build_pressure,
+        })],
+        "bead-not-found" => vec![serde_json::json!({
+            "kind": "inspect-bead",
+            "command": bead_filter
+                .and_then(swarm_work_packet_safe_arg)
+                .map(|bead| format!("br show {bead} --json"))
+                .unwrap_or_else(|| "br ready --json".to_string()),
+            "requires_human_confirmation": false,
+        })],
+        "provider-partial" => vec![serde_json::json!({
+            "kind": "inspect-status",
+            "command": "cass swarm status --json",
+            "requires_human_confirmation": false,
+        })],
+        _ => vec![serde_json::json!({
+            "kind": "list-ready",
+            "command": "br ready --json",
+            "requires_human_confirmation": false,
+        })],
+    }
+}
+
+fn swarm_work_packet_safe_arg(value: &str) -> Option<&str> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 fn swarm_age_seconds(ts: &str) -> Option<u64> {

@@ -15,6 +15,13 @@ The initial command name is:
 cass swarm status --json
 ```
 
+The first advisory planning command built on that status payload is:
+
+```bash
+cass swarm work-packet --json
+cass swarm work-packet --json --bead coding_agent_session_search-example
+```
+
 The command is advisory. It does not claim beads, release reservations, kill
 processes, run builds, repair indexes, mutate git state, or scrape raw private
 session content. It reports what it can prove, names the source of each section,
@@ -80,6 +87,60 @@ JSON error envelope with `err.kind="swarm-unsupported-format"`.
 Provider fixtures must never contact live Agent Mail, run git commands against a
 remote, or inspect private session logs. They are for deterministic tests and
 golden generation.
+
+## Work Packet Surface
+
+`cass swarm work-packet --json` is a read-only projection over
+`cass swarm status --json`. It selects the first safe ready bead, or a requested
+`--bead <id>`, and returns a scoped advisory packet for one agent. It must not
+claim the bead, reserve files, send Agent Mail, or run verification commands.
+
+Top-level shape:
+
+```json
+{
+  "schema_version": "cass.swarm.work_packet.v1",
+  "status": "ok",
+  "_meta": {
+    "source_schema_version": "cass.swarm.status.v1"
+  },
+  "filter": {"bead_id": null},
+  "summary": {
+    "bead_id": "coding_agent_session_search-example",
+    "safe_to_start": true,
+    "readiness_state": "ready",
+    "recommended_action": "claim-ready-bead",
+    "requires_coordination": false,
+    "claim_blocker_count": 0,
+    "suggested_reservation_count": 2,
+    "proof_command_count": 3
+  },
+  "work_packet": {
+    "bead": {},
+    "readiness": {},
+    "suggested_reservations": [],
+    "coordination": {},
+    "verification": {},
+    "closeout": {},
+    "fallback_actions": []
+  },
+  "source_status": {},
+  "privacy": {}
+}
+```
+
+`readiness_state` is branchable: `ready`, `blocked`,
+`build-pressure-high`, `provider-partial`, `bead-not-found`, or
+`no-ready-work`. Only `ready` sets `summary.safe_to_start=true`. Suggested file
+reservations are heuristics derived from labels and existing status evidence;
+they are not leases. Operators and agents still create real reservations through
+Agent Mail. Verification commands must use the project rch command shapes, and
+high build pressure changes the recommendation to `wait-for-rch-capacity`
+without deleting the later proof plan.
+
+The work packet closeout section may include commands such as `br close ...`,
+but these remain suggestions. Agents still need an artifact-backed proof summary,
+an Agent Mail closeout, and the normal Beads state transition.
 
 ## Exit Semantics
 

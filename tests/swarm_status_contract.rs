@@ -345,6 +345,207 @@ fn swarm_status_scenario_invariants_are_pinned() {
 }
 
 #[test]
+fn swarm_work_packet_cli_builds_ready_read_only_packet() -> Result<(), Box<dyn Error>> {
+    let fixture_path = repo_path("tests/fixtures/swarm_status/healthy.inputs.json");
+    let output = run_swarm_work_packet_fixture(&fixture_path, None)?;
+
+    require_value_eq(
+        get_path(&output, &["schema_version"]),
+        json!("cass.swarm.work_packet.v1"),
+        "schema version",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "bead_id"]),
+        json!("cass-ready-1"),
+        "selected bead",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "safe_to_start"]),
+        json!(true),
+        "safe_to_start",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness_state"]),
+        json!("ready"),
+        "readiness state",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("claim-ready-bead"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(
+            &output,
+            &["work_packet", "coordination", "send_before_editing"],
+        ),
+        json!(true),
+        "coordination send gate",
+    )?;
+
+    let reservations = get_path(&output, &["work_packet", "suggested_reservations"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("suggested reservations missing"))?;
+    require(
+        reservations.iter().any(|reservation| {
+            reservation.get("path_pattern").and_then(Value::as_str) == Some("docs/**")
+        }),
+        "docs label should suggest docs reservation",
+    )?;
+    require(
+        reservations.iter().any(|reservation| {
+            reservation.get("path_pattern").and_then(Value::as_str) == Some("src/lib.rs")
+        }),
+        "swarm label should suggest existing swarm source reservation",
+    )?;
+
+    let commands = get_path(&output, &["work_packet", "verification", "commands"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("verification commands missing"))?;
+    require(
+        commands.iter().any(|command| {
+            command
+                .as_str()
+                .is_some_and(|text| text.contains("cargo test --test swarm_status_contract"))
+        }),
+        "swarm packet should include focused swarm contract proof",
+    )?;
+    require(
+        commands.iter().all(|command| {
+            command
+                .as_str()
+                .is_some_and(|text| text.starts_with("rch exec -- env "))
+        }),
+        "verification commands must use rch",
+    )?;
+    assert_no_forbidden_fixture_leaks("work-packet-healthy", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_work_packet_cli_blocks_reserved_dirty_ready_work() -> Result<(), Box<dyn Error>> {
+    let fixture_path = repo_path("tests/fixtures/swarm_status/reservation_conflict.inputs.json");
+    let output = run_swarm_work_packet_fixture(&fixture_path, None)?;
+
+    require_value_eq(
+        get_path(&output, &["summary", "bead_id"]),
+        json!("cass-ready-conflict"),
+        "selected bead",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "safe_to_start"]),
+        json!(false),
+        "safe_to_start",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness_state"]),
+        json!("blocked"),
+        "readiness state",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("coordinate-before-claim"),
+        "recommended action",
+    )?;
+    require_value_eq(
+        get_path(&output, &["work_packet", "suggested_reservations"]),
+        json!([]),
+        "blocked packets should not suggest new reservations",
+    )?;
+
+    let reasons = get_path(&output, &["work_packet", "readiness", "reasons"])
+        .and_then(Value::as_array)
+        .ok_or_else(|| test_error("readiness reasons missing"))?;
+    require(
+        reasons
+            .iter()
+            .any(|reason| reason.as_str() == Some("active-reservation")),
+        "reservation blocker missing",
+    )?;
+    require(
+        reasons
+            .iter()
+            .any(|reason| reason.as_str() == Some("dirty-peer-work")),
+        "dirty peer blocker missing",
+    )?;
+    assert_no_forbidden_fixture_leaks("work-packet-conflict", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_work_packet_cli_defers_when_build_pressure_is_high() -> Result<(), Box<dyn Error>> {
+    let fixture_path = repo_path("tests/fixtures/swarm_status/build_pressure.inputs.json");
+    let output = run_swarm_work_packet_fixture(&fixture_path, None)?;
+
+    require_value_eq(
+        get_path(&output, &["summary", "readiness_state"]),
+        json!("build-pressure-high"),
+        "readiness state",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("wait-for-rch-capacity"),
+        "recommended action",
+    )?;
+    let fallback_command = get_path(&output, &["work_packet", "fallback_actions"])
+        .and_then(Value::as_array)
+        .and_then(|actions| actions.first())
+        .and_then(|action| action.get("command"))
+        .cloned();
+    require_value_eq(
+        fallback_command.as_ref(),
+        json!("rch status"),
+        "fallback command",
+    )?;
+    require_value_eq(
+        get_path(&output, &["work_packet", "verification", "rch_required"]),
+        json!(true),
+        "rch required",
+    )?;
+    assert_no_forbidden_fixture_leaks("work-packet-build-pressure", &output);
+    Ok(())
+}
+
+#[test]
+fn swarm_work_packet_cli_reports_missing_requested_bead() -> Result<(), Box<dyn Error>> {
+    let fixture_path = repo_path("tests/fixtures/swarm_status/healthy.inputs.json");
+    let output = run_swarm_work_packet_fixture(&fixture_path, Some("cass-missing"))?;
+
+    require_value_eq(
+        get_path(&output, &["filter", "bead_id"]),
+        json!("cass-missing"),
+        "filter bead",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "bead_id"]),
+        json!(null),
+        "selected bead",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "readiness_state"]),
+        json!("bead-not-found"),
+        "readiness state",
+    )?;
+    require_value_eq(
+        get_path(&output, &["summary", "recommended_action"]),
+        json!("inspect-bead"),
+        "recommended action",
+    )?;
+    let fallback_command = get_path(&output, &["work_packet", "fallback_actions"])
+        .and_then(Value::as_array)
+        .and_then(|actions| actions.first())
+        .and_then(|action| action.get("command"))
+        .cloned();
+    require_value_eq(
+        fallback_command.as_ref(),
+        json!("br show cass-missing --json"),
+        "fallback command",
+    )?;
+    assert_no_forbidden_fixture_leaks("work-packet-missing-bead", &output);
+    Ok(())
+}
+
+#[test]
 fn swarm_evidence_cli_links_committed_bead_to_proof_and_mail() -> Result<(), Box<dyn Error>> {
     let (_tmp, fixture_path) = write_swarm_evidence_fixture(
         "evidence-linked",
@@ -1068,6 +1269,30 @@ fn run_swarm_status_fixture(fixture_path: &Path) -> Result<Value, Box<dyn Error>
         output.stderr.is_empty(),
         format!(
             "swarm status should not log to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )?;
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn run_swarm_work_packet_fixture(
+    fixture_path: &Path,
+    bead: Option<&str>,
+) -> Result<Value, Box<dyn Error>> {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("cass")); // ubs:ignore — fixed test binary from assert_cmd.
+    cmd.env("CODING_AGENT_SEARCH_NO_UPDATE_PROMPT", "1");
+    cmd.args(["swarm", "work-packet", "--json", "--fixture"]);
+    cmd.arg(fixture_path);
+    if let Some(bead_id) = bead {
+        cmd.args(["--bead", bead_id]);
+    }
+
+    let assert = cmd.assert().success();
+    let output = assert.get_output();
+    require(
+        output.stderr.is_empty(),
+        format!(
+            "swarm work-packet should not log to stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         ),
     )?;
