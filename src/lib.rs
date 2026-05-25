@@ -5849,8 +5849,6 @@ async fn execute_cli(
         | Commands::Triage { .. }
         | Commands::View { .. }
         | Commands::Pages { .. }
-        | Commands::Mirror(..)
-        | Commands::Import(..)
         | Commands::Analytics(..) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
