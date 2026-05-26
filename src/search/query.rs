@@ -12218,8 +12218,8 @@ mod tests {
 
     #[test]
     fn sqlite_message_scan_preserves_boolean_or_precedence() {
-        let simple_or = SearchClient::sqlite_message_scan_query("alpha OR beta")
-            .expect("simple OR scan query");
+        let simple_or =
+            SearchClient::sqlite_message_scan_query("alpha OR beta").expect("simple OR scan query");
         assert!(SearchClient::sqlite_message_scan_score("alpha", &simple_or) > 0.0);
         assert!(SearchClient::sqlite_message_scan_score("beta", &simple_or) > 0.0);
         assert_eq!(
