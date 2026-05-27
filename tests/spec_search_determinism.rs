@@ -99,7 +99,7 @@ fn run_search(data_dir: &Path, args: &[&str]) -> Result<Value, Box<dyn Error>> {
 /// Extract the `hits` array. The hit identity payload (source_path,
 /// line_number, score, snippet, title, agent) is the user-visible projection
 /// whose determinism this test guards; volatile `_meta` is not compared.
-fn hits<'a>(response: &'a Value) -> Result<&'a [Value], Box<dyn Error>> {
+fn hits(response: &Value) -> Result<&[Value], Box<dyn Error>> {
     response
         .get("hits")
         .and_then(Value::as_array)
