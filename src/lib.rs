@@ -15071,6 +15071,7 @@ const CLI_DIAG_DB_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 struct StateDbSnapshot {
     conversation_count: i64,
     message_count: i64,
+    last_scan_ts: Option<i64>,
     last_indexed_at: Option<i64>,
     opened: bool,
     open_error: Option<String>,
@@ -15123,6 +15124,14 @@ fn probe_state_db(
     snapshot.last_indexed_at = franken_query_row_map_retry(
         &conn,
         "SELECT value FROM meta WHERE key = 'last_indexed_at'",
+        params![],
+        |r| r.get_typed::<String>(0),
+    )
+    .ok()
+    .and_then(|s| s.parse::<i64>().ok());
+    snapshot.last_scan_ts = franken_query_row_map_retry(
+        &conn,
+        "SELECT value FROM meta WHERE key = 'last_scan_ts'",
         params![],
         |r| r.get_typed::<String>(0),
     )
@@ -15614,25 +15623,18 @@ fn state_meta_json_for_health(
     )
 }
 
-fn status_should_skip_db_open(db_path: &Path) -> bool {
-    std::fs::metadata(db_path).ok().is_some_and(|metadata| {
-        metadata.is_file() && metadata.len() > STATUS_COUNT_SCAN_MAX_DB_BYTES
-    })
-}
-
 fn state_meta_json_for_status(
     data_dir: &Path,
     db_path: &Path,
     stale_threshold: u64,
 ) -> serde_json::Value {
-    let skip_db_open = status_should_skip_db_open(db_path);
     state_meta_json_inner(
         data_dir,
         db_path,
         stale_threshold,
         true,
         None,
-        skip_db_open,
+        false,
         true,
     )
 }
@@ -15723,6 +15725,7 @@ fn state_meta_json_inner(
     };
     let conversation_count = db_snapshot.conversation_count;
     let message_count = db_snapshot.message_count;
+    let last_scan_ts = db_snapshot.last_scan_ts;
     let mut last_indexed_at = db_snapshot.last_indexed_at;
     let db_opened = db_snapshot.opened;
     let db_open_error = db_snapshot.open_error;
@@ -15833,6 +15836,21 @@ fn state_meta_json_inner(
             },
         }
     });
+    if !assets.lexical.rebuilding
+        && last_scan_ts.is_some_and(|scan_ts| {
+            last_indexed_at
+                .map(|indexed_at| scan_ts > indexed_at.saturating_add(1_000))
+                .unwrap_or(true)
+        })
+    {
+        assets.lexical.status = "stale";
+        assets.lexical.fresh = false;
+        assets.lexical.stale = true;
+        assets.lexical.status_reason = Some(
+            "last_scan_ts is newer than last_indexed_at; a prior scan advanced without a completed projection into the searchable index"
+                .to_string(),
+        );
+    }
     let not_initialized = cass_not_initialized(
         db_exists,
         lexical_index_initialized,
@@ -65720,6 +65738,9 @@ mod cli_read_db_tests {
         storage
             .set_last_indexed_at(1_733_000_000_000)
             .expect("set last_indexed_at");
+        storage
+            .set_last_scan_ts(1_732_999_999_000)
+            .expect("set last_scan_ts");
         drop(storage);
         (temp, db_path)
     }
@@ -65800,6 +65821,7 @@ mod cli_read_db_tests {
 
         assert!(snapshot.opened, "state probe should open the database");
         assert_eq!(snapshot.last_indexed_at, Some(1_733_000_000_000));
+        assert_eq!(snapshot.last_scan_ts, Some(1_732_999_999_000));
         assert!(snapshot.counts_skipped, "count scan should remain disabled");
         assert_eq!(snapshot.conversation_count, 0);
         assert_eq!(snapshot.message_count, 0);
@@ -65811,7 +65833,7 @@ mod cli_read_db_tests {
     }
 
     #[test]
-    fn status_state_skips_open_for_large_regular_db_probe() {
+    fn status_state_probes_large_regular_db_instead_of_trusting_index_mtime() {
         let temp = TempDir::new().expect("tempdir");
         let db_path = temp.path().join("agent_search.db");
         let file = std::fs::File::create(&db_path).expect("create sparse db placeholder");
@@ -65826,19 +65848,47 @@ mod cli_read_db_tests {
             .expect("database state");
 
         assert_eq!(database.get("exists").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(database.get("opened").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(
             database.get("open_skipped").and_then(|v| v.as_bool()),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
-            database.get("counts_skipped").and_then(|v| v.as_bool()),
-            Some(true)
+            database.get("opened").and_then(|v| v.as_bool()),
+            Some(false)
         );
         assert!(
             database
                 .get("open_error")
-                .is_some_and(serde_json::Value::is_null)
+                .and_then(|v| v.as_str())
+                .is_some_and(|err| !err.is_empty())
+        );
+    }
+
+    #[test]
+    fn status_state_marks_scan_ahead_of_projection_stale() {
+        let (temp, db_path) = seed_cli_db();
+        {
+            let storage = FrankenStorage::open(&db_path).expect("reopen cass db");
+            storage
+                .set_last_scan_ts(1_733_000_010_000)
+                .expect("set scan ahead");
+        }
+
+        let state = state_meta_json_for_status(temp.path(), &db_path, 60);
+        let index = state
+            .get("index")
+            .and_then(serde_json::Value::as_object)
+            .expect("index state");
+
+        assert_eq!(index.get("fresh").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(index.get("stale").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(index.get("status").and_then(|v| v.as_str()), Some("stale"));
+        assert!(
+            index
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|reason| reason.contains("last_scan_ts is newer")),
+            "status reason should identify the scan/projection gap: {index:?}"
         );
     }
 
