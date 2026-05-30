@@ -2619,10 +2619,23 @@ mod watch_startup_preflight {
         /// Records the active step so the watchdog can compute
         /// `now - step_started_at_ms`. Must NOT be called from within
         /// the watchdog thread.
+        ///
+        /// Memory ordering: `step_started_at_ms` is written first with
+        /// `Relaxed`, then `current_step_idx` with `Release`. The
+        /// watchdog reads `current_step_idx` with `Acquire` and
+        /// `step_started_at_ms` with `Relaxed`. The Release–Acquire pair
+        /// guarantees that once the watchdog observes the new
+        /// `current_step_idx` it also observes the `step_started_at_ms`
+        /// written before it. Without this pairing, a weakly-ordered
+        /// CPU (AArch64) could let the watchdog see the new step index
+        /// but the old (or zero) timestamp, computing a falsely enormous
+        /// `elapsed_ms` and firing a spurious timeout.
         pub(super) fn enter(&self, step_idx: u8, started_at_ms: i64) {
-            self.current_step_idx.store(step_idx, Ordering::Relaxed);
+            // Write timestamp BEFORE step index so the Release on
+            // `current_step_idx` acts as the synchronisation point.
             self.step_started_at_ms
                 .store(started_at_ms, Ordering::Relaxed);
+            self.current_step_idx.store(step_idx, Ordering::Release);
         }
 
         /// Documented API for explicitly quiescing the watchdog after a
@@ -2660,6 +2673,16 @@ mod watch_startup_preflight {
     }
 
     impl WatchStartupPreflightWatchdog {
+        /// `metadata_write_lock` is the same `Arc<Mutex<()>>` that the
+        /// heartbeat thread and `IndexRunLockGuard::write_metadata` take
+        /// before every lock-file write. Passing it here ensures the
+        /// watchdog's `_TIMEOUT` rewrite cannot be overwritten by a
+        /// concurrent heartbeat tick: without this lock the heartbeat
+        /// could clobber the `_TIMEOUT` breadcrumb between the watchdog's
+        /// `set_len(0)` and `write_all` (or just after), leaving
+        /// operators with an unmodified `phase=` in the lock file even
+        /// though `process::exit(70)` was called.
+        #[allow(clippy::too_many_arguments)]
         pub(super) fn start(
             state: Arc<WatchStartupPreflightState>,
             taxonomy: &'static [&'static str],
@@ -2668,6 +2691,7 @@ mod watch_startup_preflight {
             timeout: Duration,
             poll_interval: Duration,
             policy: TimeoutPolicy,
+            metadata_write_lock: std::sync::Arc<std::sync::Mutex<()>>,
         ) -> Self {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_flag = Arc::clone(&stop);
@@ -2677,7 +2701,11 @@ mod watch_startup_preflight {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
                     }
-                    let step_idx = state.current_step_idx.load(Ordering::Relaxed);
+                    // Acquire pairs with the Release in `enter()` so
+                    // that once we see the new step index we are also
+                    // guaranteed to see the `step_started_at_ms` that
+                    // was stored (Relaxed) before the Release store.
+                    let step_idx = state.current_step_idx.load(Ordering::Acquire);
                     if step_idx == NO_STEP {
                         continue;
                     }
@@ -2690,9 +2718,10 @@ mod watch_startup_preflight {
                     // Race guard: if the main thread has already
                     // advanced past this step (exit -> NO_STEP -> next
                     // enter sets a different idx) then `step_idx` here
-                    // may be stale. Re-read; if the active step
-                    // changed, skip.
-                    let current_again = state.current_step_idx.load(Ordering::Relaxed);
+                    // may be stale. Re-read with Acquire so we also
+                    // observe any `step_started_at_ms` update the main
+                    // thread wrote before advancing past this step.
+                    let current_again = state.current_step_idx.load(Ordering::Acquire);
                     if current_again != step_idx {
                         continue;
                     }
@@ -2724,6 +2753,15 @@ mod watch_startup_preflight {
                     // `tripped=true` so the test and any same-process
                     // observer can treat the flag as "timeout metadata
                     // is already durable".
+                    //
+                    // We hold `metadata_write_lock` across the entire
+                    // rewrite. The heartbeat thread and
+                    // `IndexRunLockGuard::write_metadata` both take the
+                    // same lock before every lock-file write, so this
+                    // prevents a concurrent heartbeat tick from
+                    // clobbering the `_TIMEOUT` breadcrumb after we
+                    // truncate but before we finish writing.
+                    let _metadata_guard = metadata_write_lock.lock().ok();
                     if let Err(err) =
                         rewrite_lock_phase_for_timeout(&lock_path, &timeout_phase, now_ms)
                     {
@@ -11818,6 +11856,9 @@ pub fn run_index(
             watch_startup_preflight::op_timeout(),
             std::time::Duration::from_secs(5),
             PreflightTimeoutPolicy::Abort,
+            // INV3: pass the shared write lock so the watchdog's
+            // `_TIMEOUT` rewrite is serialised with the heartbeat.
+            Arc::clone(&index_run_lock.metadata_write_lock),
         ))
     } else {
         None
@@ -27686,6 +27727,9 @@ mod tests {
             .context("cleanup_orphan_fk_rows must be in the taxonomy")?;
 
         let state = super::WatchStartupPreflightState::new();
+        // Pass a dedicated write lock (matches the production call
+        // site) so the INV3 fix compiles and is exercised here.
+        let test_write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
         let _watchdog = super::WatchStartupPreflightWatchdog::start(
             Arc::clone(&state),
             super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
@@ -27694,6 +27738,7 @@ mod tests {
             std::time::Duration::from_millis(100),
             std::time::Duration::from_millis(25),
             super::PreflightTimeoutPolicy::RecordOnly,
+            test_write_lock,
         );
 
         // Simulate the wedge: claim we entered the step `now` and
@@ -27790,6 +27835,93 @@ mod tests {
         assert!(
             post_updated >= pre_updated,
             "watchdog must bump updated_at_ms= (pre={pre_updated}, post={post_updated}); without this operators can't distinguish a fresh TIMEOUT from a stale lock"
+        );
+
+        drop(guard);
+        Ok(())
+    }
+
+    /// Regression for INV3 (v0.6.9 hardening).
+    ///
+    /// When the watchdog fires it holds `metadata_write_lock` across
+    /// the full `rewrite_lock_phase_for_timeout` call. This serialises
+    /// the watchdog's `_TIMEOUT` rewrite against the heartbeat thread,
+    /// which also takes the same lock before every write. Without this
+    /// serialisation the heartbeat can read, then overwrite, the lock
+    /// file between the watchdog's `set_len(0)` and `write_all`, leaving
+    /// the lock file without the `_TIMEOUT` breadcrumb even though
+    /// `process::exit(70)` was called.
+    ///
+    /// The test simulates the race by:
+    /// 1. Pre-holding `metadata_write_lock` from the test thread.
+    /// 2. Starting the watchdog (RecordOnly) with the same lock.
+    /// 3. Entering a step and verifying the watchdog trips but cannot
+    ///    write the lock file while the lock is held.
+    /// 4. Releasing the lock and confirming the rewrite then lands.
+    #[test]
+    fn watchdog_timeout_rewrite_serialised_by_metadata_write_lock() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let db_path = tmp.path().join("agent_search.db");
+        std::fs::write(&db_path, b"placeholder")?;
+        let guard =
+            acquire_index_run_lock(tmp.path(), &db_path, SearchMaintenanceMode::WatchStartup)?;
+        let lock_path = tmp.path().join("index-run.lock");
+
+        let metadata_write_lock = std::sync::Arc::clone(&guard.metadata_write_lock);
+
+        // Pre-hold the lock so the watchdog's rewrite is blocked.
+        let held = metadata_write_lock
+            .lock()
+            .expect("metadata_write_lock poisoned");
+
+        let wedged = "watch_startup:cleanup_orphan_fk_rows";
+        let step_idx = super::watch_startup_step_idx(wedged)
+            .context("cleanup_orphan_fk_rows must be in taxonomy")?;
+
+        let state = super::WatchStartupPreflightState::new();
+        let _watchdog = super::WatchStartupPreflightWatchdog::start(
+            Arc::clone(&state),
+            super::WATCH_STARTUP_SUB_PHASE_TAXONOMY,
+            lock_path.clone(),
+            tmp.path().to_path_buf(),
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(10),
+            super::PreflightTimeoutPolicy::RecordOnly,
+            std::sync::Arc::clone(&metadata_write_lock),
+        );
+
+        let started_at_ms = FrankenStorage::now_millis();
+        state.enter(step_idx, started_at_ms);
+
+        // Wait long enough for the watchdog to have tripped internally
+        // (it sets `tripped` after acquiring the lock, so it must wait).
+        // 400 ms >> 50 ms timeout + 10 ms poll + acquisition delay.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+
+        // Lock file must NOT yet have _TIMEOUT because the watchdog is
+        // blocked waiting for `metadata_write_lock`.
+        let before_release = std::fs::read_to_string(&lock_path).unwrap_or_default();
+        assert!(
+            !before_release.contains("_TIMEOUT"),
+            "watchdog must not rewrite the lock file while metadata_write_lock is held; \
+             got: {before_release:?}"
+        );
+
+        // Release the lock. Now the watchdog can complete its write.
+        drop(held);
+
+        let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let after_release = loop {
+            let raw = std::fs::read_to_string(&lock_path).unwrap_or_default();
+            if raw.contains("_TIMEOUT") || std::time::Instant::now() > read_deadline {
+                break raw;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            after_release.contains("_TIMEOUT"),
+            "watchdog must rewrite lock file to _TIMEOUT after metadata_write_lock is released; \
+             got: {after_release:?}"
         );
 
         drop(guard);
