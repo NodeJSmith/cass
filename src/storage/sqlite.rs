@@ -3822,6 +3822,18 @@ where
     ))
 }
 
+pub(crate) fn error_message_indicates_populated_fts_shadow_without_rowid_reload(
+    message: &str,
+) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let mentions_populated_without_rowid_shadow = (lower
+        .contains("loading populated without rowid table")
+        || lower.contains("reloading populated without rowid table"))
+        && (lower.contains("table `fts_messages_") || lower.contains("table fts_messages_"));
+
+    mentions_populated_without_rowid_shadow && lower.contains("not yet supported")
+}
+
 impl FrankenStorage {
     fn new(conn: FrankenConnection, db_path: PathBuf) -> Self {
         Self::new_with_shared_caches(
@@ -4241,12 +4253,25 @@ impl FrankenStorage {
         // Log at warn level so the failure is visible instead of silently
         // swallowed, and set a flag for callers that need to periodically
         // recycle the connection.
-        let autocommit_pragma =
-            disable_autocommit_retain(|pragma| self.conn.execute(pragma).map(|_| ()))?;
-        tracing::debug!(
-            pragma = autocommit_pragma,
-            "disabled frankensqlite autocommit_retain for storage connection"
-        );
+        match disable_autocommit_retain(|pragma| self.conn.execute(pragma).map(|_| ())) {
+            Ok(autocommit_pragma) => {
+                tracing::debug!(
+                    pragma = autocommit_pragma,
+                    "disabled frankensqlite autocommit_retain for storage connection"
+                );
+            }
+            Err(err) => {
+                let detail = format!("{err:#}");
+                if error_message_indicates_populated_fts_shadow_without_rowid_reload(&detail) {
+                    tracing::warn!(
+                        error = %detail,
+                        "frankensqlite could not disable autocommit_retain because a populated derived FTS shadow table cannot yet be reloaded; continuing so canonical indexing can proceed"
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
+        }
 
         Ok(())
     }
@@ -15223,6 +15248,25 @@ mod tests {
             std::env::set_var(key, value.as_ref());
         }
         EnvGuard { key, previous }
+    }
+
+    #[test]
+    fn populated_fts_shadow_without_rowid_reload_errors_are_classified() {
+        assert!(
+            error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                "not implemented: reloading populated WITHOUT ROWID table `fts_messages_config` into MemDatabase is not yet supported",
+            )
+        );
+        assert!(
+            error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                "not implemented: loading populated WITHOUT ROWID table fts_messages_data is not yet supported",
+            )
+        );
+        assert!(
+            !error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                "not implemented: reloading populated WITHOUT ROWID table `user_table` into MemDatabase is not yet supported",
+            )
+        );
     }
 
     #[test]

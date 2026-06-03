@@ -8442,6 +8442,7 @@ fn should_repair_fallback_fts_after_full_index_run(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FallbackFtsRepairOutcome {
     SkippedKnownHealthyForFingerprint { archive_fingerprint: String },
+    SkippedUnsupportedPopulatedShadowReload { detail: String },
     Repaired(FtsConsistencyRepair),
 }
 
@@ -8488,16 +8489,28 @@ fn repair_fallback_fts_after_full_index_run(
     // abort this fix is supposed to prevent.  The `_storage` parameter
     // is kept for API stability (callers pass the same long-running
     // connection they already have) but is not touched.
-    let fresh_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+    let fresh_storage = match crate::storage::sqlite::open_franken_storage_with_timeout(
         db_path,
         std::time::Duration::from_secs(10),
-    )
-    .with_context(|| {
-        format!(
-            "opening fresh frankensqlite connection for fallback FTS repair at {}",
-            db_path.display()
-        )
-    })?;
+    ) {
+        Ok(storage) => storage,
+        Err(err) => {
+            let detail = format!("{err:#}");
+            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                &detail,
+            ) {
+                return Ok(Some(
+                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
+                ));
+            }
+            return Err(err).with_context(|| {
+                format!(
+                    "opening fresh frankensqlite connection for fallback FTS repair at {}",
+                    db_path.display()
+                )
+            });
+        }
+    };
 
     if let Some(archive_fingerprint) = known_archive_fingerprint
         && fresh_storage
@@ -8510,7 +8523,20 @@ fn repair_fallback_fts_after_full_index_run(
         ));
     }
 
-    let repair = fresh_storage.ensure_search_fallback_fts_consistency()?;
+    let repair = match fresh_storage.ensure_search_fallback_fts_consistency() {
+        Ok(repair) => repair,
+        Err(err) => {
+            let detail = format!("{err:#}");
+            if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+                &detail,
+            ) {
+                return Ok(Some(
+                    FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail },
+                ));
+            }
+            return Err(err);
+        }
+    };
     if let Some(archive_fingerprint) = known_archive_fingerprint {
         fresh_storage.record_search_fallback_fts_archive_fingerprint(archive_fingerprint)?;
     }
@@ -10726,10 +10752,20 @@ fn spawn_connector_producer(
         // Scan explicitly configured additional roots. These may be true remote
         // mirrors or machine-local backup directories wired through sources.toml.
         for root in &config.additional_scan_roots {
+            let root_since_ts =
+                explicit_scan_root_since_ts(root, &config.data_dir, config.since_ts);
+            if config.since_ts.is_some() && root_since_ts.is_none() {
+                tracing::debug!(
+                    connector = name,
+                    source_id = %root.origin.source_id,
+                    root = %root.path.display(),
+                    "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
+                );
+            }
             let ctx = crate::connectors::ScanContext::with_roots(
                 root.path.clone(),
                 vec![root.clone()],
-                config.since_ts,
+                root_since_ts,
             );
             let mut batch_sender =
                 StreamingBatchSender::new(&tx, config.flow_limiter.clone(), name, is_discovered);
@@ -10739,7 +10775,7 @@ fn spawn_connector_producer(
                 &config.data_dir,
                 name,
                 std::slice::from_ref(root),
-                config.since_ts,
+                root_since_ts,
                 config.active_source_filter.as_ref(),
             );
             match conn.scan_with_callback(&ctx, &mut |mut conversation| {
@@ -11596,10 +11632,19 @@ fn run_batch_index_with_connector_factories(
 
                 if !additional_scan_roots.is_empty() {
                     for root in &additional_scan_roots {
+                        let root_since_ts = explicit_scan_root_since_ts(root, &data_dir, since_ts);
+                        if since_ts.is_some() && root_since_ts.is_none() {
+                            tracing::debug!(
+                                connector = name,
+                                source_id = %root.origin.source_id,
+                                root = %root.path.display(),
+                                "configured scan root is using a full root scan so already-mirrored sessions can be promoted to canonical"
+                            );
+                        }
                         let ctx = crate::connectors::ScanContext::with_roots(
                             root.path.clone(),
                             vec![root.clone()],
-                            since_ts,
+                            root_since_ts,
                         );
                         capture_connector_sources_before_parse(
                             conn.as_ref(),
@@ -11607,7 +11652,7 @@ fn run_batch_index_with_connector_factories(
                             &data_dir,
                             name,
                             std::slice::from_ref(root),
-                            since_ts,
+                            root_since_ts,
                             active_source_filter.as_ref(),
                         );
                         match conn.scan(&ctx) {
@@ -11778,6 +11823,23 @@ fn non_watch_scan_since_ts(
         None
     } else {
         last_scan_ts.map(|ts| ts.saturating_sub(1))
+    }
+}
+
+fn explicit_scan_root_since_ts(
+    root: &ScanRoot,
+    built_in_local_root: &Path,
+    fallback_since_ts: Option<i64>,
+) -> Option<i64> {
+    if root.origin.is_local()
+        && matches!(
+            root.path.as_os_str().cmp(built_in_local_root.as_os_str()),
+            std::cmp::Ordering::Equal
+        )
+    {
+        fallback_since_ts
+    } else {
+        None
     }
 }
 
@@ -12019,47 +12081,58 @@ pub fn run_index(
     // real write.
     let _validate_fts_skipped = preflight_skip("watch_startup:validate_fts_messages");
     if !_validate_fts_skipped && let Err(err) = storage.validate_fts_messages_integrity() {
-        tracing::warn!(
-            db_path = %opts.db_path.display(),
-            error = %err,
-            "derived fallback FTS metadata is inconsistent; repairing before index pipeline"
-        );
-        storage.close_best_effort_in_place();
-        let mut repair_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-            &opts.db_path,
-            Duration::from_secs(10),
-        )
-        .with_context(|| {
-            format!(
-                "opening fresh storage for fallback FTS repair before indexing {}",
-                opts.db_path.display()
+        let detail = format!("{err:#}");
+        if crate::storage::sqlite::error_message_indicates_populated_fts_shadow_without_rowid_reload(
+            &detail,
+        ) {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %detail,
+                "skipping derived fallback FTS validation repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical indexing will continue"
+            );
+        } else {
+            tracing::warn!(
+                db_path = %opts.db_path.display(),
+                error = %err,
+                "derived fallback FTS metadata is inconsistent; repairing before index pipeline"
+            );
+            storage.close_best_effort_in_place();
+            let mut repair_storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                &opts.db_path,
+                Duration::from_secs(10),
             )
-        })?;
-        let repair = repair_storage.ensure_search_fallback_fts_consistency();
-        repair_storage.close_best_effort_in_place();
-        let repair = repair.with_context(|| {
-            format!(
-                "repairing derived fallback FTS before indexing {}",
-                opts.db_path.display()
+            .with_context(|| {
+                format!(
+                    "opening fresh storage for fallback FTS repair before indexing {}",
+                    opts.db_path.display()
+                )
+            })?;
+            let repair = repair_storage.ensure_search_fallback_fts_consistency();
+            repair_storage.close_best_effort_in_place();
+            let repair = repair.with_context(|| {
+                format!(
+                    "repairing derived fallback FTS before indexing {}",
+                    opts.db_path.display()
+                )
+            })?;
+            tracing::info!(
+                db_path = %opts.db_path.display(),
+                ?repair,
+                "derived fallback FTS repair completed before index pipeline"
+            );
+            storage = crate::storage::sqlite::open_franken_storage_with_timeout(
+                &opts.db_path,
+                Duration::from_secs(10),
             )
-        })?;
-        tracing::info!(
-            db_path = %opts.db_path.display(),
-            ?repair,
-            "derived fallback FTS repair completed before index pipeline"
-        );
-        storage = crate::storage::sqlite::open_franken_storage_with_timeout(
-            &opts.db_path,
-            Duration::from_secs(10),
-        )
-        .with_context(|| {
-            format!(
-                "reopening storage after fallback FTS repair before indexing {}",
-                opts.db_path.display()
-            )
-        })?;
-        persist::apply_index_writer_busy_timeout(&storage);
-        persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+            .with_context(|| {
+                format!(
+                    "reopening storage after fallback FTS repair before indexing {}",
+                    opts.db_path.display()
+                )
+            })?;
+            persist::apply_index_writer_busy_timeout(&storage);
+            persist::apply_index_writer_checkpoint_policy(&storage, defer_checkpoints);
+        }
     }
     complete_preflight_phase!();
 
@@ -13230,6 +13303,13 @@ pub fn run_index(
                     db_path = %opts.db_path.display(),
                     archive_fingerprint,
                     "skipping fallback FTS consistency repair because this no-op full run preserved an archive fingerprint already known to be healthy"
+                );
+            }
+            FallbackFtsRepairOutcome::SkippedUnsupportedPopulatedShadowReload { detail } => {
+                tracing::warn!(
+                    db_path = %opts.db_path.display(),
+                    error = %detail,
+                    "skipping derived fallback FTS repair because frankensqlite cannot yet reload populated FTS shadow WITHOUT ROWID tables; canonical SQLite rows and Tantivy remain authoritative"
                 );
             }
             FallbackFtsRepairOutcome::Repaired(FtsConsistencyRepair::AlreadyHealthy { rows }) => {
@@ -27900,7 +27980,7 @@ mod tests {
 
         // Lock file must NOT yet have _TIMEOUT because the watchdog is
         // blocked waiting for `metadata_write_lock`.
-        let before_release = std::fs::read_to_string(&lock_path).unwrap_or_default();
+        let before_release = read_index_run_lock_metadata_for_test(&lock_path).unwrap_or_default();
         assert!(
             !before_release.contains("_TIMEOUT"),
             "watchdog must not rewrite the lock file while metadata_write_lock is held; \
@@ -27912,7 +27992,7 @@ mod tests {
 
         let read_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         let after_release = loop {
-            let raw = std::fs::read_to_string(&lock_path).unwrap_or_default();
+            let raw = read_index_run_lock_metadata_for_test(&lock_path).unwrap_or_default();
             if raw.contains("_TIMEOUT") || std::time::Instant::now() > read_deadline {
                 break raw;
             }
@@ -32985,7 +33065,7 @@ mod tests {
         fn detect(&self) -> DetectionResult {
             DetectionResult {
                 detected: true,
-                evidence: vec!["fixture".to_string()],
+                evidence: vec![String::from("fixture")],
                 root_paths: Vec::new(),
             }
         }
@@ -33017,6 +33097,95 @@ mod tests {
 
     fn deferred_batch_connector_factory() -> Box<dyn Connector + Send> {
         Box::new(DeferredBatchConnector)
+    }
+
+    struct WatermarkSensitiveRemoteConnector;
+
+    impl WatermarkSensitiveRemoteConnector {
+        fn conversations_for_context(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+        ) -> Vec<NormalizedConversation> {
+            if ctx.since_ts.is_some() {
+                return Vec::new();
+            }
+            let Some(scan_root) = ctx.scan_roots.first() else {
+                return Vec::new();
+            };
+
+            let mut conversation = norm_conv(
+                Some("remote-watermark"),
+                vec![norm_msg(0, 1_700_000_000_000)],
+            );
+            conversation.source_path = scan_root.path.join("remote-watermark.jsonl");
+            vec![conversation]
+        }
+    }
+
+    impl Connector for WatermarkSensitiveRemoteConnector {
+        fn detect(&self) -> DetectionResult {
+            DetectionResult {
+                detected: true,
+                evidence: vec![String::from("fixture")],
+                root_paths: Vec::new(),
+            }
+        }
+
+        fn scan(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+        ) -> anyhow::Result<Vec<NormalizedConversation>> {
+            Ok(self.conversations_for_context(ctx))
+        }
+
+        fn scan_with_callback(
+            &self,
+            ctx: &crate::connectors::ScanContext,
+            on_conversation: &mut dyn FnMut(NormalizedConversation) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            for conversation in self.conversations_for_context(ctx) {
+                on_conversation(conversation)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn watermark_sensitive_remote_connector_factory() -> Box<dyn Connector + Send> {
+        Box::new(WatermarkSensitiveRemoteConnector)
+    }
+
+    fn ensure_since_ts_matches(
+        actual: Option<i64>,
+        expected: Option<i64>,
+        context: &str,
+    ) -> Result<()> {
+        if matches!(actual.cmp(&expected), std::cmp::Ordering::Equal) {
+            Ok(())
+        } else {
+            anyhow::bail!("{context}: expected {expected:?}, got {actual:?}")
+        }
+    }
+
+    fn ensure_canonical_mutations(
+        actual: CanonicalMutationCounts,
+        expected: CanonicalMutationCounts,
+        context: &str,
+    ) -> Result<()> {
+        let conversations_match = matches!(
+            actual
+                .inserted_conversations
+                .cmp(&expected.inserted_conversations),
+            std::cmp::Ordering::Equal
+        );
+        let messages_match = matches!(
+            actual.inserted_messages.cmp(&expected.inserted_messages),
+            std::cmp::Ordering::Equal
+        );
+        if conversations_match && messages_match {
+            Ok(())
+        } else {
+            anyhow::bail!("{context}: expected {expected:?}, got {actual:?}")
+        }
     }
 
     static FAILING_EXPLICIT_FILE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -34558,6 +34727,42 @@ mod tests {
     }
 
     #[test]
+    fn configured_scan_roots_force_scan_from_start() -> Result<()> {
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::remote(
+                    PathBuf::from("/remote/fixture/claude"),
+                    Origin::remote("fixture-host"),
+                    Some(Platform::Linux),
+                ),
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            None,
+            "configured remote roots may contain already-transferred files older than the global scan watermark; canonical dedupe protects repeats, but the scan must not skip never-promoted mirror sessions",
+        )?;
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::local(PathBuf::from("/tmp/cass-data")),
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            Some(1234),
+            "the built-in local root should keep normal incremental filtering",
+        )?;
+        ensure_since_ts_matches(
+            explicit_scan_root_since_ts(
+                &ScanRoot::local(PathBuf::from("/tmp/backup-root")),
+                Path::new("/tmp/cass-data"),
+                Some(1234),
+            ),
+            None,
+            "configured local roots outside the built-in local data root need the same full-scan treatment as remote mirrors",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     #[serial]
     fn streaming_consumer_handles_mixed_startup_batches_with_watch_checkpoint_policy() {
         let _wal_guard = set_env("CASS_INDEX_WRITER_WAL_AUTOCHECKPOINT_PAGES", "-1");
@@ -35237,6 +35442,67 @@ mod tests {
     }
 
     #[test]
+    fn streaming_configured_scan_roots_ignore_global_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let remote_root_path = tmp.path().join("remote-mirror").join("claude");
+        std::fs::create_dir_all(&remote_root_path)?;
+        std::fs::write(
+            remote_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"remote\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let index_path = index_dir(&data_dir)?;
+        let mut index = TantivyIndex::open_or_create(&index_path)?;
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_streaming_index_with_connector_factories(
+            &storage,
+            Some(&mut index),
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::IncrementalInline,
+            vec![ScanRoot::remote(
+                remote_root_path,
+                Origin::remote("fixture-host"),
+                Some(Platform::Linux),
+            )],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+        )
+        .context(
+            "configured remote roots should scan from the root despite the global watermark",
+        )?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 1,
+            },
+            "streaming configured scan roots",
+        )?;
+        Ok(())
+    }
+
+    #[test]
     fn streaming_index_fails_closed_when_producer_panics() {
         let tmp = TempDir::new().unwrap();
         let data_dir = tmp.path().join("data");
@@ -35290,6 +35556,65 @@ mod tests {
             Some(message.as_str()),
             "progress tracker should expose the real panic instead of pretending indexing succeeded"
         );
+    }
+
+    #[test]
+    fn batch_configured_scan_roots_ignore_global_watermark() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let remote_root_path = tmp.path().join("remote-mirror").join("claude");
+        std::fs::create_dir_all(&remote_root_path)?;
+        std::fs::write(
+            remote_root_path.join("remote-watermark.jsonl"),
+            b"{\"role\":\"user\",\"content\":\"remote\"}\n",
+        )?;
+
+        let db_path = data_dir.join("db.sqlite");
+        let storage = FrankenStorage::open(&db_path)?;
+        ensure_fts_schema(&storage);
+        let progress = Arc::new(IndexingProgress::default());
+        let opts = IndexOptions {
+            full: false,
+            force_rebuild: false,
+            watch: false,
+            watch_once_paths: None,
+            db_path,
+            data_dir: data_dir.clone(),
+            semantic: false,
+            build_hnsw: false,
+            embedder: String::from("fastembed"),
+            progress: Some(progress),
+            watch_interval_secs: 30,
+        };
+
+        let mutations = run_batch_index_with_connector_factories(
+            &storage,
+            None,
+            &opts,
+            Some(i64::MAX),
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            vec![ScanRoot::remote(
+                remote_root_path,
+                Origin::remote("fixture-host"),
+                Some(Platform::Linux),
+            )],
+            vec![("claude", watermark_sensitive_remote_connector_factory)],
+            FrankenStorage::now_millis(),
+        )
+        .context(
+            "configured remote roots should scan from the root despite the global watermark",
+        )?;
+
+        ensure_canonical_mutations(
+            mutations.canonical_mutations,
+            CanonicalMutationCounts {
+                inserted_conversations: 1,
+                inserted_messages: 1,
+            },
+            "batch configured scan roots",
+        )?;
+        Ok(())
     }
 
     #[test]
