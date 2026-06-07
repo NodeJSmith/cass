@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    config::DiscoveredHost, host_key_verification_error, is_host_key_verification_failure,
-    strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
+    config::DiscoveredHost, configure_child_process_group, host_key_verification_error,
+    is_host_key_verification_failure, strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
 
 /// Default connection timeout in seconds.
@@ -401,6 +401,7 @@ pub fn probe_host(host: &DiscoveredHost, timeout_secs: u64) -> HostProbeResult {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
     // Spawn the process and write probe script to stdin
     let mut child = match cmd.spawn() {

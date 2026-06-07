@@ -37,8 +37,8 @@ use super::{
         SourceDefinition, SyncSchedule, discover_ssh_hosts, source_path_entry_error,
         ssh_host_has_safe_token_chars, validate_optional_user_host_shape,
     },
-    host_key_verification_error, is_host_key_verification_failure, strict_ssh_cli_tokens,
-    strict_ssh_command_for_rsync, wait_for_child_output_with_timeout,
+    configure_child_process_group, host_key_verification_error, is_host_key_verification_failure,
+    strict_ssh_cli_tokens, strict_ssh_command_for_rsync, wait_for_child_output_with_timeout,
 };
 use ssh2::{FileStat, Session, Sftp};
 use std::io::{Read as IoRead, Write as IoWrite};
@@ -223,8 +223,9 @@ fn probe_remote_rsync_is_openrsync(host: &str, timeout_secs: u64) -> bool {
 
 /// Inner (non-cached) implementation of the remote openrsync probe.
 fn detect_remote_rsync_is_openrsync_via_ssh(host: &str, timeout_secs: u64) -> bool {
+    let timeout_secs = timeout_secs.clamp(1, 30);
     let mut cmd = Command::new("ssh");
-    cmd.args(strict_ssh_cli_tokens(timeout_secs.min(30)))
+    cmd.args(strict_ssh_cli_tokens(timeout_secs))
         .arg("-o")
         .arg("LogLevel=ERROR")
         .arg("--")
@@ -232,8 +233,11 @@ fn detect_remote_rsync_is_openrsync_via_ssh(host: &str, timeout_secs: u64) -> bo
         .arg("rsync --version 2>&1 | head -1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
-    let Ok(output) = cmd.output() else {
+    let Ok(Some(output)) = cmd.spawn().and_then(|child| {
+        wait_for_child_output_with_timeout(child, Duration::from_secs(timeout_secs))
+    }) else {
         return false;
     };
     if !output.status.success() && output.stdout.is_empty() {
@@ -654,6 +658,7 @@ impl SyncEngine {
             .arg("printf 'CASS_HOME_MARKER:%s\\n' \"$HOME\"")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
 
         let child = cmd
             .spawn()
@@ -1326,6 +1331,7 @@ impl SyncEngine {
             .arg(&find_command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
 
         let output = match cmd.spawn().and_then(|child| {
             wait_for_child_output_with_timeout(child, Duration::from_secs(timeout_secs))

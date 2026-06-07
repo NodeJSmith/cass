@@ -15,7 +15,6 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
-use std::env;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -60,20 +59,20 @@ struct TimedOutput {
 }
 
 fn env_truthy(key: &str) -> bool {
-    env::var(key)
+    dotenvy::var(key)
         .ok()
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key)
+    dotenvy::var(key)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(default)
 }
 
 fn env_u128(key: &str, default: u128) -> u128 {
-    env::var(key)
+    dotenvy::var(key)
         .ok()
         .and_then(|value| value.trim().parse::<u128>().ok())
         .unwrap_or(default)
@@ -85,9 +84,9 @@ fn real_index_harness() -> Result<Option<RealIndexHarness>> {
         return Ok(None);
     }
 
-    let data_dir = env::var_os("CASS_REAL_INDEX_E2E_DATA_DIR")
+    let data_dir = dotenvy::var("CASS_REAL_INDEX_E2E_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_REAL_DATA_DIR));
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_REAL_DATA_DIR));
     let db_path = data_dir.join("agent_search.db");
     let min_db_bytes = env_u64("CASS_REAL_INDEX_E2E_MIN_DB_BYTES", DEFAULT_MIN_DB_BYTES);
     let db_bytes = db_path
@@ -114,7 +113,7 @@ fn real_index_harness() -> Result<Option<RealIndexHarness>> {
         index_dir.display()
     );
 
-    let bin = env::var("CASS_REAL_INDEX_E2E_BIN").unwrap_or_else(|_| cass_bin());
+    let bin = dotenvy::var("CASS_REAL_INDEX_E2E_BIN").unwrap_or_else(|_| cass_bin());
     Ok(Some(RealIndexHarness {
         bin,
         data_dir,
@@ -123,7 +122,7 @@ fn real_index_harness() -> Result<Option<RealIndexHarness>> {
 }
 
 fn cass_bin() -> String {
-    env::var("CARGO_BIN_EXE_cass")
+    dotenvy::var("CARGO_BIN_EXE_cass")
         .ok()
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_cass").to_string())
 }
@@ -162,6 +161,7 @@ fn spawn_with_timeout_or_diag(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
     let start = Instant::now();
     let mut child = cmd
@@ -174,6 +174,7 @@ fn spawn_with_timeout_or_diag(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                kill_child_process_group(child.id());
                 let stdout = join_pipe_reader(stdout_reader, label, "stdout");
                 let stderr = join_pipe_reader(stderr_reader, label, "stderr");
                 let stdout = full_output_or_error(stdout, label, "stdout")?;
@@ -187,6 +188,7 @@ fn spawn_with_timeout_or_diag(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let pid = child.id();
+                    kill_child_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
                     let stdout = join_pipe_reader(stdout_reader, label, "stdout");
@@ -240,6 +242,7 @@ fn spawn_with_timeout_or_diag(
                 std::thread::sleep(POLL_INTERVAL);
             }
             Err(err) => {
+                kill_child_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = join_pipe_reader(stdout_reader, label, "stdout");
@@ -249,6 +252,30 @@ fn spawn_with_timeout_or_diag(
         }
     }
 }
+
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_child_process_group(pid: u32) {
+    let process_group = format!("-{pid}");
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &process_group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(_pid: u32) {}
 
 fn spawn_pipe_reader<R>(handle: Option<R>) -> JoinHandle<PipeCapture>
 where
@@ -399,6 +426,33 @@ fn list_dir_bounded_reports_symlinked_directories_without_following() -> Result<
             .iter()
             .all(|entry| !entry.contains("outside-only.txt")),
         "diagnostic listing must not follow symlinked directories outside the data dir: {entries:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn timeout_kills_shell_grandchild_pipe_holders() -> Result<()> {
+    let tmp = tempfile::TempDir::new().context("create temp dir")?;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg("sleep 30");
+
+    let start = Instant::now();
+    let error = spawn_with_timeout_or_diag(
+        cmd,
+        "intentional_shell_hang",
+        tmp.path(),
+        Duration::from_millis(300),
+    )
+    .expect_err("hung shell command should time out");
+
+    ensure!(
+        start.elapsed() < Duration::from_secs(5),
+        "timeout helper must not wait for the shell grandchild to finish"
+    );
+    ensure!(
+        error.to_string().contains("exceeded timeout"),
+        "unexpected timeout error: {error:#}"
     );
     Ok(())
 }

@@ -76,6 +76,7 @@ pub fn spawn_with_timeout_or_diag(
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
     let start = Instant::now();
     let mut child = cmd
@@ -88,6 +89,7 @@ pub fn spawn_with_timeout_or_diag(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                kill_child_process_group(child.id());
                 let stdout = join_pipe_reader(stdout_reader, label, "stdout");
                 let stderr = join_pipe_reader(stderr_reader, label, "stderr");
                 let stdout = full_output_or_panic(stdout, label, "stdout");
@@ -106,6 +108,7 @@ pub fn spawn_with_timeout_or_diag(
                     // below return. Waiting on a pipe whose writer is
                     // still alive but idle would otherwise block the
                     // diagnostic dump forever and defeat this helper.
+                    kill_child_process_group(pid);
                     let _ = child.kill();
                     let _ = child.wait();
                     let stdout = join_pipe_reader(stdout_reader, label, "stdout");
@@ -163,6 +166,7 @@ pub fn spawn_with_timeout_or_diag(
             }
             Err(err) => {
                 // try_wait errored — treat as a hard failure.
+                kill_child_process_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = join_pipe_reader(stdout_reader, label, "stdout");
@@ -172,6 +176,30 @@ pub fn spawn_with_timeout_or_diag(
         }
     }
 }
+
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_child_process_group(pid: u32) {
+    let process_group = format!("-{pid}");
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", &process_group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(_pid: u32) {}
 
 fn spawn_pipe_reader<R>(handle: Option<R>) -> JoinHandle<PipeCapture>
 where
@@ -335,16 +363,22 @@ mod tests {
 
     /// Proves the timeout path: a child that hangs past the deadline
     /// triggers the diagnostic-dump + kill + panic sequence.
+    ///
+    /// Use a shell wrapper on Unix so this also proves process-group
+    /// cleanup: killing only the shell would leave `sleep` holding the
+    /// stdout/stderr pipe FDs open, deadlocking the diagnostic join.
     #[test]
     #[should_panic(expected = "exceeded timeout")]
     fn hung_child_triggers_timeout_panic_with_diagnostic() {
-        // `/bin/sleep` is invoked DIRECTLY (no shell wrapper) so
-        // SIGKILL from `child.kill()` actually terminates the hanging
-        // process. Going through `/bin/sh -c 'sleep 30'` would kill
-        // only the shell, leaving the orphan sleep holding the
-        // stdout/stderr pipe FDs open and making the subsequent reader
-        // thread join wait for the full 30s.
+        #[cfg(unix)]
+        let cmd = {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg("sleep 30");
+            cmd
+        };
+        #[cfg(not(unix))]
         let mut cmd = Command::new("/bin/sleep");
+        #[cfg(not(unix))]
         cmd.arg("30");
         let _ =
             spawn_with_timeout_or_diag(cmd, "intentional_hang", None, Duration::from_millis(300));

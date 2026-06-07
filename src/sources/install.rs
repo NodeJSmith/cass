@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    host_key_verification_error, is_host_key_verification_failure,
+    configure_child_process_group, host_key_verification_error, is_host_key_verification_failure,
     probe::{ResourceInfo, SystemInfo},
     strict_ssh_cli_tokens, wait_for_child_output_with_timeout,
 };
@@ -1146,6 +1146,7 @@ cass --version 2>&1 || echo "VERIFY_FAILED"
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        configure_child_process_group(&mut cmd);
 
         let mut child = cmd.spawn()?;
 
