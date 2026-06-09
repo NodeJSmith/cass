@@ -88872,6 +88872,7 @@ fn run_sources_sync(
                                 "files": 0,
                                 "bytes": 0,
                                 "error": format!("Invalid source path: {message}"),
+                                "failure_reason": "invalid_path",
                             })
                         } else {
                             serde_json::json!({
@@ -88880,6 +88881,7 @@ fn run_sources_sync(
                                 "files": 0,
                                 "bytes": 0,
                                 "error": serde_json::Value::Null,
+                                "failure_reason": serde_json::Value::Null,
                             })
                         }
                     })
@@ -88895,6 +88897,10 @@ fn run_sources_sync(
                     "total_files": 0,
                     "total_bytes": 0,
                     "duration_ms": 0,
+                    "transport_decision": serde_json::to_value(
+                        SyncEngine::detect_sync_method().transport_decision()
+                    )
+                    .unwrap_or_else(|_| serde_json::json!({})),
                     "sync_decision": serde_json::to_value(&sync_decision)
                         .unwrap_or_else(|_| serde_json::json!({})),
                 }));
@@ -88918,20 +88924,24 @@ fn run_sources_sync(
                 });
 
                 if let Some(_fmt) = structured_format {
+                    let transport_decision = failed_report.transport_decision();
                     all_reports.push(serde_json::json!({
                         "source": source.name,
                         "status": "error",
-                        "method": failed_report.method.to_string(),
+                        "method": transport_decision.chosen_transport.clone(),
                         "paths": failed_report.path_results.iter().map(|r| serde_json::json!({
                             "path": r.remote_path,
                             "success": r.success,
                             "files": r.files_transferred,
                             "bytes": r.bytes_transferred,
                             "error": r.error,
+                            "failure_reason": r.failure_reason(),
                         })).collect::<Vec<_>>(),
                         "total_files": failed_report.total_files(),
                         "total_bytes": failed_report.total_bytes(),
                         "duration_ms": failed_report.total_duration_ms,
+                        "transport_decision": serde_json::to_value(&transport_decision)
+                            .unwrap_or_else(|_| serde_json::json!({})),
                         "sync_decision": serde_json::to_value(&sync_decision)
                             .unwrap_or_else(|_| serde_json::json!({})),
                         "error": failed_report
@@ -88975,10 +88985,13 @@ fn run_sources_sync(
                     "files": r.files_transferred,
                     "bytes": r.bytes_transferred,
                     "error": r.error,
+                    "failure_reason": r.failure_reason(),
                 })).collect::<Vec<_>>(),
                 "total_files": report.total_files(),
                 "total_bytes": report.total_bytes(),
                 "duration_ms": report.total_duration_ms,
+                "transport_decision": serde_json::to_value(report.transport_decision())
+                    .unwrap_or_else(|_| serde_json::json!({})),
                 "sync_decision": serde_json::to_value(&sync_decision)
                     .unwrap_or_else(|_| serde_json::json!({})),
             }));

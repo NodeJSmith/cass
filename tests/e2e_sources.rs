@@ -1963,6 +1963,49 @@ paths = ["~/.claude/projects"]
                 .as_array()
                 .is_some_and(|reasons| !reasons.is_empty())
         );
+        let transport_decision = &sources[0]["transport_decision"];
+        assert!(
+            transport_decision["chosen_transport"].as_str().is_some(),
+            "transport decision should name the chosen transport: {transport_decision}"
+        );
+        assert!(
+            transport_decision["auth_source"].as_str().is_some(),
+            "transport decision should name auth source: {transport_decision}"
+        );
+        assert!(
+            transport_decision["fallback_rationale"].as_str().is_some(),
+            "transport decision should explain fallback rationale: {transport_decision}"
+        );
+        let attempts = transport_decision["attempted_transports"]
+            .as_array()
+            .expect("transport attempts should be an array");
+        let transports = attempts
+            .iter()
+            .filter_map(|attempt| attempt["transport"].as_str())
+            .collect::<Vec<_>>();
+        assert!(transports.contains(&"rsync"));
+        assert!(transports.contains(&"wsl-rsync"));
+        assert!(transports.contains(&"scp"));
+        assert!(transports.contains(&"sftp"));
+        assert!(
+            attempts.iter().any(|attempt| attempt["status"] == "chosen"),
+            "one transport attempt should be chosen: {attempts:?}"
+        );
+        assert!(
+            attempts
+                .iter()
+                .all(|attempt| attempt["auth_source"].as_str().is_some()),
+            "each transport attempt should record auth source: {attempts:?}"
+        );
+        let paths = sources[0]["paths"]
+            .as_array()
+            .expect("paths should be an array");
+        assert!(
+            paths
+                .iter()
+                .all(|path| path.get("failure_reason").is_some()),
+            "each path should include failure_reason: {paths:?}"
+        );
 
         let env_output = cargo_bin_cmd!("cass")
             .args(["sources", "sync", "--dry-run"])
@@ -1984,6 +2027,11 @@ paths = ["~/.claude/projects"]
             .expect("env sources should be array");
         assert_eq!(env_sources.len(), 1);
         assert_eq!(env_sources[0]["sync_decision"]["manual_override"], true);
+        assert!(
+            env_sources[0]["transport_decision"]["chosen_transport"]
+                .as_str()
+                .is_some()
+        );
     }
     tracker.end("verify_json", Some("Verify valid JSON output"), start);
 
