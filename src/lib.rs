@@ -6006,16 +6006,14 @@ async fn execute_cli(
         | Commands::View { .. }
         | Commands::Pages { .. }
         | Commands::Analytics(..) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::stderr)
-                .compact()
-                .with_target(false)
-                .with_ansi(
-                    matches!(cli.color, ColorPref::Always)
-                        || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
-                )
-                .init();
+            // Robot-safe stderr hygiene + optional explicit --trace-file sink
+            // (uojcg.2.1 / uojcg.2.5). Keep the guard alive for the command run.
+            let _trace_guard = init_cli_tracing(
+                filter,
+                cli.trace_file.as_deref(),
+                matches!(cli.color, ColorPref::Always)
+                    || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
+            );
 
             match command {
                 Commands::Index {
@@ -6861,16 +6859,12 @@ async fn execute_cli(
             }
         }
         _ => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_writer(std::io::stderr)
-                .compact()
-                .with_target(false)
-                .with_ansi(
-                    matches!(cli.color, ColorPref::Always)
-                        || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
-                )
-                .init();
+            let _trace_guard = init_cli_tracing(
+                filter,
+                cli.trace_file.as_deref(),
+                matches!(cli.color, ColorPref::Always)
+                    || (matches!(cli.color, ColorPref::Auto) && stderr_is_tty),
+            );
 
             match command {
                 Commands::Completions { shell } => {
@@ -17706,6 +17700,71 @@ fn build_robot_aware_log_filter(robot_mode: bool, verbose: bool, quiet: bool) ->
         None => EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(DEFAULT_DEP_LOG_SUPPRESSION)),
     }
+}
+
+/// Tracing directive for the explicit `--trace-file` surface
+/// (coding_agent_session_search-cass-fleet-resilience-20260608-uojcg.2.5).
+///
+/// When an operator opts into `--trace-file`, dependency-level diagnostics
+/// (frankensqlite / frankensearch / asupersync, etc.) are captured at `debug`
+/// into that file as a deliberate trace artifact, while the stderr layer stays
+/// pinned to its robot-aware level so machine output is never corrupted. This is
+/// the "explicit trace surface" the bead requires: deep logs are available on
+/// demand, never by default.
+const TRACE_FILE_LOG_DIRECTIVE: &str = "debug";
+
+/// Initialize the tracing subscriber for non-TUI commands with robot-safe
+/// stdout/stderr hygiene plus an optional explicit `--trace-file` sink.
+///
+/// The stderr layer carries the robot-aware `filter` (pinned to `error` in
+/// robot/quiet mode by [`build_robot_aware_log_filter`], per uojcg.2.1), so
+/// dependency INFO/WARN logging can never interleave with a JSON stream. When
+/// `trace_file` is `Some`, a second layer captures dependency diagnostics at
+/// [`TRACE_FILE_LOG_DIRECTIVE`] into that file (uojcg.2.5) — gating deep logs
+/// behind an explicit surface rather than emitting them by default.
+///
+/// Returns the appender [`WorkerGuard`](tracing_appender::non_blocking::WorkerGuard)
+/// when a trace file is active; the caller MUST keep it alive for the duration of
+/// the command so buffered trace lines are flushed.
+fn init_cli_tracing(
+    filter: EnvFilter,
+    trace_file: Option<&Path>,
+    ansi: bool,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::Layer;
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .compact()
+        .with_target(false)
+        .with_ansi(ansi)
+        .with_filter(filter);
+
+    let (trace_layer, guard) = match trace_file {
+        Some(path) => match OpenOptions::new().create(true).append(true).open(path) {
+            Ok(file) => {
+                let (non_blocking, guard) = tracing_appender::non_blocking(file);
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .compact()
+                    .with_filter(EnvFilter::new(TRACE_FILE_LOG_DIRECTIVE))
+                    .boxed();
+                (Some(layer), Some(guard))
+            }
+            Err(e) => {
+                eprintln!("trace-file open error ({}): {e}", path.display());
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(trace_layer)
+        .init();
+    guard
 }
 
 #[cfg(test)]
