@@ -18,6 +18,7 @@ pub mod encryption;
 pub mod evidence_bundle;
 pub mod explainability;
 pub mod export;
+pub mod fleet_archive_coverage;
 pub mod fleet_doctor_schema;
 pub mod fleet_version_skew;
 pub mod ftui_harness;
