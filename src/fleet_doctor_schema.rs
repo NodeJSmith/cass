@@ -608,9 +608,154 @@ impl FleetDoctorReport {
     }
 }
 
+/// A single source/fleet-doctor check outcome, decoupled from the CLI's internal
+/// `DiagnosticCheck` so the mapping below stays pure and unit-testable. `status`
+/// is `"pass"` / `"warn"` / `"fail"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceCheck {
+    pub name: String,
+    pub status: String,
+    pub remediation: Option<String>,
+}
+
+impl SourceCheck {
+    pub fn new(
+        name: impl Into<String>,
+        status: impl Into<String>,
+        remediation: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            status: status.into(),
+            remediation: remediation.into(),
+        }
+    }
+
+    fn is_fail(&self) -> bool {
+        self.status.eq_ignore_ascii_case("fail")
+    }
+
+    fn matches(&self, needle: &str) -> bool {
+        self.name.to_ascii_lowercase().contains(needle)
+    }
+}
+
+/// Assemble a bounded [`HostDoctorReport`] from a source's doctor checks, deriving
+/// the reachability/transport [`HostProbeStatus`] and a safe next command
+/// (bead uojcg.8.2, reachability/transport slice). Pure and unit-testable; the
+/// CLI maps its `DiagnosticCheck`s into [`SourceCheck`]s and calls this. Identity
+/// (`host_alias`, `platform`) is always preserved, even when unreachable.
+///
+/// Status derivation, in priority order: an SSH/connectivity `fail` →
+/// `Unreachable` (root cause `RemoteTransportAuth`); else an rsync/transport
+/// `fail` → `CommandNotFound`; else any `fail` → `Degraded`; else any `warn` →
+/// `Partial`; else `Ok`. The recommended action is the first failing (then
+/// warning) check's remediation.
+pub fn host_report_from_checks(
+    host_alias: &str,
+    platform: Platform,
+    elapsed_ms: u64,
+    checks: &[SourceCheck],
+) -> HostDoctorReport {
+    let ssh_failed = checks
+        .iter()
+        .any(|c| (c.matches("ssh") || c.matches("connect")) && c.is_fail());
+    let rsync_failed = checks
+        .iter()
+        .any(|c| (c.matches("rsync") || c.matches("transport")) && c.is_fail());
+    let any_fail = checks.iter().any(SourceCheck::is_fail);
+    let any_warn = checks.iter().any(|c| c.status.eq_ignore_ascii_case("warn"));
+
+    let status = if ssh_failed {
+        HostProbeStatus::Unreachable
+    } else if rsync_failed {
+        HostProbeStatus::CommandNotFound
+    } else if any_fail {
+        HostProbeStatus::Degraded
+    } else if any_warn {
+        HostProbeStatus::Partial
+    } else {
+        HostProbeStatus::Ok
+    };
+
+    let recommended_action = checks
+        .iter()
+        .find(|c| c.is_fail())
+        .or_else(|| checks.iter().find(|c| c.status.eq_ignore_ascii_case("warn")))
+        .and_then(|c| c.remediation.clone());
+
+    let mut report = HostDoctorReport::skeleton(host_alias, platform, status, elapsed_ms);
+    report.recommended_action = recommended_action;
+    if matches!(status, HostProbeStatus::Unreachable | HostProbeStatus::CommandNotFound) {
+        report.likely_root_cause = Some(RootCauseFamily::RemoteTransportAuth);
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chk(name: &str, status: &str) -> SourceCheck {
+        SourceCheck::new(name, status, Some(format!("fix {name}")))
+    }
+
+    #[test]
+    fn host_report_ok_when_all_checks_pass() {
+        let checks = [chk("SSH connectivity", "pass"), chk("rsync available", "pass")];
+        let r = host_report_from_checks("ts1", Platform::linux_x86_64(), 30, &checks);
+        assert_eq!(r.status, HostProbeStatus::Ok);
+        assert_eq!(r.host_alias, "ts1");
+        assert!(!r.unreachable);
+        assert!(r.recommended_action.is_none());
+        assert!(r.likely_root_cause.is_none());
+    }
+
+    #[test]
+    fn ssh_fail_marks_unreachable_with_transport_root_cause() {
+        let checks = [chk("SSH connectivity", "fail"), chk("rsync available", "pass")];
+        let r = host_report_from_checks("mac-mini-old", Platform::linux_x86_64(), 5000, &checks);
+        assert_eq!(r.status, HostProbeStatus::Unreachable);
+        assert!(r.unreachable, "unreachable flag must mirror status");
+        assert_eq!(r.likely_root_cause, Some(RootCauseFamily::RemoteTransportAuth));
+        assert_eq!(r.recommended_action.as_deref(), Some("fix SSH connectivity"));
+        assert_eq!(r.host_alias, "mac-mini-old", "identity preserved when unreachable");
+    }
+
+    #[test]
+    fn rsync_fail_marks_command_not_found() {
+        let checks = [chk("SSH connectivity", "pass"), chk("rsync available", "fail")];
+        let r = host_report_from_checks("ts2", Platform::linux_x86_64(), 80, &checks);
+        assert_eq!(r.status, HostProbeStatus::CommandNotFound);
+        assert!(r.status.is_hard_failure());
+        assert_eq!(r.likely_root_cause, Some(RootCauseFamily::RemoteTransportAuth));
+    }
+
+    #[test]
+    fn other_fail_is_degraded_and_warn_is_partial() {
+        let degraded = [chk("SSH connectivity", "pass"), chk("Remote Path: paths[0]", "fail")];
+        let r = host_report_from_checks("css", Platform::linux_x86_64(), 50, &degraded);
+        assert_eq!(r.status, HostProbeStatus::Degraded);
+        assert_eq!(r.recommended_action.as_deref(), Some("fix Remote Path: paths[0]"));
+
+        let warned = [chk("SSH connectivity", "pass"), chk("storage", "warn")];
+        let r2 = host_report_from_checks("csd", Platform::linux_x86_64(), 50, &warned);
+        assert_eq!(r2.status, HostProbeStatus::Partial);
+        assert_eq!(r2.recommended_action.as_deref(), Some("fix storage"));
+    }
+
+    #[test]
+    fn host_report_serializes_with_status_and_identity() {
+        let checks = [chk("SSH connectivity", "fail")];
+        let r = host_report_from_checks("mac-mini-old", Platform::linux_x86_64(), 5000, &checks);
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["status"], "unreachable");
+        assert_eq!(value["unreachable"], true);
+        assert_eq!(value["host_alias"], "mac-mini-old");
+        assert_eq!(value["likely_root_cause"], "remote-transport-auth");
+        let back: HostDoctorReport = serde_json::from_value(value).unwrap();
+        assert_eq!(back, r);
+    }
 
     fn populated_ok_host() -> HostDoctorReport {
         let mut h = HostDoctorReport::skeleton(
