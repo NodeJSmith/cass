@@ -1308,6 +1308,46 @@ pub enum Commands {
     #[command(subcommand)]
     Analytics(AnalyticsCommand),
 
+    /// Verify release distribution channels (GitHub, Homebrew, Scoop, crates.io, installer).
+    ///
+    /// Robot-safe: `--from <file|->` evaluates a recorded observation JSON
+    /// offline (CI/agents), while `--live` gathers per-channel observations over
+    /// the network. Prints a ReleaseVerificationReport as JSON.
+    ReleaseVerify {
+        /// Read a ReleaseVerifyRequest JSON from a file (or `-` for stdin) and
+        /// evaluate it offline. Mutually exclusive with --live.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "live")]
+        from: Option<String>,
+
+        /// Gather live per-channel observations over the network (explicit opt-in).
+        #[arg(long)]
+        live: bool,
+
+        /// Expected release version under test (required for --live).
+        #[arg(long)]
+        expected_version: Option<String>,
+
+        /// GitHub owner/repo for the release channel (defaults to the cass repo).
+        #[arg(long)]
+        repo: Option<String>,
+
+        /// crates.io crate name (defaults to the cass crate).
+        #[arg(long)]
+        crate_name: Option<String>,
+
+        /// Raw URL of the Homebrew formula file (enables the homebrew channel).
+        #[arg(long)]
+        homebrew_formula_url: Option<String>,
+
+        /// Raw URL of the Scoop manifest JSON (enables the scoop channel).
+        #[arg(long)]
+        scoop_manifest_url: Option<String>,
+
+        /// Output as JSON (`--robot` also works). Default for this command.
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+
     /// Run the semantic model daemon (Unix only)
     #[cfg(unix)]
     Daemon {
@@ -2502,6 +2542,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "models"
             | "pack"
             | "pages"
+            | "release-verify"
             | "resume"
             | "robot-docs"
             | "search"
@@ -5326,6 +5367,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "triage",
     "introspect",
     "api-version",
+    "release-verify",
     "robot-docs",
     "models",
     "sources",
@@ -6886,6 +6928,29 @@ async fn execute_cli(
                 Commands::ApiVersion { json } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_api_version(structured_format)?;
+                }
+                Commands::ReleaseVerify {
+                    from,
+                    live,
+                    expected_version,
+                    repo,
+                    crate_name,
+                    homebrew_formula_url,
+                    scoop_manifest_url,
+                    json,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_release_verify(
+                        structured_format,
+                        from.as_deref(),
+                        live,
+                        expected_version.as_deref(),
+                        repo.as_deref(),
+                        crate_name.as_deref(),
+                        homebrew_formula_url.as_deref(),
+                        scoop_manifest_url.as_deref(),
+                    )
+                    .await?;
                 }
                 Commands::State {
                     data_dir,
@@ -17564,6 +17629,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Man) => "man".to_string(),
         Some(Commands::Capabilities { .. }) => "capabilities".to_string(),
         Some(Commands::ApiVersion { .. }) => "api-version".to_string(),
+        Some(Commands::ReleaseVerify { .. }) => "release-verify".to_string(),
         Some(Commands::State { .. }) => "state".to_string(),
         Some(Commands::Introspect { .. }) => "introspect".to_string(),
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
@@ -17843,6 +17909,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         | Commands::Status { json, .. }
         | Commands::Triage { json, .. }
         | Commands::ApiVersion { json }
+        | Commands::ReleaseVerify { json, .. }
         | Commands::State { json, .. }
         | Commands::View { json, .. }
         | Commands::Capabilities { json }
@@ -73549,6 +73616,313 @@ fn run_api_version(output_format: Option<RobotFormat>) -> CliResult<()> {
     println!("contract: v{CONTRACT_VERSION}");
 
     Ok(())
+}
+
+/// Default GitHub owner/repo and crate name for the release channels.
+const RELEASE_VERIFY_DEFAULT_REPO: &str = "Dicklesworthstone/coding_agent_session_search";
+const RELEASE_VERIFY_DEFAULT_CRATE: &str = "coding-agent-search";
+const RELEASE_VERIFY_HTTP_TIMEOUT_SECS: u64 = 15;
+
+/// Resolved configuration for a live release-channel probe.
+struct LiveGatherConfig {
+    expected_version: String,
+    repo: String,
+    crate_name: String,
+    homebrew_formula_url: Option<String>,
+    scoop_manifest_url: Option<String>,
+}
+
+/// Robot-safe `cass release-verify`. Offline `--from` reuses the tested
+/// [`crate::release_verify::verify_from_json`] core; `--live` gathers explicit
+/// per-channel observations over the network. Prints a ReleaseVerificationReport.
+async fn run_release_verify(
+    output_format: Option<RobotFormat>,
+    from: Option<&str>,
+    live: bool,
+    expected_version: Option<&str>,
+    repo: Option<&str>,
+    crate_name: Option<&str>,
+    homebrew_formula_url: Option<&str>,
+    scoop_manifest_url: Option<&str>,
+) -> CliResult<()> {
+    let report = if let Some(path) = from {
+        let body = read_release_verify_input(path).map_err(|err| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!("failed to read release-verify request from {path}: {err}"),
+            hint: Some(
+                "Provide a ReleaseVerifyRequest JSON file path or '-' for stdin.".to_string(),
+            ),
+            retryable: false,
+        })?;
+        crate::release_verify::verify_from_json(&body).map_err(|err| CliError {
+            code: 2,
+            kind: CliErrorKind::Usage.kind_str(),
+            message: format!("invalid release-verify request JSON: {err}"),
+            hint: Some(
+                "Expected {\"expected_version\":\"x.y.z\",\"channels\":[{\"channel\":\"github_release\",...}]}."
+                    .to_string(),
+            ),
+            retryable: false,
+        })?
+    } else if live {
+        let version = expected_version.ok_or_else(|| {
+            CliError::usage(
+                "--live requires --expected-version <v>",
+                Some("Pass the release version under test, e.g. --expected-version 0.6.13.".to_string()),
+            )
+        })?;
+        let config = LiveGatherConfig {
+            expected_version: version.to_string(),
+            repo: repo.unwrap_or(RELEASE_VERIFY_DEFAULT_REPO).to_string(),
+            crate_name: crate_name.unwrap_or(RELEASE_VERIFY_DEFAULT_CRATE).to_string(),
+            homebrew_formula_url: homebrew_formula_url.map(str::to_string),
+            scoop_manifest_url: scoop_manifest_url.map(str::to_string),
+        };
+        let request =
+            asupersync::runtime::spawn_blocking(move || gather_live_release_observations(&config))
+                .await;
+        crate::release_verify::verify_request(request)
+    } else {
+        return Err(CliError::usage(
+            "release-verify requires --from <file|-> or --live",
+            Some(
+                "Use --from for offline/CI evaluation, or --live to probe channels over the network."
+                    .to_string(),
+            ),
+        ));
+    };
+
+    let payload = serde_json::to_value(&report).map_err(|err| CliError {
+        code: 1,
+        kind: CliErrorKind::Unknown.kind_str(),
+        message: format!("serializing release-verify report: {err}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+    if let Some(fmt) = structured_format {
+        return output_structured_value(payload, fmt);
+    }
+
+    println!(
+        "Release {} channels: {}/{} ready (overall_ready={})",
+        report.expected_version, report.summary.ready, report.summary.total, report.overall_ready
+    );
+    for action in report.manual_actions() {
+        if let Some(next) = &action.manual_next_action {
+            println!("  {} -> {next}", action.channel.as_str());
+        }
+    }
+    Ok(())
+}
+
+/// Read a release-verify request body from a file path or `-` (stdin).
+fn read_release_verify_input(path: &str) -> std::io::Result<String> {
+    use std::io::Read;
+    if path == "-" {
+        let mut body = String::new();
+        std::io::stdin().read_to_string(&mut body)?;
+        Ok(body)
+    } else {
+        std::fs::read_to_string(path)
+    }
+}
+
+/// Gather explicit, best-effort per-channel observations over the network.
+/// Never fails: an unreachable channel becomes a `reachable: false` observation
+/// that [`crate::release_verify::evaluate_channel`] maps to `NetworkUnavailable`.
+fn gather_live_release_observations(
+    config: &LiveGatherConfig,
+) -> crate::release_verify::ReleaseVerifyRequest {
+    use crate::release_verify::{ChannelObservationInput, ReleaseChannel, ReleaseVerifyRequest};
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("cass/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(RELEASE_VERIFY_HTTP_TIMEOUT_SECS))
+        .build()
+        .ok();
+
+    let unreachable = |channel: ReleaseChannel| ChannelObservationInput {
+        channel,
+        configured: true,
+        reachable: false,
+        observed_version: None,
+        checksum_ok: None,
+        dispatch_ran: None,
+        installer_ok: None,
+    };
+    let not_configured = |channel: ReleaseChannel| ChannelObservationInput {
+        channel,
+        configured: false,
+        reachable: false,
+        observed_version: None,
+        checksum_ok: None,
+        dispatch_ran: None,
+        installer_ok: None,
+    };
+
+    let Some(client) = client else {
+        // Could not even build a client: report every channel as unreachable.
+        return ReleaseVerifyRequest {
+            expected_version: config.expected_version.clone(),
+            channels: vec![
+                unreachable(ReleaseChannel::GithubRelease),
+                unreachable(ReleaseChannel::Homebrew),
+                unreachable(ReleaseChannel::Scoop),
+                unreachable(ReleaseChannel::CratesIo),
+                not_configured(ReleaseChannel::InstallerScript),
+            ],
+        };
+    };
+
+    let mut channels = Vec::new();
+
+    // GitHub release (source of truth): latest published tag + asset presence.
+    channels.push(
+        probe_json_version(
+            &client,
+            ReleaseChannel::GithubRelease,
+            &format!("https://api.github.com/repos/{}/releases/latest", config.repo),
+            "tag_name",
+        )
+        .unwrap_or_else(|| unreachable(ReleaseChannel::GithubRelease)),
+    );
+
+    // crates.io: max stable version.
+    channels.push(
+        probe_json_version(
+            &client,
+            ReleaseChannel::CratesIo,
+            &format!("https://crates.io/api/v1/crates/{}", config.crate_name),
+            "crate.max_stable_version",
+        )
+        .unwrap_or_else(|| unreachable(ReleaseChannel::CratesIo)),
+    );
+
+    // Homebrew formula (dispatch-driven): only when an explicit URL is supplied.
+    channels.push(match &config.homebrew_formula_url {
+        Some(url) => probe_text_version(&client, ReleaseChannel::Homebrew, url, true)
+            .unwrap_or_else(|| unreachable(ReleaseChannel::Homebrew)),
+        None => not_configured(ReleaseChannel::Homebrew),
+    });
+
+    // Scoop manifest (dispatch-driven): only when an explicit URL is supplied.
+    channels.push(match &config.scoop_manifest_url {
+        Some(url) => probe_json_version(&client, ReleaseChannel::Scoop, url, "version")
+            .map(|mut obs| {
+                obs.dispatch_ran = Some(true);
+                obs
+            })
+            .unwrap_or_else(|| unreachable(ReleaseChannel::Scoop)),
+        None => not_configured(ReleaseChannel::Scoop),
+    });
+
+    // Installer smoke is not auto-executed (it runs curl|bash); CI supplies it
+    // via --from. Marked not-configured for live probes.
+    channels.push(not_configured(ReleaseChannel::InstallerScript));
+
+    ReleaseVerifyRequest {
+        expected_version: config.expected_version.clone(),
+        channels,
+    }
+}
+
+/// GET a JSON document and read a (possibly dotted) string field as the observed
+/// version. Returns `None` on any network/parse failure (caller maps to
+/// unreachable).
+fn probe_json_version(
+    client: &reqwest::blocking::Client,
+    channel: crate::release_verify::ReleaseChannel,
+    url: &str,
+    field_path: &str,
+) -> Option<crate::release_verify::ChannelObservationInput> {
+    use crate::release_verify::ChannelObservationInput;
+    let response = client.get(url).send().ok()?;
+    if !response.status().is_success() {
+        // Reachable but no artifact (e.g. 404) -> configured, reachable, missing.
+        return Some(ChannelObservationInput {
+            channel,
+            configured: true,
+            reachable: true,
+            observed_version: None,
+            checksum_ok: None,
+            dispatch_ran: None,
+            installer_ok: None,
+        });
+    }
+    let json: serde_json::Value = response.json().ok()?;
+    let mut current = &json;
+    for key in field_path.split('.') {
+        current = current.get(key)?;
+    }
+    let observed = current.as_str().map(str::to_string);
+    Some(ChannelObservationInput {
+        channel,
+        configured: true,
+        reachable: true,
+        observed_version: observed,
+        checksum_ok: None,
+        dispatch_ran: None,
+        installer_ok: None,
+    })
+}
+
+/// GET a text document and extract the first `version "X"` / `version X`
+/// occurrence (Homebrew formula style). Returns `None` on failure.
+fn probe_text_version(
+    client: &reqwest::blocking::Client,
+    channel: crate::release_verify::ReleaseChannel,
+    url: &str,
+    dispatch_driven: bool,
+) -> Option<crate::release_verify::ChannelObservationInput> {
+    use crate::release_verify::ChannelObservationInput;
+    let response = client.get(url).send().ok()?;
+    if !response.status().is_success() {
+        return Some(ChannelObservationInput {
+            channel,
+            configured: true,
+            reachable: true,
+            observed_version: None,
+            checksum_ok: None,
+            dispatch_ran: dispatch_driven.then_some(false),
+            installer_ok: None,
+        });
+    }
+    let body = response.text().ok()?;
+    let observed = extract_formula_version(&body);
+    Some(ChannelObservationInput {
+        channel,
+        configured: true,
+        reachable: true,
+        observed_version: observed.clone(),
+        checksum_ok: None,
+        dispatch_ran: dispatch_driven.then_some(observed.is_some()),
+        installer_ok: None,
+    })
+}
+
+/// Extract a `version "X"` value from a Homebrew-style formula body.
+fn extract_formula_version(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("version") {
+            let rest = rest.trim();
+            let inner = rest.trim_start_matches(['=', ' ']).trim();
+            let value = inner.trim_matches(['"', '\'']);
+            if !value.is_empty() && value.chars().next().is_some_and(|c| c.is_ascii_digit() || c == 'v') {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Build command schemas for all CLI commands
