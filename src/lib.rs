@@ -65519,6 +65519,29 @@ fn truncate_end(s: &str, max_chars: usize) -> String {
 
 /// Quick health check for agents: index freshness, db stats, recommended action.
 /// Designed to be fast (<100ms) for pre-search checks.
+/// Bounded budget (ms) for `cass status` before it sheds optional/expensive
+/// sections. Overridable via `CASS_STATUS_BUDGET_MS`; defaults to 8s (the report
+/// observed status timing out under an 8s cap). Bead uojcg.2.2.
+fn status_budget_ms() -> u64 {
+    dotenvy::var("CASS_STATUS_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(8000)
+}
+
+/// Test-only deterministic slowdown so E2E can trip the status budget. Honored
+/// only when `CASS_TEST_STATUS_SLOW_MS` is set (operators never set it). Bead
+/// uojcg.2.2.
+fn maybe_test_status_delay() {
+    if let Ok(raw) = dotenvy::var("CASS_TEST_STATUS_SLOW_MS")
+        && let Ok(ms) = raw.parse::<u64>()
+        && ms > 0
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 fn run_status(
     data_dir_override: &Option<PathBuf>,
     db_override: Option<PathBuf>,
@@ -65528,8 +65551,14 @@ fn run_status(
 ) -> CliResult<()> {
     let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
     let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    // Bounded execution budget for the robot surface (uojcg.2.2): when the
+    // optional/expensive sections would exceed it, status sheds them and returns
+    // a parseable partial result (with timed_out + skipped_sections) instead of
+    // blocking on a slow filesystem/coverage scan.
+    let status_budget = crate::robot_budget_envelope::RobotBudget::new(status_budget_ms());
     let mut state = state_meta_json_for_status(&data_dir, &db_path, stale_threshold);
     refresh_state_database_counts_if_needed(&mut state, &db_path, "status");
+    maybe_test_status_delay();
 
     let index_exists = state
         .get("index")
@@ -65731,10 +65760,6 @@ fn run_status(
     });
 
     if let Some(fmt) = structured_format {
-        let quarantine_report = collect_diag_quarantine_report(
-            &data_dir,
-            &crate::search::tantivy::expected_index_dir(&data_dir),
-        );
         let policy_registry = state
             .get("policy_registry")
             .cloned()
@@ -65742,41 +65767,67 @@ fn run_status(
         let topology_budget =
             serde_json::to_value(crate::topology_budget::inspect_host_topology_budget())
                 .unwrap_or(serde_json::Value::Null);
-        // Status is a readiness surface, not a doctor run. Deep coverage
-        // checks verify raw-mirror manifests and can hash very large archived
-        // blobs; doing that here made `cass status --json` CPU-bound on real
-        // archives. Keep the provenance explicit and route operators to doctor
-        // for sole-copy/source-coverage analysis.
-        let (coverage_risk, coverage_source, coverage_checked) = (
-            doctor_fast_coverage_risk_unchecked(db_exists),
-            "status-fast-state",
-            false,
-        );
-        let sources_path = doctor_sources_config_path(&data_dir);
-        let remote_source_sync_report =
-            collect_doctor_remote_source_sync_fast_report(&data_dir, &sources_path);
-        let remote_source_archive_checked = false;
-        let remote_source_sync_summary = doctor_remote_source_sync_runtime_summary(
-            &remote_source_sync_report,
-            "status-inline-local-config",
-            remote_source_archive_checked,
-        );
-        let doctor_summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
-            surface: "status-summary",
-            state: &state,
-            status,
-            healthy,
-            initialized: !not_initialized,
-            db_exists,
-            rebuild_active,
-            coverage_risk: &coverage_risk,
-            coverage_source,
-            coverage_checked,
-            remote_source_sync_summary: Some(&remote_source_sync_summary),
-            quarantine_summary: Some(&quarantine_report.summary),
-            recommended_action: recommended_action.as_ref(),
-            data_dir: &data_dir,
-        });
+
+        // Status is a readiness surface, not a doctor run. Deep coverage checks
+        // verify raw-mirror manifests and can hash very large archived blobs, and
+        // the quarantine scan walks the filesystem; doing that here made
+        // `cass status --json` CPU-bound on real archives. These optional sections
+        // are now shed when the bounded budget is tripped (uojcg.2.2), so status
+        // returns a parseable PARTIAL result with timed_out + skipped_sections
+        // rather than blocking. The core readiness above is cheap and always
+        // present; operators are routed to `cass doctor check` for the rest.
+        let mut skipped_sections: Vec<String> = Vec::new();
+        let (quarantine_value, coverage_value, remote_sync_value, doctor_summary_value) =
+            if status_budget.is_healthy() {
+                let quarantine_report = collect_diag_quarantine_report(
+                    &data_dir,
+                    &crate::search::tantivy::expected_index_dir(&data_dir),
+                );
+                let coverage_risk = doctor_fast_coverage_risk_unchecked(db_exists);
+                let sources_path = doctor_sources_config_path(&data_dir);
+                let remote_source_sync_report =
+                    collect_doctor_remote_source_sync_fast_report(&data_dir, &sources_path);
+                let remote_source_sync_summary = doctor_remote_source_sync_runtime_summary(
+                    &remote_source_sync_report,
+                    "status-inline-local-config",
+                    false,
+                );
+                let doctor_summary = build_doctor_runtime_summary(DoctorRuntimeSummaryInput {
+                    surface: "status-summary",
+                    state: &state,
+                    status,
+                    healthy,
+                    initialized: !not_initialized,
+                    db_exists,
+                    rebuild_active,
+                    coverage_risk: &coverage_risk,
+                    coverage_source: "status-fast-state",
+                    coverage_checked: false,
+                    remote_source_sync_summary: Some(&remote_source_sync_summary),
+                    quarantine_summary: Some(&quarantine_report.summary),
+                    recommended_action: recommended_action.as_ref(),
+                    data_dir: &data_dir,
+                });
+                (
+                    serde_json::to_value(&quarantine_report).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&coverage_risk).unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&remote_source_sync_summary)
+                        .unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&doctor_summary).unwrap_or(serde_json::Value::Null),
+                )
+            } else {
+                for section in
+                    ["quarantine", "coverage_risk", "remote_source_sync", "doctor_summary"]
+                {
+                    skipped_sections.push(section.to_string());
+                }
+                (
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                )
+            };
         let recommended_commands = readiness_recommended_commands(
             &data_dir,
             &db_path,
@@ -65786,6 +65837,12 @@ fn run_status(
             not_initialized,
             recommended_action.as_deref(),
         );
+        let budget_timed_out = status_budget.is_exhausted();
+        let recommended_next_probe = if skipped_sections.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String("cass doctor check --json".to_string())
+        };
         let payload = serde_json::json!({
             "status": status,
             "healthy": healthy,
@@ -65813,12 +65870,19 @@ fn run_status(
             "ingest_quarantine": state.get("ingest_quarantine").cloned().unwrap_or(serde_json::Value::Null),
             "policy_registry": policy_registry,
             "topology_budget": topology_budget,
-            "doctor_summary": doctor_summary,
-            "remote_source_sync": remote_source_sync_summary,
-            "coverage_risk": coverage_risk,
-            "quarantine": quarantine_report,
+            "doctor_summary": doctor_summary_value,
+            "remote_source_sync": remote_sync_value,
+            "coverage_risk": coverage_value,
+            "quarantine": quarantine_value,
             "recommended_action": recommended_action,
             "recommended_commands": recommended_commands,
+            "budget": serde_json::json!({
+                "elapsed_ms": status_budget.elapsed_ms(),
+                "budget_ms": status_budget.total_ms(),
+                "timed_out": budget_timed_out,
+                "skipped_sections": skipped_sections,
+                "recommended_next_probe": recommended_next_probe,
+            }),
             "_meta": state.get("_meta").cloned().unwrap_or(serde_json::Value::Null),
         });
         return output_structured_value(payload, fmt);
