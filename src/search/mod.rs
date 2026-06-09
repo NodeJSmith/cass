@@ -43,6 +43,7 @@ pub(crate) mod proof_log;
 pub mod query;
 pub(crate) mod readiness;
 pub(crate) mod readiness_fixtures;
+pub(crate) mod regression_corpus;
 pub mod reranker;
 pub mod reranker_registry;
 pub mod runtime_optimizations;
