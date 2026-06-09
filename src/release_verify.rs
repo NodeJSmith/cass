@@ -16,6 +16,35 @@
 //! a stable JSON contract and an explicit failure taxonomy. Keeping the decision
 //! logic pure makes every release scenario unit-testable with fixtures/test
 //! doubles and keeps the wire contract pinned independent of live network state.
+//!
+//! # Robot-safe usage
+//!
+//! Callers feed a [`ReleaseVerifyRequest`] (the expected version plus one
+//! [`ChannelObservationInput`] per channel) and get a
+//! [`ReleaseVerificationReport`] back; [`verify_from_json`] is the
+//! string-in/struct-out entry for scripts, CI, and agents. Live network probing
+//! (GitHub release API, Homebrew tap, Scoop bucket, crates.io, installer smoke)
+//! belongs in the caller that fills the observations — it is always explicit, so
+//! a network-less run reports `network_unavailable` per channel rather than
+//! silently passing.
+//!
+//! ## Pre-release use
+//!
+//! After cutting a tag and before announcing it, gather observations for every
+//! channel and treat [`ReleaseVerificationReport::overall_ready`] as the
+//! go/no-go gate. Any `stale`/`missing`/`checksum_mismatch`/`installer_failed`
+//! channel blocks the announcement; each carries a `manual_next_action` (e.g.
+//! "manually dispatch the homebrew update workflow for version X") so the
+//! release owner knows exactly what to run. A `network_unavailable` channel is
+//! never treated as ready — re-run with connectivity.
+//!
+//! ## Post-release use
+//!
+//! Re-run periodically after publishing to confirm the dispatch-driven channels
+//! (Homebrew/Scoop) actually propagated — the recurring `release.yml` no-op bug
+//! leaves them `stale`/`missing` until someone dispatches the notify workflow.
+//! [`ReleaseVerificationReport::manual_actions`] lists exactly the channels that
+//! still need a manual push.
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -389,6 +418,79 @@ impl ReleaseVerificationReport {
     }
 }
 
+/// A single channel's observation in the robot-safe request payload. Mirrors
+/// [`ChannelObservation`] but is `Deserialize` and carries its channel id so a
+/// caller can submit a flat JSON array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelObservationInput {
+    /// Which channel this observation is for.
+    pub channel: ReleaseChannel,
+    /// Whether this channel applies to the release under test.
+    #[serde(default)]
+    pub configured: bool,
+    /// Whether the channel could be contacted at all.
+    #[serde(default)]
+    pub reachable: bool,
+    /// Version string the channel serves, if determined.
+    #[serde(default)]
+    pub observed_version: Option<String>,
+    /// Whether the asset checksum matched, when checked.
+    #[serde(default)]
+    pub checksum_ok: Option<bool>,
+    /// Whether the dispatch-driven notify workflow ran (Homebrew/Scoop).
+    #[serde(default)]
+    pub dispatch_ran: Option<bool>,
+    /// Whether the installer script produced a working expected-version binary.
+    #[serde(default)]
+    pub installer_ok: Option<bool>,
+}
+
+impl ChannelObservationInput {
+    fn into_pair(self) -> (ReleaseChannel, ChannelObservation) {
+        (
+            self.channel,
+            ChannelObservation {
+                configured: self.configured,
+                reachable: self.reachable,
+                observed_version: self.observed_version,
+                checksum_ok: self.checksum_ok,
+                dispatch_ran: self.dispatch_ran,
+                installer_ok: self.installer_ok,
+            },
+        )
+    }
+}
+
+/// Robot-safe request payload: the expected release version plus one
+/// observation per channel. This is the stable JSON input contract for scripts,
+/// CI, and agents (the producing side fills observations from explicit, live
+/// checks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseVerifyRequest {
+    /// The release version under test.
+    pub expected_version: String,
+    /// Per-channel observations.
+    pub channels: Vec<ChannelObservationInput>,
+}
+
+/// Evaluate a deserialized request into a report.
+pub fn verify_request(request: ReleaseVerifyRequest) -> ReleaseVerificationReport {
+    let observations: Vec<(ReleaseChannel, ChannelObservation)> = request
+        .channels
+        .into_iter()
+        .map(ChannelObservationInput::into_pair)
+        .collect();
+    ReleaseVerificationReport::build(&request.expected_version, &observations)
+}
+
+/// Robot-safe entry: parse a [`ReleaseVerifyRequest`] JSON string and return the
+/// verification report. The CLI layer wraps this after gathering live, explicit
+/// per-channel observations; CI and tests can drive it with recorded doubles.
+pub fn verify_from_json(input: &str) -> Result<ReleaseVerificationReport, serde_json::Error> {
+    let request: ReleaseVerifyRequest = serde_json::from_str(input)?;
+    Ok(verify_request(request))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,6 +679,61 @@ mod tests {
         let back: ReleaseVerificationReport =
             serde_json::from_value(value).expect("deserialize");
         assert_eq!(back, report);
+    }
+
+    #[test]
+    fn verify_from_json_drives_a_complete_release_fixture() {
+        let input = r#"{
+            "expected_version": "0.6.13",
+            "channels": [
+                {"channel":"github_release","configured":true,"reachable":true,"observed_version":"0.6.13","checksum_ok":true},
+                {"channel":"homebrew","configured":true,"reachable":true,"observed_version":"0.6.13","dispatch_ran":true},
+                {"channel":"crates_io","configured":true,"reachable":true,"observed_version":"0.6.13"}
+            ]
+        }"#;
+        let report = verify_from_json(input).expect("parse request");
+        assert!(report.overall_ready, "complete-release fixture should be ready: {report:?}");
+        assert_eq!(report.summary.total, 3);
+        assert_eq!(report.expected_version, "0.6.13");
+    }
+
+    #[test]
+    fn verify_from_json_flags_lagging_dispatch_channel() {
+        let input = r#"{
+            "expected_version": "0.6.13",
+            "channels": [
+                {"channel":"github_release","configured":true,"reachable":true,"observed_version":"0.6.13","checksum_ok":true},
+                {"channel":"scoop","configured":true,"reachable":true,"observed_version":"0.6.12","dispatch_ran":false}
+            ]
+        }"#;
+        let report = verify_from_json(input).expect("parse request");
+        assert!(!report.overall_ready);
+        let scoop = report
+            .channels
+            .iter()
+            .find(|c| c.channel == ReleaseChannel::Scoop)
+            .unwrap();
+        assert_eq!(scoop.state, ChannelState::Missing);
+        assert!(scoop.manual_next_action.is_some());
+    }
+
+    #[test]
+    fn verify_request_round_trips_through_its_json_contract() {
+        let request = ReleaseVerifyRequest {
+            expected_version: "0.6.13".to_string(),
+            channels: vec![ChannelObservationInput {
+                channel: ReleaseChannel::GithubRelease,
+                configured: true,
+                reachable: true,
+                observed_version: Some("0.6.13".to_string()),
+                checksum_ok: Some(true),
+                dispatch_ran: None,
+                installer_ok: None,
+            }],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        let back: ReleaseVerifyRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, request);
     }
 
     #[test]
