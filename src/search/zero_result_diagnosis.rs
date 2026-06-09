@@ -153,10 +153,10 @@ fn match_kind(requested: &str, known: &str) -> Option<MatchKind> {
     if normalize_case(requested) == normalize_case(known) {
         return Some(MatchKind::CaseInsensitive);
     }
-    if let Some(variant) = platform_variant(requested) {
-        if normalize_case(&variant) == normalize_case(known) {
-            return Some(MatchKind::PlatformPathVariant);
-        }
+    if let Some(variant) = platform_variant(requested)
+        && normalize_case(&variant) == normalize_case(known)
+    {
+        return Some(MatchKind::PlatformPathVariant);
     }
     let rb = basename(requested);
     if !rb.is_empty() && normalize_case(rb) == normalize_case(basename(known)) {
