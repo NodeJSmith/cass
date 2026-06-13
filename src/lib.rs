@@ -19715,6 +19715,27 @@ fn lexical_repair_error_is_active_index_run(rendered: &str) -> bool {
     rendered.contains("already holds")
 }
 
+/// #287: bounded degraded refusal for robot search callers. `kind` carries the
+/// stable machine-readable reason code (`checkpoint_incomplete` or
+/// `quarantine_circuit_breaker`) so an agent can branch on the structured
+/// error envelope instead of timing out against a silent multi-minute inline
+/// lexical rebuild.
+fn search_robot_degraded_error(
+    reason_code: &'static str,
+    reason: &str,
+    next_action: &str,
+) -> CliError {
+    CliError {
+        code: 5,
+        kind: reason_code,
+        message: format!(
+            "search is degraded ({reason_code}): {reason}; robot mode refuses to launch a heavyweight inline lexical repair and returns this bounded verdict instead"
+        ),
+        hint: Some(next_action.to_string()),
+        retryable: true,
+    }
+}
+
 fn search_lexical_repair_failed_error(reason: &str, err: anyhow::Error) -> CliError {
     let rendered = format!("{err:#}");
     if lexical_repair_error_is_active_index_run(&rendered) {
@@ -19747,6 +19768,7 @@ fn ensure_lexical_assets_for_search(
     timeout_ms: Option<u64>,
     started_at: Instant,
     dry_run: bool,
+    robot_bounded_degraded: bool,
 ) -> CliResult<SearchLexicalSelfHeal> {
     if dry_run || !db_path.exists() {
         return Ok(SearchLexicalSelfHeal::skipped());
@@ -19828,6 +19850,33 @@ fn ensure_lexical_assets_for_search(
             reason: Some(reason),
             indexed_docs: None,
         });
+    }
+
+    // #287: everything below launches a heavyweight inline lexical rebuild
+    // that can run for minutes (and, behind an active ingest-quarantine
+    // circuit breaker, may never converge) — during which a robot-mode search
+    // produces zero output until an external timeout kills it. Robot callers
+    // get a bounded structured refusal with a stable reason code instead;
+    // human-mode searches keep the self-healing inline rebuild.
+    if robot_bounded_degraded {
+        let quarantine = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
+        if quarantine.circuit_breaker_active {
+            return Err(search_robot_degraded_error(
+                "quarantine_circuit_breaker",
+                &reason,
+                &format!(
+                    "{} recently quarantined conversations keep the ingest circuit breaker active; inspect the quarantine files and retry repaired source paths with `cass index --watch-once <path>`",
+                    quarantine.recent_quarantined_conversations
+                ),
+            ));
+        }
+        if diagnosis.checkpoint_refresh_allowed {
+            return Err(search_robot_degraded_error(
+                "checkpoint_incomplete",
+                &reason,
+                "Run `cass index --json` to complete the lexical rebuild checkpoint, then retry the search.",
+            ));
+        }
     }
 
     tracing::warn!(
@@ -20028,6 +20077,7 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
+            false,
         )
         .expect("search self-heal should rebuild missing lexical index");
         assert_eq!(repair.action, "rebuilt-from-canonical-db");
@@ -20063,6 +20113,7 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
+            false,
         )
         .expect("initial rebuild");
 
@@ -20083,6 +20134,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
+            false,
             false,
         )
         .expect("search self-heal should refresh checkpoint");
@@ -20119,6 +20171,7 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
+            false,
         )
         .expect("initial rebuild from old database");
 
@@ -20128,6 +20181,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
+            false,
             false,
         )
         .expect("search self-heal should rebuild for different active db");
@@ -20182,6 +20236,7 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
+            false,
         )
         .expect("initial rebuild from active database");
 
@@ -20208,6 +20263,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
+            false,
             false,
         )
         .expect("search self-heal should not rebuild inline after same-db content changes");
@@ -20263,6 +20319,7 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
+            false,
         )
         .expect("initial rebuild from old database");
         let diagnosis = search_lexical_self_heal_diagnosis(&index_path, &db_path)
@@ -20282,6 +20339,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             Some(0),
             Instant::now(),
+            false,
             false,
         )
         .expect_err(
@@ -20307,6 +20365,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
+            false,
             false,
         )
         .expect("initial rebuild from active database");
@@ -20340,6 +20399,7 @@ mod search_lexical_self_heal_tests {
             Some(0),
             Instant::now(),
             false,
+            false,
         )
         .expect_err(
             "incomplete checkpoint should wait for active rebuild instead of being searched",
@@ -20349,6 +20409,149 @@ mod search_lexical_self_heal_tests {
         assert!(
             err.message.contains("already repairing the search index"),
             "unexpected error: {err:?}"
+        );
+    }
+
+    /// #287: a robot-mode search facing an incomplete lexical checkpoint that
+    /// the cheap live-index refresh cannot reconcile must return a bounded
+    /// structured refusal with the stable `checkpoint_incomplete` reason code
+    /// instead of silently launching a multi-minute inline rebuild.
+    #[test]
+    fn robot_search_returns_bounded_checkpoint_incomplete_instead_of_inline_rebuild() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+        ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("initial rebuild from active database");
+
+        // Mark the checkpoint incomplete AND grow the canonical DB so the
+        // live-index doc count no longer matches — the cheap metadata-only
+        // checkpoint refresh then cannot reconcile, and only the heavyweight
+        // canonical rebuild path remains.
+        let state_path = index_path.join(".lexical-rebuild-state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).expect("read checkpoint"))
+                .expect("parse checkpoint");
+        state["completed"] = serde_json::json!(false);
+        std::fs::write(
+            &state_path,
+            serde_json::to_vec_pretty(&state).expect("serialize checkpoint"),
+        )
+        .expect("write incomplete checkpoint");
+        seed_search_db_at(
+            &db_path,
+            "robotrefusalneedle appended after the incomplete checkpoint",
+            "robot-refusal-extra-conversation",
+        );
+
+        let err = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            true,
+        )
+        .expect_err("robot search must refuse the heavyweight inline rebuild with a bounded verdict");
+        assert_eq!(err.kind, "checkpoint_incomplete");
+        assert_eq!(err.code, 5);
+        assert!(err.retryable);
+        assert!(
+            err.message
+                .contains("lexical rebuild checkpoint is incomplete"),
+            "unexpected error: {err:?}"
+        );
+
+        // Human-mode (non-robot) searches keep the self-healing inline rebuild.
+        let repair = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            false,
+        )
+        .expect("human-mode search keeps the inline self-heal rebuild");
+        assert_eq!(repair.action, "rebuilt-from-canonical-db");
+    }
+
+    /// #287: an active ingest-quarantine circuit breaker means any inline
+    /// rebuild may never converge — robot-mode searches must surface the
+    /// stable `quarantine_circuit_breaker` reason code as a bounded refusal.
+    #[test]
+    fn robot_search_returns_bounded_quarantine_circuit_breaker_refusal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let data_dir = temp.path();
+        let db_path = seed_canonical_search_db(data_dir);
+        let index_path = crate::search::tantivy::expected_index_dir(data_dir);
+
+        // Trip the ingest-quarantine circuit breaker: at least
+        // INGEST_QUARANTINE_CIRCUIT_DEFAULT_LIMIT recent poison records.
+        let quarantine_dir = data_dir.join("quarantine");
+        std::fs::create_dir_all(&quarantine_dir).expect("create quarantine dir");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut lines = String::new();
+        for idx in 0..25 {
+            let record = serde_json::json!({
+                "schema_version": 1,
+                "conversation_id": format!("tester|/logs/demo-{idx}.jsonl|/workspace/demo|poison-{idx}|1|2|1"),
+                "schema_version_at_quarantine": crate::storage::sqlite::CURRENT_SCHEMA_VERSION,
+                "first_quarantined_at_ms": now_ms,
+                "last_attempt_at_ms": now_ms,
+                "attempt_count": 1,
+                "reason": "index-ingest-out-of-memory",
+                "error_kind": "out-of-memory",
+                "last_error": "out of memory",
+                "agent_slug": "tester",
+                "external_id": format!("poison-{idx}"),
+                "source_path": format!("/logs/demo-{idx}.jsonl"),
+                "workspace": "/workspace/demo",
+                "started_at": 1,
+                "ended_at": 2,
+                "message_count": 1
+            });
+            lines.push_str(&format!("{record}\n"));
+        }
+        std::fs::write(quarantine_dir.join("index_ingest_poison.jsonl"), lines)
+            .expect("write poison records");
+        let summary = crate::indexer::conversation_ingest_quarantine_summary(data_dir);
+        assert!(
+            summary.circuit_breaker_active,
+            "fixture must trip the ingest circuit breaker: {summary:?}"
+        );
+
+        // No lexical index exists, so the self-heal would normally launch the
+        // inline canonical rebuild; robot mode must refuse instead while the
+        // breaker is active.
+        let err = ensure_lexical_assets_for_search(
+            data_dir,
+            &db_path,
+            &index_path,
+            None,
+            Instant::now(),
+            false,
+            true,
+        )
+        .expect_err("robot search must refuse inline rebuild behind an active circuit breaker");
+        assert_eq!(err.kind, "quarantine_circuit_breaker");
+        assert_eq!(err.code, 5);
+        assert!(err.retryable);
+        assert!(
+            err.hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("cass index --watch-once")),
+            "hint must name the recovery command: {err:?}"
         );
     }
 
@@ -20374,6 +20577,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
+            false,
             false,
         )
         .expect(
@@ -20427,6 +20631,7 @@ mod search_lexical_self_heal_tests {
             None,
             Instant::now(),
             false,
+            false,
         )
         .expect("initial rebuild");
 
@@ -20443,6 +20648,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
+            false,
             false,
         )
         .expect("search self-heal should rebuild incompatible lexical artifact");
@@ -20481,6 +20687,7 @@ mod search_lexical_self_heal_tests {
             &index_path,
             None,
             Instant::now(),
+            false,
             false,
         )
         .expect("search self-heal should publish a fresh empty lexical artifact");
@@ -20665,6 +20872,9 @@ fn run_cli_search(
         timeout_ms,
         start_time,
         dry_run,
+        // #287: robot callers get a bounded degraded refusal (stable reason
+        // code) instead of a silent multi-minute inline lexical rebuild.
+        effective_robot.is_some(),
     )?;
     if search_self_heal.action != "skipped" {
         tracing::info!(
@@ -21619,6 +21829,7 @@ fn run_cli_pack(
         &index_path,
         timeout_ms,
         start_time,
+        false,
         false,
     )?;
     if search_self_heal.action != "skipped" {
@@ -69172,6 +69383,108 @@ mod cli_read_db_tests {
     }
 }
 
+/// Data gathered by the bounded archive-DB doctor probe (#287): row counts,
+/// the PRAGMA integrity verdict, and (when the database is healthy) the FTS
+/// visibility state — everything `run_doctor_impl` needs to reconstruct the
+/// `database`/`fts_table` checks without touching the connection on the main
+/// thread.
+struct DoctorBoundedArchiveDbProbe {
+    conv_count: Option<i64>,
+    msg_count: Option<i64>,
+    integrity: Option<Result<DoctorDatabaseIntegrityProbe, String>>,
+    fts_state: Option<DoctorFtsTableState>,
+}
+
+enum DoctorBoundedArchiveDbProbeOutcome {
+    Completed(DoctorBoundedArchiveDbProbe),
+    TimedOut { phase: &'static str },
+}
+
+/// Hard deadline for the bounded archive-DB doctor probe (#287). Matches the
+/// 30s DB-open hard timeout by default; override via
+/// `CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS`.
+fn doctor_archive_db_probe_hard_timeout() -> Duration {
+    let secs = dotenvy::var("CASS_DOCTOR_DB_PROBE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(30);
+    Duration::from_secs(secs)
+}
+
+/// #287: the doctor's `SELECT COUNT(*)` row counts and
+/// `PRAGMA quick_check`/`integrity_check` probes used to run unbounded on the
+/// main thread, so a wedged or busy-spinning database made
+/// `cass doctor --json` emit zero stdout bytes until an external timeout
+/// killed it. Run the connection-consuming probe work on a worker thread with
+/// a hard deadline instead: on timeout the doctor marks the `database` check
+/// `status:"timeout"` (with the phase that was in flight) and continues to a
+/// final JSON verdict. The abandoned worker stays detached — the same
+/// containment contract as `open_franken_cli_read_db_with_hard_timeout`.
+fn run_bounded_doctor_archive_db_probe(
+    conn: frankensqlite::Connection,
+    db_path: &Path,
+    timeout: Duration,
+) -> DoctorBoundedArchiveDbProbeOutcome {
+    let phase = std::sync::Arc::new(std::sync::Mutex::new("row_count_conversations"));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker_phase = std::sync::Arc::clone(&phase);
+    let worker_db_path = db_path.to_path_buf();
+    let conn = crate::storage::sqlite::SendFrankenConnection::new(conn);
+    let _probe_worker = std::thread::spawn(move || {
+        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
+
+        let set_phase = |value: &'static str| {
+            if let Ok(mut current) = worker_phase.lock() {
+                *current = value;
+            }
+        };
+        let (conn, _, _) = conn.into_parts();
+        let conv_count: Option<i64> = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM conversations",
+                &[],
+                |r: &frankensqlite::Row| r.get_typed(0),
+            )
+            .ok();
+        set_phase("row_count_messages");
+        let msg_count: Option<i64> = conn
+            .query_row_map(
+                "SELECT COUNT(*) FROM messages",
+                &[],
+                |r: &frankensqlite::Row| r.get_typed(0),
+            )
+            .ok();
+        let mut integrity = None;
+        let mut fts_state = None;
+        if conv_count.is_some() && msg_count.is_some() {
+            set_phase("integrity_probe");
+            let probe = doctor_database_integrity_probe(&conn);
+            let healthy = matches!(&probe, Ok(result) if result.is_ok());
+            integrity = Some(probe);
+            if healthy {
+                set_phase("fts_probe");
+                fts_state = Some(probe_doctor_fts_table(&conn));
+            }
+        }
+        set_phase("connection_close");
+        let _ = close_franken_cli_read_db(conn, &worker_db_path, "doctor database health");
+        let _ = tx.send(DoctorBoundedArchiveDbProbe {
+            conv_count,
+            msg_count,
+            integrity,
+            fts_state,
+        });
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(probe) => DoctorBoundedArchiveDbProbeOutcome::Completed(probe),
+        Err(_) => DoctorBoundedArchiveDbProbeOutcome::TimedOut {
+            phase: phase.lock().map(|current| *current).unwrap_or("unknown"),
+        },
+    }
+}
+
 /// Internal doctor executor reached through the typed `doctor` module.
 /// CRITICAL: This function NEVER deletes user data. It only rebuilds derived data (index, db)
 /// from source session files. This is essential because users may have only one copy of their
@@ -69581,97 +69894,110 @@ pub(crate) fn run_doctor_impl(
         );
         match db_open_result {
             Ok(conn) => {
-                use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
-
-                let conv_count: Option<i64> = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM conversations",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .ok();
-                let msg_count: Option<i64> = conn
-                    .query_row_map(
-                        "SELECT COUNT(*) FROM messages",
-                        &[],
-                        |r: &frankensqlite::Row| r.get_typed(0),
-                    )
-                    .ok();
-
-                if let (Some(conv_count), Some(msg_count)) = (conv_count, msg_count) {
-                    db_conversations = Some(conv_count.max(0) as usize);
-                    db_messages = Some(msg_count.max(0) as usize);
-                    match doctor_database_integrity_probe(&conn) {
-                        Ok(integrity) if integrity.is_ok() => {
-                            db_ok = true;
-                            add_check!(
-                                "database",
-                                "pass",
-                                format!(
-                                    "Database OK ({} conversations, {} messages)",
-                                    conv_count, msg_count
-                                ),
-                                false
-                            );
-
-                            // Check whether the FTS table is visible through
-                            // frankensqlite on this connection. Do not auto-register
-                            // it here: on migrated databases with legacy rootpage=0
-                            // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
-                            // can persist duplicate sqlite_master rows.
-                            match probe_doctor_fts_table(&conn) {
-                                DoctorFtsTableState::QueryableViaFrankensqlite => {
+                // #287: the row-count and PRAGMA probes run on a deadline-bounded
+                // worker thread. On timeout the doctor records a `timeout` check
+                // (with the in-flight phase) and continues, so a wedged database
+                // can no longer hold the entire doctor run hostage with zero
+                // stdout output.
+                let probe_timeout = doctor_archive_db_probe_hard_timeout();
+                match run_bounded_doctor_archive_db_probe(conn, &db_path, probe_timeout) {
+                    DoctorBoundedArchiveDbProbeOutcome::Completed(probe) => {
+                        if let (Some(conv_count), Some(msg_count), Some(integrity_probe)) =
+                            (probe.conv_count, probe.msg_count, probe.integrity)
+                        {
+                            db_conversations = Some(conv_count.max(0) as usize);
+                            db_messages = Some(msg_count.max(0) as usize);
+                            match integrity_probe {
+                                Ok(integrity) if integrity.is_ok() => {
+                                    db_ok = true;
                                     add_check!(
-                                        "fts_table",
-                                        "pass",
-                                        "FTS search table (fts_messages) is queryable via frankensqlite",
-                                        false
-                                    );
-                                }
-                                DoctorFtsTableState::Missing {
-                                    frankensqlite_error,
-                                } => {
-                                    add_check!(
-                                        "fts_table",
+                                        "database",
                                         "pass",
                                         format!(
-                                            "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                            "Database OK ({} conversations, {} messages)",
+                                            conv_count, msg_count
                                         ),
                                         false
                                     );
+
+                                    // Check whether the FTS table is visible through
+                                    // frankensqlite on this connection. Do not auto-register
+                                    // it here: on migrated databases with legacy rootpage=0
+                                    // FTS schema entries, CREATE VIRTUAL TABLE IF NOT EXISTS
+                                    // can persist duplicate sqlite_master rows.
+                                    match probe.fts_state {
+                                        Some(DoctorFtsTableState::QueryableViaFrankensqlite) => {
+                                            add_check!(
+                                                "fts_table",
+                                                "pass",
+                                                "FTS search table (fts_messages) is queryable via frankensqlite",
+                                                false
+                                            );
+                                        }
+                                        Some(DoctorFtsTableState::Missing {
+                                            frankensqlite_error,
+                                        }) => {
+                                            add_check!(
+                                                "fts_table",
+                                                "pass",
+                                                format!(
+                                                    "Database-resident FTS table is absent or not queryable via frankensqlite ({frankensqlite_error}); lexical search relies on the Tantivy index instead"
+                                                ),
+                                                false
+                                            );
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                Ok(integrity) => {
+                                    let failed_pragma = integrity.failed_pragma_name();
+                                    add_check!(
+                                        "database",
+                                        "fail",
+                                        format!(
+                                            "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
+                                            integrity.diagnostic_summary(),
+                                            conv_count,
+                                            msg_count
+                                        ),
+                                        true
+                                    );
+                                    needs_rebuild = true;
+                                }
+                                Err(err) => {
+                                    add_check!(
+                                        "database",
+                                        "fail",
+                                        format!(
+                                            "Database health probe failed via frankensqlite: {err}"
+                                        ),
+                                        true
+                                    );
+                                    needs_rebuild = true;
                                 }
                             }
-                        }
-                        Ok(integrity) => {
-                            let failed_pragma = integrity.failed_pragma_name();
-                            add_check!(
-                                "database",
-                                "fail",
-                                format!(
-                                    "Database failed frankensqlite {failed_pragma}: {} ({} conversations, {} messages)",
-                                    integrity.diagnostic_summary(),
-                                    conv_count,
-                                    msg_count
-                                ),
-                                true
-                            );
-                            needs_rebuild = true;
-                        }
-                        Err(err) => {
-                            add_check!(
-                                "database",
-                                "fail",
-                                format!("Database health probe failed via frankensqlite: {err}"),
-                                true
-                            );
+                        } else {
+                            add_check!("database", "fail", "Database query failed", true);
                             needs_rebuild = true;
                         }
                     }
-                } else {
-                    add_check!("database", "fail", "Database query failed", true);
-                    needs_rebuild = true;
+                    DoctorBoundedArchiveDbProbeOutcome::TimedOut { phase } => {
+                        // Deliberately NOT a `fail`: a busy or wedged database is
+                        // not proof of corruption, so the doctor must not steer
+                        // operators toward a rebuild. The `timeout` status keeps
+                        // the run bounded and is surfaced through the
+                        // `timeout_or_busy_spin_guard` reason code (#287).
+                        add_check!(
+                            "database",
+                            "timeout",
+                            format!(
+                                "Database health probe timed out after {}s during {phase}; archive health is unverified (busy or wedged database). Retry later or inspect with `cass status --json`.",
+                                probe_timeout.as_secs()
+                            ),
+                            false
+                        );
+                    }
                 }
-                let _ = close_franken_cli_read_db(conn, &db_path, "doctor database health");
             }
             Err(e) => {
                 add_check!(
@@ -69717,34 +70043,21 @@ pub(crate) fn run_doctor_impl(
                     false
                 );
 
-                // Check if index is empty but database has data
-                if num_docs == 0 && db_ok {
-                    if let Ok(conn) = open_franken_cli_read_db_with_hard_timeout(
-                        db_path.to_path_buf(),
-                        "doctor index sync",
-                        Duration::from_secs(1),
-                    ) {
-                        use frankensqlite::compat::{ConnectionExt as _, RowExt as _};
-                        if let Ok(msg_count) = conn.query_row_map(
-                            "SELECT COUNT(*) FROM messages",
-                            &[],
-                            |r: &frankensqlite::Row| r.get_typed::<i64>(0),
-                        ) {
-                            if msg_count > 0 {
-                                add_check!(
-                                    "index_sync",
-                                    "warn",
-                                    format!(
-                                        "Index is empty but database has {} messages",
-                                        msg_count
-                                    ),
-                                    true
-                                );
-                                needs_rebuild = true;
-                            }
-                        }
-                        let _ = close_franken_cli_read_db(conn, &db_path, "doctor index sync");
-                    }
+                // Check if index is empty but database has data. #287: reuse the
+                // message count from the bounded archive-DB probe above (db_ok
+                // implies it succeeded) instead of re-opening the database and
+                // running another unbounded COUNT on the main thread.
+                if num_docs == 0
+                    && db_ok
+                    && let Some(msg_count) = db_messages.filter(|&count| count > 0)
+                {
+                    add_check!(
+                        "index_sync",
+                        "warn",
+                        format!("Index is empty but database has {} messages", msg_count),
+                        true
+                    );
+                    needs_rebuild = true;
                 }
             }
             Ok(None) => {
@@ -71254,8 +71567,14 @@ pub(crate) fn run_doctor_impl(
         });
     }
 
-    // Count issues
-    let fail_count = checks.iter().filter(|c| c.status == "fail").count();
+    // Count issues. #287: a `timeout` check means the doctor could not verify
+    // that surface within its hard deadline — the run is bounded but the
+    // verdict is unproven, so it counts as a failure for health/exit purposes
+    // (an agent must not read a timed-out probe as "healthy").
+    let fail_count = checks
+        .iter()
+        .filter(|c| c.status == "fail" || c.status == "timeout")
+        .count();
     let warn_count = checks.iter().filter(|c| c.status == "warn").count();
     let issues_found = fail_count + warn_count;
     let issues_fixed = checks.iter().filter(|c| c.fix_applied).count();
@@ -71440,6 +71759,36 @@ pub(crate) fn run_doctor_impl(
     } else {
         "unhealthy"
     };
+    // #287: stable machine-readable reason codes for degraded doctor outcomes,
+    // so an agent can make a bounded decision from the JSON verdict without
+    // parsing free-form check messages. Ordered by triage priority; the first
+    // entry is surfaced as the primary `reason_code`.
+    let mut degraded_reason_codes: Vec<&'static str> = Vec::new();
+    if checks.iter().any(|c| c.status == "timeout") {
+        degraded_reason_codes.push("timeout_or_busy_spin_guard");
+    }
+    if checks
+        .iter()
+        .any(|c| c.name == "database" && c.status == "fail")
+    {
+        degraded_reason_codes.push("db_unavailable");
+    }
+    if readiness_snapshot
+        .pointer("/ingest_quarantine/circuit_breaker_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        degraded_reason_codes.push("quarantine_circuit_breaker");
+    }
+    if !not_initialized
+        && readiness_snapshot
+            .pointer("/index/checkpoint/completed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        degraded_reason_codes.push("checkpoint_incomplete");
+    }
+    let primary_reason_code = degraded_reason_codes.first().copied();
 
     // Output
     let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
@@ -71467,6 +71816,13 @@ pub(crate) fn run_doctor_impl(
             "doctor_contract_version": 1,
             "capabilities_url": "cass capabilities --json",
             "status": doctor_status,
+            // #287: machine-readable degradation taxonomy. `reason_code` is the
+            // primary (highest-priority) entry of `degraded_reason_codes`; both
+            // are null/empty on healthy runs. Stable values:
+            // timeout_or_busy_spin_guard, db_unavailable,
+            // quarantine_circuit_breaker, checkpoint_incomplete.
+            "reason_code": primary_reason_code,
+            "degraded_reason_codes": degraded_reason_codes,
             "health_class": health_class,
             "risk_level": risk_level,
             "healthy": healthy,
@@ -81209,6 +81565,23 @@ fn run_index_with_data(
         }
     };
 
+    // #287: machine-readable liveness for robot callers. Healthy structured
+    // runs still end with exactly one JSON document on stdout; but when the
+    // stall watchdog fires, a robot caller that only reads stdout used to see
+    // zero bytes until its external timeout killed the process. Emit the
+    // stall/abort payload as an NDJSON event line on stdout too (flushed, in
+    // case the caller kills us next) so the agent can distinguish "wedged
+    // indexer" from "slow command" before its deadline.
+    let emit_robot_stall_event_on_stdout = |payload: &serde_json::Value| {
+        if structured_format.is_some()
+            && let Ok(line) = serde_json::to_string(payload)
+        {
+            use std::io::Write as _;
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+        }
+    };
+
     if let Some(notice) = &indexing_exclusion_notice {
         emit_indexing_exclusion_notice(notice, structured_output);
     }
@@ -81547,6 +81920,7 @@ fn run_index_with_data(
 
             if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
                 emit_event(payload.clone());
+                emit_robot_stall_event_on_stdout(&payload);
                 abort_after_index_stall_if_requested(&payload);
             }
 
@@ -81564,6 +81938,10 @@ fn run_index_with_data(
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 eprintln!("{summary}");
                 eprintln!("{diagnostics}");
+                // #287: `--json --no-progress-events` callers still need a
+                // machine-readable stall signal on stdout before any external
+                // timeout kills the run.
+                emit_robot_stall_event_on_stdout(&payload);
                 abort_after_index_stall_if_requested(&payload);
             }
             std::thread::sleep(Duration::from_millis(100));
