@@ -26,6 +26,7 @@ pub mod asset_state;
 pub(crate) mod bounded_discovery;
 pub mod canonicalize;
 pub(crate) mod command_envelope;
+pub(crate) mod contention_diagnostics;
 pub mod daemon_client;
 pub(crate) mod drill_down;
 pub(crate) mod e2e_scenarios;

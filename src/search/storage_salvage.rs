@@ -745,7 +745,11 @@ pub(crate) struct SalvageApplyReceipt {
 }
 
 /// Why an [`SalvageApplyReceipt`] failed its own well-formedness contract.
+/// The shared `Missing` prefix is the semantic point of the type (each variant
+/// names something the receipt failed to record), so the variant-name lint is
+/// intentionally allowed here.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum SalvageReceiptDefect {
     /// An archive-touching apply did not record the backup it took.
     MissingBackupPath,
