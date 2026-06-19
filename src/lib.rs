@@ -17647,7 +17647,6 @@ fn readiness_snapshot_from_state(
 /// re-deriving the JSON. Staged ahead of its callers (the recovery-support
 /// bundle wiring `6f1lm` and the human readiness summary wiring `v6vuz`),
 /// which become thin assemblers over this one builder.
-#[allow(dead_code)]
 pub(crate) fn build_truth_table_for_data_dir(
     data_dir: &Path,
     db_path: &Path,
@@ -17662,7 +17661,6 @@ pub(crate) fn build_truth_table_for_data_dir(
 /// Variant of [`build_truth_table_for_data_dir`] for callers that already
 /// hold a `state_meta_json` snapshot (status/doctor compute it once), so the
 /// data dir is not re-probed.
-#[allow(dead_code)]
 pub(crate) fn build_truth_table_from_state(
     state: &serde_json::Value,
 ) -> crate::search::readiness::DerivedAssetTruthTable {
@@ -17682,6 +17680,35 @@ pub(crate) fn build_truth_table_from_state(
         cass_not_initialized(db_exists, lexical_index_initialized, rebuild_active);
     let readiness = readiness_snapshot_from_state(state, not_initialized);
     crate::search::readiness::truth_table_from_state(state, readiness)
+}
+
+/// Render the bounded human readiness summary (bead
+/// `coding_agent_session_search-v6vuz`) as a CLI section, from a live
+/// `state_meta_json` snapshot the surface already computed.
+///
+/// This is the live counterpart of the `.13.2` contract
+/// (`crate::search::human_readiness_summary`): every human (non-`--json`)
+/// readiness surface emits the *same* projection the robot JSON serializes, so
+/// the operator-facing copy can never drift from the machine contract. The
+/// projection is pure over the already-built snapshot (no extra I/O), so even
+/// the `<50ms` health surface stays fast. Nothing is printed if the projection
+/// would be unsafe to surface — a structural backstop on top of the curated
+/// safe-next-command, so a human surface can never recommend a destructive or
+/// archive-risking action.
+fn print_human_readiness_section(
+    state: &serde_json::Value,
+    surface: crate::search::readiness_projection::SurfaceKind,
+) {
+    let table = build_truth_table_from_state(state);
+    let summary = crate::search::human_readiness_summary::project_human_summary(&table, surface);
+    if !summary.is_safe(table.archive_risk) {
+        return;
+    }
+    println!();
+    println!("Readiness:");
+    for line in summary.render_lines() {
+        println!("{line}");
+    }
 }
 
 fn lexical_readiness_from_state(
@@ -22237,6 +22264,11 @@ fn run_cli_search(
         None
     };
 
+    // Bead v6vuz: captured before the output chain because `warning` and
+    // `effective_robot` are conditionally moved into the robot branch below.
+    let is_human_search = effective_robot.is_none();
+    let has_readiness_warning = warning.is_some();
+
     if let Some(format) = effective_robot {
         // Robot output mode (JSON)
         output_robot_results(
@@ -22292,6 +22324,25 @@ fn run_cli_search(
             println!("Snippet: {}", apply_wrap(&snippet, wrap));
         }
         println!("----------------------------------------------------------------");
+    }
+
+    // Bead v6vuz: in human (non-robot) search mode, surface the same bounded
+    // readiness banner the robot `_meta` carries when the lexical index is
+    // stale or partial — so a human is told results may be incomplete instead
+    // of silently trusting them, in the same vocabulary as `--robot-meta`. The
+    // banner goes to stderr (stdout stays results-only) and the truth-table
+    // probe runs only on the already-degraded path (a staleness/partial
+    // `warning` exists), so the common healthy search stays probe-free.
+    if is_human_search && has_readiness_warning {
+        let table =
+            build_truth_table_for_data_dir(&data_dir, &db_path, DEFAULT_STALE_THRESHOLD_SECS);
+        let summary = crate::search::human_readiness_summary::project_human_summary(
+            &table,
+            crate::search::readiness_projection::SurfaceKind::SearchMeta,
+        );
+        if summary.is_safe(table.archive_risk) {
+            eprintln!("{}", summary.render_compact_line());
+        }
     }
 
     Ok(())
@@ -67942,6 +67993,13 @@ fn run_status(
         println!("Recommended: {action}");
     }
 
+    // Bead v6vuz: mirror the robot readiness vocabulary in the human surface so
+    // the operator-facing summary never contradicts `cass status --json`.
+    print_human_readiness_section(
+        &state,
+        crate::search::readiness_projection::SurfaceKind::Status,
+    );
+
     Ok(())
 }
 
@@ -68165,6 +68223,14 @@ fn run_triage(
         println!("Next command: {command}");
     }
     println!("Machine output: cass triage --json");
+
+    // Bead v6vuz: same bounded readiness summary as `status`, in triage's
+    // agent-oriented vocabulary, so the human and `--json` triage agree.
+    print_human_readiness_section(
+        &state,
+        crate::search::readiness_projection::SurfaceKind::Triage,
+    );
+
     Ok(())
 }
 
@@ -68536,6 +68602,17 @@ fn run_health(
         } else {
             println!("Run 'cass status --json' for the exact readiness gap.");
         }
+    }
+
+    // Bead v6vuz: append the bounded readiness summary on the human surface
+    // only (never in `--json` mode, which must stay a pure JSON payload). The
+    // Health surface renders a compact partial — the projection is pure over
+    // the snapshot already built above, so health stays the <50ms fast surface.
+    if structured_format.is_none() {
+        print_human_readiness_section(
+            &state,
+            crate::search::readiness_projection::SurfaceKind::Health,
+        );
     }
 
     let final_error = if healthy {
@@ -73719,6 +73796,23 @@ pub(crate) fn run_doctor_impl(
             not_initialized,
         });
         print_doctor_operation_outcome_human(&operation_outcome, wrap);
+
+        // Bead v6vuz: emit the same bounded readiness summary `cass status`
+        // does, rendered through the wrap-aware doctor printer, so the human
+        // `cass doctor` names the same readiness class and safe next action as
+        // `cass doctor --json` (built from the same `readiness_snapshot`).
+        let readiness_table = build_truth_table_from_state(&readiness_snapshot);
+        let readiness_human = crate::search::human_readiness_summary::project_human_summary(
+            &readiness_table,
+            crate::search::readiness_projection::SurfaceKind::Status,
+        );
+        if readiness_human.is_safe(readiness_table.archive_risk) {
+            println!();
+            print_doctor_human_line(wrap, "Readiness:".bold().to_string());
+            for line in readiness_human.render_lines() {
+                print_doctor_human_line(wrap, line);
+            }
+        }
     }
 
     if fail_count == 0 || operation_exit_code_kind == DoctorExitCodeKind::Success {

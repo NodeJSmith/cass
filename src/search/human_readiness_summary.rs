@@ -1,12 +1,3 @@
-// Dead-code tolerated module-wide: the human-facing readiness summary
-// contract for bead cass-fleet-resilience-20260608-uojcg.13.2 lands here
-// ahead of the CLI/TUI surface wiring in src/lib.rs (health / status /
-// doctor / search) and the fleet doctor renderer. Once those human
-// (non-JSON) branches call `project_human_summary`, they emit copy that
-// mirrors the canonical robot readiness vocabulary instead of hand-rolling
-// a second, drift-prone story.
-#![allow(dead_code)]
-
 //! Bounded human CLI/TUI readiness summaries that mirror the robot JSON
 //! (bead cass-fleet-resilience-20260608-uojcg.13.2).
 //!
