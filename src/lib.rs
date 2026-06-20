@@ -34,6 +34,7 @@ pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
 pub mod lessons;
+pub mod lessons_extraction;
 pub mod metric_integrity;
 pub mod model;
 pub mod pages;
@@ -1396,6 +1397,9 @@ pub enum Commands {
     /// Manage semantic search models
     #[command(subcommand)]
     Models(ModelsCommand),
+    /// Mine and query durable lessons from local evidence (commits, beads, proofs)
+    #[command(subcommand)]
+    Lessons(LessonsCommand),
     /// Read-only swarm operations status, work packets, and coordination lint
     #[command(subcommand)]
     Swarm(SwarmCommand),
@@ -2181,6 +2185,77 @@ pub enum ModelsCommand {
     },
 }
 
+/// Subcommands for the durable lessons graph (bead
+/// coding_agent_session_search-guided-ops-repro-trust-5u82n.4). Lessons are a
+/// derived, advisory surface mined from local cass evidence (landed commit
+/// summaries in live mode; commits/beads/proofs in fixture mode) and reduced to
+/// distinct, redacted, supersession-resolved records by
+/// [`crate::lessons::LessonGraph`].
+#[derive(Subcommand, Debug, Clone)]
+pub enum LessonsCommand {
+    /// List durable lessons mined from local evidence.
+    List {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Read evidence from a single lessons fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+        /// Read evidence from a lessons fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+        /// Fixture id within --fixture-dir (resolves to `<id>.evidence.json`).
+        #[arg(long, default_value = "corpus")]
+        fixture_id: String,
+        /// Lifecycle filter: active, superseded, outdated, or all.
+        #[arg(long, default_value = "active")]
+        status: String,
+        /// Restrict to one lesson kind (e.g. gotcha, security_warning, invariant).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Cap the number of lessons returned.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Search durable lessons by substring over topic, summary, and applies-to.
+    Search {
+        /// Query terms (case-insensitive AND-of-substrings).
+        query: String,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Read evidence from a single lessons fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+        /// Read evidence from a lessons fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+        /// Fixture id within --fixture-dir (resolves to `<id>.evidence.json`).
+        #[arg(long, default_value = "corpus")]
+        fixture_id: String,
+        /// Cap the number of lessons returned.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// View one lesson by its stable lesson id.
+    View {
+        /// Lesson id (e.g. `lsn-0123456789abcdef`).
+        lesson_id: String,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Read evidence from a single lessons fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+        /// Read evidence from a lessons fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+        /// Fixture id within --fixture-dir (resolves to `<id>.evidence.json`).
+        #[arg(long, default_value = "corpus")]
+        fixture_id: String,
+    },
+}
+
 /// Subcommands for managing path mappings (P6.3)
 #[derive(Subcommand, Debug, Clone)]
 pub enum MappingsAction {
@@ -2776,6 +2851,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "import"
             | "index"
             | "introspect"
+            | "lessons"
             | "models"
             | "pack"
             | "pages"
@@ -5652,6 +5728,7 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "release-verify",
     "robot-docs",
     "models",
+    "lessons",
     "quarantine",
     "sources",
     "analytics",
@@ -7751,6 +7828,9 @@ async fn execute_cli(
                     .await;
                     result?;
                 }
+                Commands::Lessons(subcmd) => {
+                    run_lessons_command(subcmd, cli)?;
+                }
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
                 }
@@ -8446,6 +8526,436 @@ fn parse_size_bytes(raw: &str) -> std::result::Result<u64, CliError> {
             format!("size `{value}` is too large"),
             Some("Use a smaller size limit.".to_string()),
         )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// `cass lessons` — durable lessons graph
+// (coding_agent_session_search-guided-ops-repro-trust-5u82n.4)
+//
+// Lessons are a derived, advisory surface: local evidence (landed commit
+// summaries in live mode; commits/beads/proofs in fixture mode) is classified
+// and redacted by `crate::lessons_extraction`, then reduced to distinct,
+// supersession-resolved records by `crate::lessons::LessonGraph`. The command
+// is read-only and never mutates user data.
+// ---------------------------------------------------------------------------
+
+/// Resolve an optional lessons-evidence fixture path, mirroring the swarm
+/// resolver: an explicit `--fixture` file, else `<dir>/<id>.evidence.json`.
+fn resolve_lessons_fixture_path(
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<Option<PathBuf>> {
+    if let Some(path) = fixture {
+        return Ok(Some(path.to_path_buf()));
+    }
+    let Some(dir) = fixture_dir else {
+        return Ok(None);
+    };
+    if fixture_id.trim().is_empty()
+        || fixture_id.contains('/')
+        || fixture_id.contains('\\')
+        || matches!(fixture_id, "." | "..")
+    {
+        return Err(CliError::usage(
+            "Invalid lessons fixture id",
+            Some("Use a simple fixture id such as `corpus`.".to_string()),
+        ));
+    }
+    Ok(Some(dir.join(format!("{fixture_id}.evidence.json"))))
+}
+
+/// Read and parse a lessons-evidence fixture file.
+fn load_lessons_evidence(path: &Path) -> CliResult<crate::lessons_extraction::LessonsEvidence> {
+    let body = std::fs::read_to_string(path).map_err(|source| CliError {
+        code: 10,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!("failed to read lessons fixture {}: {source}", path.display()),
+        hint: Some(
+            "Pass --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in lessons evidence file."
+                .to_string(),
+        ),
+        retryable: false,
+    })?;
+    serde_json::from_str(&body).map_err(|source| CliError {
+        code: 10,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!(
+            "failed to parse lessons fixture {}: {source}",
+            path.display()
+        ),
+        hint: None,
+        retryable: false,
+    })
+}
+
+/// Gather live lessons evidence from the local repository: landed commit
+/// summaries (the most universally available, stable signal). Richer live bead
+/// and proof mining is a scoped follow-on; the extraction core already supports
+/// all three sources and fixture mode exercises them.
+fn gather_live_lessons_evidence() -> crate::lessons_extraction::LessonsEvidence {
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "cass".to_string());
+    crate::lessons_extraction::LessonsEvidence {
+        project,
+        commits: gather_git_commit_evidence(&repo, 500),
+        beads: Vec::new(),
+        proofs: Vec::new(),
+    }
+}
+
+/// Best-effort read of the last `max` non-merge commit subjects from `repo`.
+/// Returns an empty vec when git is unavailable or `repo` is not a repository,
+/// keeping live mode honest rather than failing.
+fn gather_git_commit_evidence(
+    repo: &Path,
+    max: usize,
+) -> Vec<crate::lessons_extraction::CommitEvidence> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("log")
+        .arg("--no-merges")
+        .arg(format!("--max-count={max}"))
+        .arg("--pretty=format:%H\u{1f}%ct\u{1f}%s")
+        .output();
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut commits = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\u{1f}');
+        let (Some(sha), Some(ct), Some(subject)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if subject.trim().is_empty() {
+            continue;
+        }
+        let ts_ms = ct.trim().parse::<u64>().unwrap_or(0).saturating_mul(1000);
+        commits.push(crate::lessons_extraction::CommitEvidence {
+            sha: sha.to_string(),
+            subject: subject.to_string(),
+            body: String::new(),
+            timestamp_ms: ts_ms,
+        });
+    }
+    commits
+}
+
+/// Build the lessons graph + extraction manifest from a fixture or live
+/// evidence, returning the resolved mode label ("fixture"/"live").
+fn build_lessons_state(
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<(
+    crate::lessons::LessonGraph,
+    crate::lessons_extraction::ExtractionManifest,
+    &'static str,
+)> {
+    let evidence_path = resolve_lessons_fixture_path(fixture, fixture_dir, fixture_id)?;
+    let (evidence, mode) = match evidence_path {
+        Some(path) => (load_lessons_evidence(&path)?, "fixture"),
+        None => (gather_live_lessons_evidence(), "live"),
+    };
+    let extraction = crate::lessons_extraction::extract(&evidence);
+    let graph = crate::lessons::LessonGraph::build(extraction.candidates);
+    Ok((graph, extraction.manifest, mode))
+}
+
+/// Whether a lesson passes a lifecycle `status` filter ("all" passes any).
+fn lesson_passes_status_filter(record: &crate::lessons::LessonRecord, filter: &str) -> bool {
+    filter.eq_ignore_ascii_case("all") || record.status.as_str().eq_ignore_ascii_case(filter)
+}
+
+/// Whether a lesson passes an optional `kind` filter.
+fn lesson_passes_kind_filter(record: &crate::lessons::LessonRecord, kind: Option<&str>) -> bool {
+    match kind {
+        None => true,
+        Some(k) => record.kind.as_str().eq_ignore_ascii_case(k),
+    }
+}
+
+/// Whether every query token is a substring of the lesson's searchable text.
+fn lesson_matches_query(record: &crate::lessons::LessonRecord, tokens: &[String]) -> bool {
+    let hay = format!(
+        "{} {} {} {}",
+        record.topic,
+        record.summary,
+        record.applies_to.join(" "),
+        record.kind.as_str()
+    )
+    .to_ascii_lowercase();
+    tokens.iter().all(|t| hay.contains(t.as_str()))
+}
+
+/// Sort rank so active lessons sort ahead of superseded ahead of outdated.
+fn lesson_status_rank(status: crate::lessons::LessonStatus) -> u8 {
+    match status {
+        crate::lessons::LessonStatus::Active => 0,
+        crate::lessons::LessonStatus::Superseded => 1,
+        crate::lessons::LessonStatus::Outdated => 2,
+    }
+}
+
+/// Serialize a lesson record to a JSON value (never fails for these types).
+fn lesson_record_value(record: &crate::lessons::LessonRecord) -> serde_json::Value {
+    serde_json::to_value(record).unwrap_or(serde_json::Value::Null)
+}
+
+/// Emit a lessons payload as structured output, or a terse human summary line.
+fn emit_lessons_payload(
+    cli: &Cli,
+    json: bool,
+    payload: serde_json::Value,
+    human: impl FnOnce(&serde_json::Value) -> String,
+) -> CliResult<()> {
+    if let Some(fmt) = resolve_subcommand_structured_format(cli, json) {
+        let fmt = if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        };
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!("{}", human(&payload));
+    }
+    Ok(())
+}
+
+fn run_lessons_command(cmd: LessonsCommand, cli: &Cli) -> CliResult<()> {
+    match cmd {
+        LessonsCommand::List {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            status,
+            kind,
+            limit,
+        } => run_lessons_list(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            &status,
+            kind.as_deref(),
+            limit,
+        ),
+        LessonsCommand::Search {
+            query,
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            limit,
+        } => run_lessons_search(
+            cli,
+            &query,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            limit,
+        ),
+        LessonsCommand::View {
+            lesson_id,
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+        } => run_lessons_view(
+            cli,
+            &lesson_id,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lessons_list(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    status: &str,
+    kind: Option<&str>,
+    limit: usize,
+) -> CliResult<()> {
+    let (graph, manifest, mode) = build_lessons_state(fixture, fixture_dir, fixture_id)?;
+    let mut selected: Vec<&crate::lessons::LessonRecord> = graph
+        .lessons
+        .iter()
+        .filter(|l| lesson_passes_status_filter(l, status))
+        .filter(|l| lesson_passes_kind_filter(l, kind))
+        .collect();
+    // Freshest first; stable tiebreak on id.
+    selected.sort_by(|a, b| {
+        b.freshness_ms
+            .cmp(&a.freshness_ms)
+            .then_with(|| a.lesson_id.cmp(&b.lesson_id))
+    });
+    let matched = selected.len();
+    selected.truncate(limit);
+    let lessons: Vec<serde_json::Value> = selected.into_iter().map(lesson_record_value).collect();
+    let returned = lessons.len();
+
+    let payload = serde_json::json!({
+        "schema_version": crate::lessons::LESSONS_SCHEMA_VERSION,
+        "mode": mode,
+        "project": manifest.project.clone(),
+        "summary": serde_json::to_value(graph.summary).unwrap_or(serde_json::Value::Null),
+        "manifest": serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        "redaction": serde_json::to_value(manifest.redaction).unwrap_or(serde_json::Value::Null),
+        "filter": { "status": status, "kind": kind, "limit": limit },
+        "matched": matched,
+        "returned": returned,
+        "lessons": lessons,
+    });
+
+    emit_lessons_payload(cli, json, payload, |p| {
+        format!(
+            "Lessons [{}]: {} active / {} total — {} shown",
+            p.get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            p.pointer("/summary/active")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            p.pointer("/summary/total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            p.get("returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lessons_search(
+    cli: &Cli,
+    query: &str,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    limit: usize,
+) -> CliResult<()> {
+    let (graph, manifest, mode) = build_lessons_state(fixture, fixture_dir, fixture_id)?;
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    let mut selected: Vec<&crate::lessons::LessonRecord> = if tokens.is_empty() {
+        graph.lessons.iter().collect()
+    } else {
+        graph
+            .lessons
+            .iter()
+            .filter(|l| lesson_matches_query(l, &tokens))
+            .collect()
+    };
+    // Active first, then freshest, then stable id.
+    selected.sort_by(|a, b| {
+        lesson_status_rank(a.status)
+            .cmp(&lesson_status_rank(b.status))
+            .then_with(|| b.freshness_ms.cmp(&a.freshness_ms))
+            .then_with(|| a.lesson_id.cmp(&b.lesson_id))
+    });
+    let matched = selected.len();
+    selected.truncate(limit);
+    let lessons: Vec<serde_json::Value> = selected.into_iter().map(lesson_record_value).collect();
+    let returned = lessons.len();
+
+    let payload = serde_json::json!({
+        "schema_version": crate::lessons::LESSONS_SCHEMA_VERSION,
+        "mode": mode,
+        "project": manifest.project.clone(),
+        "query": query,
+        "summary": serde_json::to_value(graph.summary).unwrap_or(serde_json::Value::Null),
+        "manifest": serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        "redaction": serde_json::to_value(manifest.redaction).unwrap_or(serde_json::Value::Null),
+        "matched": matched,
+        "returned": returned,
+        "lessons": lessons,
+    });
+
+    emit_lessons_payload(cli, json, payload, |p| {
+        format!(
+            "Lessons search [{}] {:?}: {} match(es), {} shown",
+            p.get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            query,
+            p.get("matched")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            p.get("returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+    })
+}
+
+fn run_lessons_view(
+    cli: &Cli,
+    lesson_id: &str,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<()> {
+    let (graph, manifest, mode) = build_lessons_state(fixture, fixture_dir, fixture_id)?;
+    let found = graph
+        .lessons
+        .iter()
+        .find(|l| l.lesson_id.as_str().eq(lesson_id));
+
+    let payload = serde_json::json!({
+        "schema_version": crate::lessons::LESSONS_SCHEMA_VERSION,
+        "mode": mode,
+        "project": manifest.project.clone(),
+        "requested_id": lesson_id,
+        "found": found.is_some(),
+        "lesson": found.map(lesson_record_value),
+        "available_count": graph.lessons.len(),
+    });
+
+    emit_lessons_payload(cli, json, payload, |p| {
+        if p.get("found")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|found| found)
+        {
+            format!(
+                "Lesson {lesson_id}: {}",
+                p.pointer("/lesson/summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            )
+        } else {
+            format!(
+                "Lesson {lesson_id} not found ({} available)",
+                p.get("available_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            )
+        }
     })
 }
 
@@ -18835,6 +19345,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Mirror(..)) => "mirror".to_string(),
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
+        Some(Commands::Lessons(..)) => "lessons".to_string(),
         Some(Commands::Swarm(..)) => "swarm".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
         #[cfg(unix)]
@@ -19196,6 +19707,11 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Lessons(
+            LessonsCommand::List { json, .. }
+            | LessonsCommand::Search { json, .. }
+            | LessonsCommand::View { json, .. },
+        ) => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sources(_) => false,
         Commands::Quarantine(
             QuarantineCommand::List { json, .. } | QuarantineCommand::Clear { json, .. },
