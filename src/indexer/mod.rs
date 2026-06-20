@@ -21949,10 +21949,9 @@ fn quarantine_source_missing_ids(data_dir: &Path) -> BTreeSet<String> {
                 continue;
             };
             if let Some(source_path) = value.get("source_path").and_then(serde_json::Value::as_str)
+                && !Path::new(source_path).exists()
             {
-                if !Path::new(source_path).exists() {
-                    missing.insert(conversation_id.to_string());
-                }
+                missing.insert(conversation_id.to_string());
             }
         }
     }
