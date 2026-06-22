@@ -1147,6 +1147,35 @@ fn health_shape_matches_golden() {
 }
 
 #[test]
+fn onboarding_json_matches_golden() {
+    // `cass onboarding --json` on an isolated empty HOME: no providers detected,
+    // no semantic model, no archive DB → recommended_action=discover_sources,
+    // mutation_free=true. Read-only; deterministic; paths scrub to [TEST_HOME].
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let scrubbed = capture_robot_json(
+        test_home.path(),
+        &["onboarding", "--json"],
+        ExpectStatus::ExitAny,
+    );
+    assert_golden("robot/onboarding.json.golden", &scrubbed);
+}
+
+#[test]
+fn onboarding_shape_matches_golden() {
+    let test_home = tempfile::tempdir().expect("create temp home");
+    let onboarding = capture_robot_json(
+        test_home.path(),
+        &["onboarding", "--json"],
+        ExpectStatus::ExitAny,
+    );
+    let onboarding: Value =
+        serde_json::from_str(&onboarding).expect("parse scrubbed onboarding JSON");
+    let canonical =
+        serde_json::to_string_pretty(&json_value_schema(&onboarding)).expect("pretty-print JSON");
+    assert_golden("robot/onboarding_shape.json.golden", &canonical);
+}
+
+#[test]
 fn diag_json_matches_golden() {
     // `cass diag --json` is the artifact-inventory surface that
     // ibuuh.36's verification matrix wants frozen alongside manifest

@@ -1,9 +1,12 @@
-// Dead-code tolerated module-wide: this redacted recovery/support evidence
-// bundle contract (bead cass-fleet-resilience-20260608-uojcg.13.3) lands ahead
-// of its CLI command + real-binary E2E wiring. The live `cass` command that
-// gathers the readiness summary, command envelope, source/fleet provenance,
-// quarantine, and root-cause attribution and emits a shareable bundle is the
-// follow-on; this is the pure, fixture-testable assembler + redaction posture.
+// Dead-code tolerated module-wide: the pure assembler + redaction posture
+// (bead cass-fleet-resilience-20260608-uojcg.13.3) is now wired live by
+// `cass support-bundle` (bead 6f1lm; see src/lib.rs::run_support_bundle, which
+// gathers the readiness summary, command envelope, source provenance,
+// quarantine, and root-cause attribution and emits the shareable bundle). Two
+// pieces remain forward API the local single-host surface does not yet
+// populate: the proof-log links (`ProofLogKind`/`ProofLogLink` — the bundle
+// passes an empty Vec) and multi-host `FleetSummary` (passed `None`), so the
+// module-wide allow stays until those are wired.
 #![allow(dead_code)]
 
 //! Redacted recovery / support evidence bundle (bead

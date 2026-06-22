@@ -641,6 +641,9 @@ struct RenderedEvidence {
     excerpt_truncated: bool,
     estimated_tokens: usize,
     citation: RenderedCitation,
+    /// Metadata-only trust/provenance verdict for this evidence item (bead
+    /// 5u82n.3). Advisory; mirrors the per-hit `trust` block on `cass search`.
+    trust: crate::search::trust_scoring::TrustAssessment,
     selection: RenderedSelection,
     roles: Vec<&'static str>,
     matched_terms: Vec<String>,
@@ -1395,10 +1398,15 @@ fn rendered_answer_pack(
     plan: &PlannedAnswerPack,
     request: &PackRenderRequest,
 ) -> RenderedAnswerPack {
+    // q4pau: build the commit/bead/release correlation index once per pack render
+    // (fail-open empty index off-repo); its repo root anchors cwd-relative
+    // workspace matching for each evidence item.
+    let correlation = crate::search::trust_correlation::build_for_cwd();
+    let query_workspace = correlation.project_workspace();
     let evidence = plan
         .evidence
         .iter()
-        .map(|item| rendered_evidence(item, request))
+        .map(|item| rendered_evidence(item, request, &correlation, query_workspace.as_deref()))
         .collect::<Vec<_>>();
     let mut envelope_redactions = Vec::new();
     let query_text = redact_pack_output_text(&request.query_text, &mut envelope_redactions);
@@ -1783,7 +1791,103 @@ fn push_full_redaction(
     });
 }
 
-fn rendered_evidence(item: &PlannedPackEvidence, request: &PackRenderRequest) -> RenderedEvidence {
+/// Map a pack evidence candidate's source story to the trust source-kind. An
+/// unavailable source is archive-only (source-unhealthy) for trust purposes;
+/// otherwise classify by origin (live local file vs reachable remote mirror).
+fn pack_trust_source_kind(
+    readiness: PackSourceReadiness,
+    origin_kind: &str,
+) -> crate::search::trust_scoring::SourceTrustKind {
+    use crate::search::trust_scoring::SourceTrustKind;
+    if matches!(readiness, PackSourceReadiness::Unavailable) {
+        SourceTrustKind::ArchiveOnly
+    } else if origin_kind.eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID) {
+        SourceTrustKind::LocalPresent
+    } else {
+        SourceTrustKind::RemoteMirror
+    }
+}
+
+/// Map the pack's realized search mode (the requested mode plus any lexical
+/// fallback) to the trust [`RealizedMode`](crate::search::trust_scoring::RealizedMode).
+fn pack_trust_realized_mode(
+    search_mode: &str,
+    fallback_mode: Option<&str>,
+) -> crate::search::trust_scoring::RealizedMode {
+    use crate::search::trust_scoring::RealizedMode;
+    if fallback_mode.is_some_and(|mode| mode.eq_ignore_ascii_case("lexical")) {
+        return RealizedMode::Lexical;
+    }
+    match search_mode.to_ascii_lowercase().as_str() {
+        "lexical" => RealizedMode::Lexical,
+        "semantic" => RealizedMode::Semantic,
+        _ => RealizedMode::Hybrid,
+    }
+}
+
+/// Build the metadata-only trust verdict for one pack evidence item (beads
+/// 5u82n.3 + q4pau). Advisory only; the same scoring core that powers the
+/// per-hit `cass search` verdict. Recency/source/mode always contribute;
+/// `query_workspace` drives a cwd-relative workspace match, and for on-project
+/// evidence `correlation` links the excerpt to a closed bead / commit / proof /
+/// release when it references a known identifier.
+fn pack_trust_assessment(
+    candidate: &PackCandidate,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+    query_workspace: Option<&str>,
+) -> crate::search::trust_scoring::TrustAssessment {
+    use crate::search::trust_correlation::{correlate, proof_for, scan_text, workspace_matches};
+    use crate::search::trust_scoring::{HitTrustContext, assess_trust, derive_trust_signals};
+    let workspace = {
+        let ws = candidate.workspace.trim();
+        (!ws.is_empty()).then(|| ws.to_string())
+    };
+    let on_project = match (query_workspace, workspace.as_deref()) {
+        (None, _) => None,
+        (Some(q), Some(w)) => Some(workspace_matches(q, w)),
+        (Some(_), None) => Some(false),
+    };
+    let mut ctx = HitTrustContext {
+        created_at_ms: candidate.created_at_ms,
+        now_ms: request.generated_at_ms,
+        workspace,
+        query_workspace: None,
+        source_kind: pack_trust_source_kind(candidate.source_readiness, &candidate.origin_kind),
+        realized_mode: pack_trust_realized_mode(
+            &request.search_mode,
+            request.fallback_mode.as_deref(),
+        ),
+        ..HitTrustContext::default()
+    };
+    if matches!(on_project, Some(true)) {
+        let scan = scan_text(&[&candidate.excerpt]);
+        let link = correlate(correlation, &scan);
+        if !link.is_empty() {
+            ctx.outcome = link.outcome;
+            ctx.linked_closed_bead = link.linked_closed_bead;
+            if let Some(commit) = link.linked_commit {
+                ctx.release_tag = correlation.release_tag_for_commit(&commit);
+                ctx.linked_commit = Some(commit);
+            }
+            ctx.proof = proof_for(
+                ctx.outcome,
+                ctx.linked_commit.is_some(),
+                ctx.release_tag.is_some(),
+            );
+        }
+    }
+    let mut signals = derive_trust_signals(&ctx);
+    signals.workspace_match = on_project.unwrap_or(true);
+    assess_trust(&signals)
+}
+
+fn rendered_evidence(
+    item: &PlannedPackEvidence,
+    request: &PackRenderRequest,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+    query_workspace: Option<&str>,
+) -> RenderedEvidence {
     let candidate = &item.candidate;
     let mut redactions = Vec::new();
     let excerpt = redact_pack_output_text(&item.excerpt, &mut redactions);
@@ -1822,6 +1926,7 @@ fn rendered_evidence(item: &PlannedPackEvidence, request: &PackRenderRequest) ->
         match_type: candidate.match_type.clone(),
         verified: candidate.line_start.is_some() && !candidate.source_path.trim().is_empty(),
     };
+    let trust = pack_trust_assessment(candidate, request, correlation, query_workspace);
     RenderedEvidence {
         id: item.id.clone(),
         rank: item.rank,
@@ -1829,6 +1934,7 @@ fn rendered_evidence(item: &PlannedPackEvidence, request: &PackRenderRequest) ->
         excerpt_truncated: item.excerpt_truncated,
         estimated_tokens: item.estimated_tokens,
         citation,
+        trust,
         selection: rendered_selection(item.selection, request.explain_selection),
         roles: rendered_roles(candidate.role),
         matched_terms: candidate

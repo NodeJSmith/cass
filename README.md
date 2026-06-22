@@ -854,6 +854,48 @@ cass search "error" --robot-format compact
 cass search "error" --robot --robot-meta
 # → { "hits": [...], "_meta": { "elapsed_ms": 12, "cache_hit": true, "wildcard_fallback": false, ... } }
 
+# Per-hit trust verdict (advisory; --robot-meta only)
+cass search "error" --robot --robot-meta
+# Each hit then carries a metadata-only `trust` block:
+#   "trust": {
+#     "schema_version": 1,
+#     "trust_tier": "unverified",     // trusted | likely | unverified | stale | failed
+#     "confidence": "medium",         // low | medium | high
+#     "provenance_refs": [],          // e.g. ["commit:ab0d12ef90ab", "bead:xyz", "release:v0.6.15"]
+#     "stale_reason": "aged_out",     // present only when not fully trusted
+#     "recommended_followup": "..."   // advisory next step (never a destructive command)
+#   }
+```
+
+**How agents should branch on `trust_tier`** (relevance is not correctness — a
+hit can be a landed fix or a failed attempt):
+
+| `trust_tier` | Meaning | What to do |
+|--------------|---------|------------|
+| `trusted` | Landed, proof-backed, release/bead-contained | Safe to reuse |
+| `likely` | Has provenance (commit/closed bead) but not proof-pinned | Confirm via the cited ref first |
+| `unverified` | Relevant but no provenance link, or lexical-only corroboration | Corroborate before reuse |
+| `stale` | Aged out (`aged_out`) or superseded (`superseded_by_newer`) | Prefer a newer result |
+| `failed` | A failed/reverted attempt (`failed_attempt`) | Do not reuse |
+
+The verdict is **advisory metadata only** — it never changes result ordering.
+It is derived from metadata-only signals (recency, source health, realized
+search mode, cwd-relative workspace match, and — opportunistically — linked
+commit/bead/release provenance); it carries no raw session text. The same
+`trust` block is attached to `cass pack` evidence. Branch on `trust_tier` and
+`stale_reason`, not on `confidence` alone.
+
+Provenance correlation is **project-scoped and explicit-reference anchored**:
+for a hit from the project you are running `cass` in now, cass links it to a
+closed bead / commit / proof / release only when the hit's own indexed text
+references a known identifier (`bead:<id>`, `commit:<sha>`, `release:<tag>`),
+joined against that project's local beads and git history. A temporal or
+workspace coincidence is never enough, so an unrelated conversation never
+inherits another's trust. Off-project hits report `workspace_mismatch`, and a
+hit whose local source file no longer exists on disk reports `source_unhealthy`
+(archive-only) instead of overtrusting a dead path.
+
+```bash
 # Deterministic answer pack for handoff prompts
 cass pack "why did checkout fail" --robot --max-tokens 12000 --limit 40
 

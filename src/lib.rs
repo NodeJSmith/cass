@@ -34,6 +34,7 @@ pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
 pub mod lessons;
+pub mod lessons_extraction;
 pub mod metric_integrity;
 pub mod model;
 pub mod pages;
@@ -734,6 +735,28 @@ pub enum Commands {
         #[arg(long, default_value_t = 300)]
         stale_threshold: u64,
     },
+    /// Assemble a redacted, share-safe recovery/support evidence bundle
+    SupportBundle {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+
+        /// Staleness threshold in seconds (default: 300)
+        #[arg(long, default_value_t = 300)]
+        stale_threshold: u64,
+
+        /// Include full filesystem paths in the bundle (default: basename-only)
+        #[arg(long, default_value_t = false)]
+        include_full_paths: bool,
+
+        /// Include raw session/tool payloads in the bundle (default: suppressed)
+        #[arg(long, default_value_t = false)]
+        include_raw_evidence: bool,
+    },
     /// Quick state/health check (alias of status)
     State {
         /// Override data dir
@@ -794,6 +817,17 @@ pub enum Commands {
         /// Staleness threshold in seconds (default: 300)
         #[arg(long, default_value_t = 300)]
         stale_threshold: u64,
+    },
+    /// First-run source onboarding + readiness wizard. Read-only: explains what
+    /// CASS found, what it will index, what is missing, and the single safest
+    /// next command. Scriptable via `--json`; never launches a bare TUI.
+    Onboarding {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        /// Output as JSON (for automation)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
     /// Diagnose cass installation issues. Legacy `cass doctor --json` maps to the read-only check surface.
     /// Legacy `--fix` maps to safe-auto-run and may only apply contract-declared safe repairs.
@@ -1344,6 +1378,27 @@ pub enum Commands {
     /// Inspect and manage the conversation-ingest quarantine (list / clear)
     #[command(subcommand)]
     Quarantine(QuarantineCommand),
+    /// Prune an already-indexed subset of conversations by source-path glob
+    /// (dry-run by default; `--apply` to commit). Removes matching rows from the
+    /// canonical DB and rebuilds derived search/analytics assets.
+    Forget {
+        /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
+        #[arg(long = "source-glob")]
+        source_glob: String,
+
+        /// Override db path
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Actually delete the matching conversations. Without this, runs as a
+        /// dry-run (inspect only).
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
     /// Inspect and prune raw-mirror evidence under explicit operator control
     #[command(subcommand)]
     Mirror(MirrorCommand),
@@ -1353,6 +1408,9 @@ pub enum Commands {
     /// Manage semantic search models
     #[command(subcommand)]
     Models(ModelsCommand),
+    /// Mine and query durable lessons from local evidence (commits, beads, proofs)
+    #[command(subcommand)]
+    Lessons(LessonsCommand),
     /// Read-only swarm operations status, work packets, and coordination lint
     #[command(subcommand)]
     Swarm(SwarmCommand),
@@ -1456,6 +1514,35 @@ pub enum QuarantineCommand {
         filter: Option<String>,
 
         /// Actually remove the matching entries. Without this, runs as a dry-run (inspect only).
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+    },
+    /// Re-attempt retry-eligible quarantined conversations (bounded; dry-run by
+    /// default). Clears eligible (legacy / version-stale) entries so they are
+    /// re-ingested on the next `cass index` pass; irreducible same-version
+    /// entries are reported but never cleared unless `--force-irreducible`.
+    Retry {
+        /// Override data dir
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+
+        /// Cap the number of entries attempted in this pass (bounded, resumable).
+        /// Omit to attempt every eligible entry. Deferred entries are reported,
+        /// never dropped — re-run to resume.
+        #[arg(long)]
+        max_attempts: Option<usize>,
+
+        /// Also retry irreducible same-version entries (an explicit operator
+        /// override of the safe eligible-only default).
+        #[arg(long, default_value_t = false)]
+        force_irreducible: bool,
+
+        /// Actually clear eligible entries so the next index re-ingests them.
+        /// Without this, runs as a dry-run (classify only).
         #[arg(long, default_value_t = false)]
         apply: bool,
 
@@ -2109,6 +2196,77 @@ pub enum ModelsCommand {
     },
 }
 
+/// Subcommands for the durable lessons graph (bead
+/// coding_agent_session_search-guided-ops-repro-trust-5u82n.4). Lessons are a
+/// derived, advisory surface mined from local cass evidence (landed commit
+/// summaries in live mode; commits/beads/proofs in fixture mode) and reduced to
+/// distinct, redacted, supersession-resolved records by
+/// [`crate::lessons::LessonGraph`].
+#[derive(Subcommand, Debug, Clone)]
+pub enum LessonsCommand {
+    /// List durable lessons mined from local evidence.
+    List {
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Read evidence from a single lessons fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+        /// Read evidence from a lessons fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+        /// Fixture id within --fixture-dir (resolves to `<id>.evidence.json`).
+        #[arg(long, default_value = "corpus")]
+        fixture_id: String,
+        /// Lifecycle filter: active, superseded, outdated, or all.
+        #[arg(long, default_value = "active")]
+        status: String,
+        /// Restrict to one lesson kind (e.g. gotcha, security_warning, invariant).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Cap the number of lessons returned.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Search durable lessons by substring over topic, summary, and applies-to.
+    Search {
+        /// Query terms (case-insensitive AND-of-substrings).
+        query: String,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Read evidence from a single lessons fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+        /// Read evidence from a lessons fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+        /// Fixture id within --fixture-dir (resolves to `<id>.evidence.json`).
+        #[arg(long, default_value = "corpus")]
+        fixture_id: String,
+        /// Cap the number of lessons returned.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// View one lesson by its stable lesson id.
+    View {
+        /// Lesson id (e.g. `lsn-0123456789abcdef`).
+        lesson_id: String,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
+        /// Read evidence from a single lessons fixture file.
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "fixture_dir")]
+        fixture: Option<PathBuf>,
+        /// Read evidence from a lessons fixture directory.
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        fixture_dir: Option<PathBuf>,
+        /// Fixture id within --fixture-dir (resolves to `<id>.evidence.json`).
+        #[arg(long, default_value = "corpus")]
+        fixture_id: String,
+    },
+}
+
 /// Subcommands for managing path mappings (P6.3)
 #[derive(Subcommand, Debug, Clone)]
 pub enum MappingsAction {
@@ -2704,7 +2862,9 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "import"
             | "index"
             | "introspect"
+            | "lessons"
             | "models"
+            | "onboarding"
             | "pack"
             | "pages"
             | "release-verify"
@@ -2717,6 +2877,7 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "stats"
             | "status"
             | "storage"
+            | "support-bundle"
             | "swarm"
             | "timeline"
             | "triage"
@@ -2729,8 +2890,8 @@ fn data_dir_insertion_index(rest: &[String], command_index: usize) -> Option<usi
     let command = rest.get(command_index)?.to_ascii_lowercase();
     match command.as_str() {
         "tui" | "index" | "search" | "pack" | "stats" | "diag" | "storage" | "dedup" | "status"
-        | "triage" | "state" | "health" | "doctor" | "context" | "sessions" | "timeline"
-        | "daemon" => Some(command_index + 1),
+        | "triage" | "support-bundle" | "state" | "health" | "onboarding" | "doctor" | "context"
+        | "sessions" | "timeline" | "daemon" => Some(command_index + 1),
         "mirror" => rest
             .get(command_index + 1)
             .is_some_and(|action| action.eq_ignore_ascii_case("prune"))
@@ -5573,11 +5734,14 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "index",
     "capabilities",
     "triage",
+    "support-bundle",
+    "onboarding",
     "introspect",
     "api-version",
     "release-verify",
     "robot-docs",
     "models",
+    "lessons",
     "quarantine",
     "sources",
     "analytics",
@@ -6258,6 +6422,7 @@ async fn execute_cli(
         | Commands::Dedup { .. }
         | Commands::Status { .. }
         | Commands::Triage { .. }
+        | Commands::SupportBundle { .. }
         | Commands::View { .. }
         | Commands::Pages { .. }
         | Commands::Analytics(..) => {
@@ -6591,6 +6756,23 @@ async fn execute_cli(
                         cli.db.clone(),
                         structured_format,
                         stale_threshold,
+                    )?;
+                }
+                Commands::SupportBundle {
+                    data_dir,
+                    json,
+                    stale_threshold,
+                    include_full_paths,
+                    include_raw_evidence,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_support_bundle(
+                        &data_dir,
+                        cli.db.clone(),
+                        structured_format,
+                        stale_threshold,
+                        include_full_paths,
+                        include_raw_evidence,
                     )?;
                 }
                 Commands::View {
@@ -7209,6 +7391,10 @@ async fn execute_cli(
                         robot_meta,
                     )?;
                 }
+                Commands::Onboarding { data_dir, json } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_onboarding(&data_dir, cli.db.clone(), structured_format)?;
+                }
                 Commands::Doctor {
                     data_dir,
                     json,
@@ -7632,6 +7818,15 @@ async fn execute_cli(
                 Commands::Quarantine(subcmd) => {
                     run_quarantine_command(subcmd, cli)?;
                 }
+                Commands::Forget {
+                    source_glob,
+                    db,
+                    apply,
+                    json,
+                } => {
+                    let structured_format = resolve_subcommand_structured_format(cli, json);
+                    run_forget_command(source_glob, db, apply, cli, structured_format)?;
+                }
                 Commands::Mirror(subcmd) => {
                     run_mirror_command(subcmd, cli)?;
                 }
@@ -7649,6 +7844,9 @@ async fn execute_cli(
                     })
                     .await;
                     result?;
+                }
+                Commands::Lessons(subcmd) => {
+                    run_lessons_command(subcmd, cli)?;
                 }
                 Commands::Import(subcmd) => {
                     handle_import(subcmd, cli).await?;
@@ -7724,7 +7922,115 @@ fn run_quarantine_command(cmd: QuarantineCommand, cli: &Cli) -> CliResult<()> {
             let structured_format = resolve_subcommand_structured_format(cli, json);
             run_quarantine_clear(data_dir, filter, apply, structured_format)
         }
+        QuarantineCommand::Retry {
+            data_dir,
+            max_attempts,
+            force_irreducible,
+            apply,
+            json,
+        } => {
+            let structured_format = resolve_subcommand_structured_format(cli, json);
+            run_quarantine_retry_command(
+                data_dir,
+                max_attempts,
+                force_irreducible,
+                apply,
+                structured_format,
+            )
+        }
     }
+}
+
+/// `cass quarantine retry`: a bounded, resumable retry of retry-eligible
+/// quarantined conversations (#292 ask #3). Dry-run by default; `--apply` clears
+/// eligible entries so the next `cass index` re-ingests them.
+fn run_quarantine_retry_command(
+    data_dir_override: Option<PathBuf>,
+    max_attempts: Option<usize>,
+    force_irreducible: bool,
+    apply: bool,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let data_dir = data_dir_override.unwrap_or_else(default_data_dir);
+    let config = crate::indexer::quarantine_retry::RetryConfig {
+        max_attempts,
+        eligible_only: !force_irreducible,
+    };
+
+    let report =
+        crate::indexer::run_quarantine_retry(&data_dir, &config, apply).map_err(|err| {
+            CliError {
+                code: 9,
+                kind: "quarantine",
+                message: format!("quarantine retry failed: {err}"),
+                hint: Some(
+                    "Run `cass quarantine list --json` to inspect entries, then retry.".to_string(),
+                ),
+                retryable: false,
+            }
+        })?;
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("schema_version".to_string(), serde_json::json!(1));
+            obj.insert("applied".to_string(), serde_json::json!(apply));
+            obj.insert("dry_run".to_string(), serde_json::json!(!apply));
+            obj.insert(
+                "data_dir".to_string(),
+                serde_json::json!(data_dir.display().to_string()),
+            );
+        }
+        return output_structured_value(payload, fmt);
+    }
+
+    println!("CASS Quarantine Retry");
+    println!("=====================");
+    println!();
+    println!(
+        "Mode: {}",
+        if apply {
+            "APPLY (clears eligible entries for re-ingest on next index)"
+        } else {
+            "dry-run (classify only)"
+        }
+    );
+    println!();
+    println!("{}", report.summary);
+    if apply {
+        println!(
+            "  cleared (eligible): {}, remaining quarantined: {}",
+            report.cleared, report.remaining_quarantined
+        );
+    } else {
+        println!(
+            "  eligible for retry: {}, irreducible: {}, source-missing: {}",
+            report
+                .entries
+                .iter()
+                .filter(|e| matches!(
+                    e.outcome,
+                    crate::indexer::quarantine_retry::RetryOutcome::RetriedCleared
+                ))
+                .count(),
+            report.skipped_irreducible,
+            report.skipped_source_missing
+        );
+    }
+    if report.resume_recommended {
+        println!("  (budget reached — re-run to resume the remaining eligible entries)");
+    }
+    println!();
+    println!("Next: {}", report.next_safe_command);
+    Ok(())
 }
 
 /// Build the deterministic per-entry JSON view used by both `list` and the
@@ -7936,6 +8242,133 @@ fn run_quarantine_clear(
     Ok(())
 }
 
+/// `cass forget --source-glob <pat>`: prune an already-indexed subset of
+/// conversations by source-path glob (#292 ask #2). Dry-run by default;
+/// `--apply` deletes the matching rows from the canonical DB and rebuilds the
+/// derived search/analytics assets so search coverage stays consistent.
+fn run_forget_command(
+    source_glob: String,
+    db_override: Option<PathBuf>,
+    apply: bool,
+    cli: &Cli,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    use crate::storage::sqlite::FrankenStorage;
+
+    let db_path = db_override
+        .or_else(|| cli.db.clone())
+        .unwrap_or_else(default_db_path);
+    if !db_path.is_file() {
+        return Err(CliError {
+            code: 5,
+            kind: "forget",
+            message: format!("no canonical database at {}", db_path.display()),
+            hint: Some("Run `cass index` first, or pass --db <path>.".to_string()),
+            retryable: false,
+        });
+    }
+
+    let storage = FrankenStorage::open(&db_path).map_err(|e| CliError {
+        code: 5,
+        kind: "forget",
+        message: format!("failed to open canonical database: {e}"),
+        hint: None,
+        retryable: false,
+    })?;
+
+    let report = storage
+        .forget_conversations_by_source_glob(&source_glob, !apply)
+        .map_err(|e| CliError {
+            code: 5,
+            kind: "forget",
+            message: format!("forget failed: {e}"),
+            hint: Some(
+                "Run `cass forget --source-glob <pat> --json` (dry-run) first to inspect matches."
+                    .to_string(),
+            ),
+            retryable: false,
+        })?;
+
+    // After an actual deletion, rebuild derived assets so search/analytics stay
+    // consistent (mirrors the agent-purge path). The lexical index also
+    // self-heals on next search, but rebuilding FTS now keeps DB-resident
+    // surfaces correct.
+    if apply && report.conversations_deleted > 0 {
+        if let Err(e) = storage.rebuild_fts() {
+            tracing::warn!(error = %e, "forget: failed to rebuild FTS after deletion");
+        }
+        if let Err(e) = storage.rebuild_analytics() {
+            tracing::warn!(error = %e, "forget: failed to rebuild analytics after deletion");
+        }
+        if let Err(e) = storage.rebuild_daily_stats() {
+            tracing::warn!(error = %e, "forget: failed to rebuild daily stats after deletion");
+        }
+    }
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let mut payload = serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("schema_version".to_string(), serde_json::json!(1));
+            obj.insert("applied".to_string(), serde_json::json!(apply));
+            obj.insert(
+                "db_path".to_string(),
+                serde_json::json!(db_path.display().to_string()),
+            );
+        }
+        return output_structured_value(payload, fmt);
+    }
+
+    println!("CASS Forget (prune conversations by source glob)");
+    println!("================================================");
+    println!();
+    println!(
+        "Mode: {}",
+        if apply {
+            "APPLY (mutating)"
+        } else {
+            "dry-run (inspect only)"
+        }
+    );
+    println!("Pattern: {}", report.pattern);
+    println!();
+    println!(
+        "Matched conversations: {} ({} messages)",
+        report.conversations_matched, report.messages_matched
+    );
+    if !report.sample_source_paths.is_empty() {
+        println!("Sample matches:");
+        for path in &report.sample_source_paths {
+            println!("  {path}");
+        }
+        if report.conversations_matched > report.sample_source_paths.len() {
+            println!(
+                "  ... and {} more",
+                report.conversations_matched - report.sample_source_paths.len()
+            );
+        }
+    }
+    println!();
+    if apply {
+        println!(
+            "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
+            report.conversations_deleted
+        );
+    } else if report.conversations_matched > 0 {
+        println!("Re-run with --apply to delete these conversations.");
+    } else {
+        println!("No conversations match. Nothing to forget.");
+    }
+    Ok(())
+}
+
 fn run_mirror_prune(
     data_dir_override: Option<PathBuf>,
     older_than: Option<String>,
@@ -8110,6 +8543,436 @@ fn parse_size_bytes(raw: &str) -> std::result::Result<u64, CliError> {
             format!("size `{value}` is too large"),
             Some("Use a smaller size limit.".to_string()),
         )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// `cass lessons` — durable lessons graph
+// (coding_agent_session_search-guided-ops-repro-trust-5u82n.4)
+//
+// Lessons are a derived, advisory surface: local evidence (landed commit
+// summaries in live mode; commits/beads/proofs in fixture mode) is classified
+// and redacted by `crate::lessons_extraction`, then reduced to distinct,
+// supersession-resolved records by `crate::lessons::LessonGraph`. The command
+// is read-only and never mutates user data.
+// ---------------------------------------------------------------------------
+
+/// Resolve an optional lessons-evidence fixture path, mirroring the swarm
+/// resolver: an explicit `--fixture` file, else `<dir>/<id>.evidence.json`.
+fn resolve_lessons_fixture_path(
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<Option<PathBuf>> {
+    if let Some(path) = fixture {
+        return Ok(Some(path.to_path_buf()));
+    }
+    let Some(dir) = fixture_dir else {
+        return Ok(None);
+    };
+    if fixture_id.trim().is_empty()
+        || fixture_id.contains('/')
+        || fixture_id.contains('\\')
+        || matches!(fixture_id, "." | "..")
+    {
+        return Err(CliError::usage(
+            "Invalid lessons fixture id",
+            Some("Use a simple fixture id such as `corpus`.".to_string()),
+        ));
+    }
+    Ok(Some(dir.join(format!("{fixture_id}.evidence.json"))))
+}
+
+/// Read and parse a lessons-evidence fixture file.
+fn load_lessons_evidence(path: &Path) -> CliResult<crate::lessons_extraction::LessonsEvidence> {
+    let body = std::fs::read_to_string(path).map_err(|source| CliError {
+        code: 10,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!("failed to read lessons fixture {}: {source}", path.display()),
+        hint: Some(
+            "Pass --fixture <file> or --fixture-dir <dir> --fixture-id <id> with a checked-in lessons evidence file."
+                .to_string(),
+        ),
+        retryable: false,
+    })?;
+    serde_json::from_str(&body).map_err(|source| CliError {
+        code: 10,
+        kind: CliErrorKind::Config.kind_str(),
+        message: format!(
+            "failed to parse lessons fixture {}: {source}",
+            path.display()
+        ),
+        hint: None,
+        retryable: false,
+    })
+}
+
+/// Gather live lessons evidence from the local repository: landed commit
+/// summaries (the most universally available, stable signal). Richer live bead
+/// and proof mining is a scoped follow-on; the extraction core already supports
+/// all three sources and fixture mode exercises them.
+fn gather_live_lessons_evidence() -> crate::lessons_extraction::LessonsEvidence {
+    let repo = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project = repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "cass".to_string());
+    crate::lessons_extraction::LessonsEvidence {
+        project,
+        commits: gather_git_commit_evidence(&repo, 500),
+        beads: Vec::new(),
+        proofs: Vec::new(),
+    }
+}
+
+/// Best-effort read of the last `max` non-merge commit subjects from `repo`.
+/// Returns an empty vec when git is unavailable or `repo` is not a repository,
+/// keeping live mode honest rather than failing.
+fn gather_git_commit_evidence(
+    repo: &Path,
+    max: usize,
+) -> Vec<crate::lessons_extraction::CommitEvidence> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("log")
+        .arg("--no-merges")
+        .arg(format!("--max-count={max}"))
+        .arg("--pretty=format:%H\u{1f}%ct\u{1f}%s")
+        .output();
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut commits = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\u{1f}');
+        let (Some(sha), Some(ct), Some(subject)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if subject.trim().is_empty() {
+            continue;
+        }
+        let ts_ms = ct.trim().parse::<u64>().unwrap_or(0).saturating_mul(1000);
+        commits.push(crate::lessons_extraction::CommitEvidence {
+            sha: sha.to_string(),
+            subject: subject.to_string(),
+            body: String::new(),
+            timestamp_ms: ts_ms,
+        });
+    }
+    commits
+}
+
+/// Build the lessons graph + extraction manifest from a fixture or live
+/// evidence, returning the resolved mode label ("fixture"/"live").
+fn build_lessons_state(
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<(
+    crate::lessons::LessonGraph,
+    crate::lessons_extraction::ExtractionManifest,
+    &'static str,
+)> {
+    let evidence_path = resolve_lessons_fixture_path(fixture, fixture_dir, fixture_id)?;
+    let (evidence, mode) = match evidence_path {
+        Some(path) => (load_lessons_evidence(&path)?, "fixture"),
+        None => (gather_live_lessons_evidence(), "live"),
+    };
+    let extraction = crate::lessons_extraction::extract(&evidence);
+    let graph = crate::lessons::LessonGraph::build(extraction.candidates);
+    Ok((graph, extraction.manifest, mode))
+}
+
+/// Whether a lesson passes a lifecycle `status` filter ("all" passes any).
+fn lesson_passes_status_filter(record: &crate::lessons::LessonRecord, filter: &str) -> bool {
+    filter.eq_ignore_ascii_case("all") || record.status.as_str().eq_ignore_ascii_case(filter)
+}
+
+/// Whether a lesson passes an optional `kind` filter.
+fn lesson_passes_kind_filter(record: &crate::lessons::LessonRecord, kind: Option<&str>) -> bool {
+    match kind {
+        None => true,
+        Some(k) => record.kind.as_str().eq_ignore_ascii_case(k),
+    }
+}
+
+/// Whether every query token is a substring of the lesson's searchable text.
+fn lesson_matches_query(record: &crate::lessons::LessonRecord, tokens: &[String]) -> bool {
+    let hay = format!(
+        "{} {} {} {}",
+        record.topic,
+        record.summary,
+        record.applies_to.join(" "),
+        record.kind.as_str()
+    )
+    .to_ascii_lowercase();
+    tokens.iter().all(|t| hay.contains(t.as_str()))
+}
+
+/// Sort rank so active lessons sort ahead of superseded ahead of outdated.
+fn lesson_status_rank(status: crate::lessons::LessonStatus) -> u8 {
+    match status {
+        crate::lessons::LessonStatus::Active => 0,
+        crate::lessons::LessonStatus::Superseded => 1,
+        crate::lessons::LessonStatus::Outdated => 2,
+    }
+}
+
+/// Serialize a lesson record to a JSON value (never fails for these types).
+fn lesson_record_value(record: &crate::lessons::LessonRecord) -> serde_json::Value {
+    serde_json::to_value(record).unwrap_or(serde_json::Value::Null)
+}
+
+/// Emit a lessons payload as structured output, or a terse human summary line.
+fn emit_lessons_payload(
+    cli: &Cli,
+    json: bool,
+    payload: serde_json::Value,
+    human: impl FnOnce(&serde_json::Value) -> String,
+) -> CliResult<()> {
+    if let Some(fmt) = resolve_subcommand_structured_format(cli, json) {
+        let fmt = if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        };
+        output_structured_value(payload, fmt)?;
+    } else {
+        println!("{}", human(&payload));
+    }
+    Ok(())
+}
+
+fn run_lessons_command(cmd: LessonsCommand, cli: &Cli) -> CliResult<()> {
+    match cmd {
+        LessonsCommand::List {
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            status,
+            kind,
+            limit,
+        } => run_lessons_list(
+            cli,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            &status,
+            kind.as_deref(),
+            limit,
+        ),
+        LessonsCommand::Search {
+            query,
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+            limit,
+        } => run_lessons_search(
+            cli,
+            &query,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+            limit,
+        ),
+        LessonsCommand::View {
+            lesson_id,
+            json,
+            fixture,
+            fixture_dir,
+            fixture_id,
+        } => run_lessons_view(
+            cli,
+            &lesson_id,
+            json,
+            fixture.as_deref(),
+            fixture_dir.as_deref(),
+            &fixture_id,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lessons_list(
+    cli: &Cli,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    status: &str,
+    kind: Option<&str>,
+    limit: usize,
+) -> CliResult<()> {
+    let (graph, manifest, mode) = build_lessons_state(fixture, fixture_dir, fixture_id)?;
+    let mut selected: Vec<&crate::lessons::LessonRecord> = graph
+        .lessons
+        .iter()
+        .filter(|l| lesson_passes_status_filter(l, status))
+        .filter(|l| lesson_passes_kind_filter(l, kind))
+        .collect();
+    // Freshest first; stable tiebreak on id.
+    selected.sort_by(|a, b| {
+        b.freshness_ms
+            .cmp(&a.freshness_ms)
+            .then_with(|| a.lesson_id.cmp(&b.lesson_id))
+    });
+    let matched = selected.len();
+    selected.truncate(limit);
+    let lessons: Vec<serde_json::Value> = selected.into_iter().map(lesson_record_value).collect();
+    let returned = lessons.len();
+
+    let payload = serde_json::json!({
+        "schema_version": crate::lessons::LESSONS_SCHEMA_VERSION,
+        "mode": mode,
+        "project": manifest.project.clone(),
+        "summary": serde_json::to_value(graph.summary).unwrap_or(serde_json::Value::Null),
+        "manifest": serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        "redaction": serde_json::to_value(manifest.redaction).unwrap_or(serde_json::Value::Null),
+        "filter": { "status": status, "kind": kind, "limit": limit },
+        "matched": matched,
+        "returned": returned,
+        "lessons": lessons,
+    });
+
+    emit_lessons_payload(cli, json, payload, |p| {
+        format!(
+            "Lessons [{}]: {} active / {} total — {} shown",
+            p.get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            p.pointer("/summary/active")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            p.pointer("/summary/total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            p.get("returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_lessons_search(
+    cli: &Cli,
+    query: &str,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+    limit: usize,
+) -> CliResult<()> {
+    let (graph, manifest, mode) = build_lessons_state(fixture, fixture_dir, fixture_id)?;
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    let mut selected: Vec<&crate::lessons::LessonRecord> = if tokens.is_empty() {
+        graph.lessons.iter().collect()
+    } else {
+        graph
+            .lessons
+            .iter()
+            .filter(|l| lesson_matches_query(l, &tokens))
+            .collect()
+    };
+    // Active first, then freshest, then stable id.
+    selected.sort_by(|a, b| {
+        lesson_status_rank(a.status)
+            .cmp(&lesson_status_rank(b.status))
+            .then_with(|| b.freshness_ms.cmp(&a.freshness_ms))
+            .then_with(|| a.lesson_id.cmp(&b.lesson_id))
+    });
+    let matched = selected.len();
+    selected.truncate(limit);
+    let lessons: Vec<serde_json::Value> = selected.into_iter().map(lesson_record_value).collect();
+    let returned = lessons.len();
+
+    let payload = serde_json::json!({
+        "schema_version": crate::lessons::LESSONS_SCHEMA_VERSION,
+        "mode": mode,
+        "project": manifest.project.clone(),
+        "query": query,
+        "summary": serde_json::to_value(graph.summary).unwrap_or(serde_json::Value::Null),
+        "manifest": serde_json::to_value(&manifest).unwrap_or(serde_json::Value::Null),
+        "redaction": serde_json::to_value(manifest.redaction).unwrap_or(serde_json::Value::Null),
+        "matched": matched,
+        "returned": returned,
+        "lessons": lessons,
+    });
+
+    emit_lessons_payload(cli, json, payload, |p| {
+        format!(
+            "Lessons search [{}] {:?}: {} match(es), {} shown",
+            p.get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+            query,
+            p.get("matched")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+            p.get("returned")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        )
+    })
+}
+
+fn run_lessons_view(
+    cli: &Cli,
+    lesson_id: &str,
+    json: bool,
+    fixture: Option<&Path>,
+    fixture_dir: Option<&Path>,
+    fixture_id: &str,
+) -> CliResult<()> {
+    let (graph, manifest, mode) = build_lessons_state(fixture, fixture_dir, fixture_id)?;
+    let found = graph
+        .lessons
+        .iter()
+        .find(|l| l.lesson_id.as_str().eq(lesson_id));
+
+    let payload = serde_json::json!({
+        "schema_version": crate::lessons::LESSONS_SCHEMA_VERSION,
+        "mode": mode,
+        "project": manifest.project.clone(),
+        "requested_id": lesson_id,
+        "found": found.is_some(),
+        "lesson": found.map(lesson_record_value),
+        "available_count": graph.lessons.len(),
+    });
+
+    emit_lessons_payload(cli, json, payload, |p| {
+        if p.get("found")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|found| found)
+        {
+            format!(
+                "Lesson {lesson_id}: {}",
+                p.pointer("/lesson/summary")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+            )
+        } else {
+            format!(
+                "Lesson {lesson_id} not found ({} available)",
+                p.get("available_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            )
+        }
     })
 }
 
@@ -18474,6 +19337,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Dedup { .. }) => "dedup".to_string(),
         Some(Commands::Status { .. }) => "status".to_string(),
         Some(Commands::Triage { .. }) => "triage".to_string(),
+        Some(Commands::SupportBundle { .. }) => "support-bundle".to_string(),
         Some(Commands::View { .. }) => "view".to_string(),
         Some(Commands::Completions { .. }) => "completions".to_string(),
         Some(Commands::Man) => "man".to_string(),
@@ -18484,6 +19348,7 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Introspect { .. }) => "introspect".to_string(),
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
         Some(Commands::Health { .. }) => "health".to_string(),
+        Some(Commands::Onboarding { .. }) => "onboarding".to_string(),
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
         Some(Commands::Context { .. }) => "context".to_string(),
         Some(Commands::Sessions { .. }) => "sessions".to_string(),
@@ -18494,9 +19359,11 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Expand { .. }) => "expand".to_string(),
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
         Some(Commands::Quarantine(..)) => "quarantine".to_string(),
+        Some(Commands::Forget { .. }) => "forget".to_string(),
         Some(Commands::Mirror(..)) => "mirror".to_string(),
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
+        Some(Commands::Lessons(..)) => "lessons".to_string(),
         Some(Commands::Swarm(..)) => "swarm".to_string(),
         Some(Commands::Pages { .. }) => "pages".to_string(),
         #[cfg(unix)]
@@ -18744,6 +19611,9 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Pack { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Index { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Health { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
+        Commands::Onboarding { json, .. } => {
+            resolve_subcommand_structured_format(cli, *json).is_some()
+        }
         Commands::Pages { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sessions { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
@@ -18761,6 +19631,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         | Commands::Dedup { json, .. }
         | Commands::Status { json, .. }
         | Commands::Triage { json, .. }
+        | Commands::SupportBundle { json, .. }
         | Commands::ApiVersion { json }
         | Commands::ReleaseVerify { json, .. }
         | Commands::State { json, .. }
@@ -18778,6 +19649,7 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Mirror(MirrorCommand::Prune { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Forget { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sources(SourcesCommand::List { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
@@ -18856,6 +19728,11 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Models(ModelsCommand::CheckUpdate { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
+        Commands::Lessons(
+            LessonsCommand::List { json, .. }
+            | LessonsCommand::Search { json, .. }
+            | LessonsCommand::View { json, .. },
+        ) => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sources(_) => false,
         Commands::Quarantine(
             QuarantineCommand::List { json, .. } | QuarantineCommand::Clear { json, .. },
@@ -24233,6 +25110,104 @@ fn search_cursor_manifest_json(input: SearchCursorManifestInput<'_>) -> serde_js
     })
 }
 
+/// Map the realized [`SearchMode`] to the trust [`RealizedMode`] vocabulary.
+fn trust_realized_mode(
+    mode: crate::search::query::SearchMode,
+) -> crate::search::trust_scoring::RealizedMode {
+    use crate::search::query::SearchMode;
+    use crate::search::trust_scoring::RealizedMode;
+    match mode {
+        SearchMode::Lexical => RealizedMode::Lexical,
+        SearchMode::Semantic => RealizedMode::Semantic,
+        SearchMode::Hybrid => RealizedMode::Hybrid,
+    }
+}
+
+/// Map a hit's origin to the trust source-kind with a cheap fs/archive probe
+/// (q4pau). A remote hit is backed by a reachable mirror copy. A local hit whose
+/// recorded `source_path` no longer exists on disk is archive-only — the source
+/// file was deleted, moved, or pruned and only the DB row survives — so it scores
+/// `ArchiveOnly` (source-unhealthy) instead of overtrusting a dead path.
+fn trust_source_kind_for_hit(
+    hit: &crate::search::query::SearchHit,
+) -> crate::search::trust_scoring::SourceTrustKind {
+    use crate::search::trust_scoring::SourceTrustKind;
+    if !normalized_robot_hit_origin_kind(hit)
+        .eq_ignore_ascii_case(crate::sources::provenance::LOCAL_SOURCE_ID)
+    {
+        return SourceTrustKind::RemoteMirror;
+    }
+    let path = hit.source_path.trim();
+    if !path.is_empty() && std::path::Path::new(path).exists() {
+        SourceTrustKind::LocalPresent
+    } else {
+        SourceTrustKind::ArchiveOnly
+    }
+}
+
+/// Build the metadata-only trust verdict JSON for one search hit (beads
+/// 5u82n.3 + q4pau). Advisory only — it never affects result ordering.
+///
+/// Recency, source health (fs probe), and realized mode always contribute.
+/// `query_workspace` (the project the agent is in now) drives a cwd-relative
+/// workspace match. For on-project hits, `correlation` links the result to a
+/// closed bead / commit / proof / release when the hit's own indexed text
+/// references a known identifier — so the verdict reaches trusted/likely/failed
+/// instead of only unverified/stale. Off-project hits are never correlated, so a
+/// cross-project conversation cannot inherit this project's trust.
+fn trust_value_for_hit(
+    hit: &crate::search::query::SearchHit,
+    now_ms: i64,
+    realized_mode: crate::search::trust_scoring::RealizedMode,
+    correlation: &crate::search::trust_correlation::CorrelationIndex,
+    query_workspace: Option<&str>,
+) -> serde_json::Value {
+    use crate::search::trust_correlation::{correlate, proof_for, scan_text, workspace_matches};
+    use crate::search::trust_scoring::{HitTrustContext, assess_trust, derive_trust_signals};
+    let workspace = {
+        let ws = hit.workspace.trim();
+        (!ws.is_empty()).then(|| ws.to_string())
+    };
+    // cwd-relative workspace match: None (no cwd anchor) => no penalty and no
+    // correlation; Some(false) => off-project; Some(true) => on-project.
+    let on_project = match (query_workspace, workspace.as_deref()) {
+        (None, _) => None,
+        (Some(q), Some(w)) => Some(workspace_matches(q, w)),
+        (Some(_), None) => Some(false),
+    };
+    let mut ctx = HitTrustContext {
+        created_at_ms: hit.created_at,
+        now_ms,
+        workspace,
+        // Workspace match is applied below via the cwd-relative policy, so the
+        // pure derivation is left without a filter to avoid double-penalizing.
+        query_workspace: None,
+        source_kind: trust_source_kind_for_hit(hit),
+        realized_mode,
+        ..HitTrustContext::default()
+    };
+    if matches!(on_project, Some(true)) {
+        let scan = scan_text(&[&hit.title, &hit.snippet, &hit.content]);
+        let link = correlate(correlation, &scan);
+        if !link.is_empty() {
+            ctx.outcome = link.outcome;
+            ctx.linked_closed_bead = link.linked_closed_bead;
+            if let Some(commit) = link.linked_commit {
+                ctx.release_tag = correlation.release_tag_for_commit(&commit);
+                ctx.linked_commit = Some(commit);
+            }
+            ctx.proof = proof_for(
+                ctx.outcome,
+                ctx.linked_commit.is_some(),
+                ctx.release_tag.is_some(),
+            );
+        }
+    }
+    let mut signals = derive_trust_signals(&ctx);
+    signals.workspace_match = on_project.unwrap_or(true);
+    serde_json::to_value(assess_trust(&signals)).unwrap_or(serde_json::Value::Null)
+}
+
 /// Output search results in robot-friendly format
 #[allow(clippy::too_many_arguments, unused_variables)]
 fn output_robot_results(
@@ -24621,8 +25596,39 @@ fn output_robot_results(
             || !result.suggestions.is_empty()
             || explanation.is_some());
     let estimate_tokens = max_tokens.is_some() || include_meta || jsonl_meta_emitted;
-    let (filtered_hits, tokens_estimated, hits_clamped) =
+    let (mut filtered_hits, tokens_estimated, hits_clamped) =
         clamp_hits_to_budget(filtered_hits, max_tokens, estimate_tokens);
+
+    // 5u82n.3: attach a metadata-only trust/provenance verdict per hit. Gated on
+    // --robot-meta so the fast paths above stay byte-identical, and skipped for
+    // the minimal projection (intentionally source_path/line_number/agent only).
+    // Advisory metadata — result ordering is untouched. `filtered_hits` is a
+    // prefix projection of `result.hits` (same order; clamp only drops the
+    // tail), so zip aligns each verdict with its hit.
+    if include_meta && !minimal_projection && !result.hits.is_empty() {
+        let now_ms = crate::storage::sqlite::FrankenStorage::now_millis();
+        let realized = trust_realized_mode(search_mode_meta.realized);
+        // q4pau: build the commit/bead/release correlation index once per query
+        // (fail-open: an empty index when cwd is not a git repo) and use its repo
+        // root as the cwd workspace anchor for cwd-relative workspace matching.
+        let correlation = crate::search::trust_correlation::build_for_cwd();
+        let query_workspace = correlation.project_workspace();
+        for (hit, value) in result.hits.iter().zip(filtered_hits.iter_mut()) {
+            if let serde_json::Value::Object(map) = value {
+                map.insert(
+                    "trust".to_string(),
+                    trust_value_for_hit(
+                        hit,
+                        now_ms,
+                        realized,
+                        &correlation,
+                        query_workspace.as_deref(),
+                    ),
+                );
+            }
+        }
+    }
+
     let search_page_count = result.hits.len();
     let returned_count = filtered_hits.len();
     let clamped_unemitted_hits = returned_count < search_page_count;
@@ -67249,6 +68255,196 @@ fn capabilities_connector_names() -> Vec<String> {
     connectors
 }
 
+/// Roughly count session-like files under a detected provider root, bounded so
+/// first-run onboarding stays fast even against a large existing corpus (the
+/// estimate is an indexing-cost signal, not an exact total).
+fn count_onboarding_sessions(root: &Path) -> u64 {
+    const MAX_FILES: u64 = 50_000;
+    const MAX_DEPTH: usize = 8;
+    let mut count = 0u64;
+    for entry in walkdir::WalkDir::new(root)
+        .max_depth(MAX_DEPTH)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_session = entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("jsonl")
+                    || ext.eq_ignore_ascii_case("json")
+                    || ext.eq_ignore_ascii_case("md")
+                    || ext.eq_ignore_ascii_case("db")
+            });
+        if is_session {
+            count += 1;
+            if count >= MAX_FILES {
+                break;
+            }
+        }
+    }
+    count
+}
+
+/// Gather a read-only [`OnboardingObservation`](crate::source_onboarding::OnboardingObservation)
+/// from live host state — detected agent providers, source-config exclusions and
+/// remote sources, local semantic-model files, and the archive DB. Performs no
+/// mutation (bead 5u82n.6).
+fn gather_onboarding_observation(
+    data_dir: &Path,
+    db_path: &Path,
+) -> crate::source_onboarding::OnboardingObservation {
+    use crate::source_onboarding::{OnboardingObservation, ProviderObservation};
+
+    let sources_config = crate::sources::config::SourcesConfig::load().ok();
+
+    // Detected providers (default opts => detected-only) with per-provider
+    // readability + a bounded session estimate + the config exclusion flag.
+    let opts = franken_agent_detection::AgentDetectOptions::default();
+    let providers: Vec<ProviderObservation> =
+        match franken_agent_detection::detect_installed_agents(&opts) {
+            Ok(report) => report
+                .installed_agents
+                .into_iter()
+                .filter(|entry| entry.detected)
+                .map(|entry| {
+                    let root_readable =
+                        entry.root_paths.iter().any(|p| std::fs::read_dir(p).is_ok());
+                    let estimated_sessions = entry
+                        .root_paths
+                        .iter()
+                        .map(|p| count_onboarding_sessions(Path::new(p)))
+                        .sum();
+                    let excluded = sources_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.is_agent_disabled(&entry.slug));
+                    ProviderObservation {
+                        name: entry.slug,
+                        excluded,
+                        root_readable,
+                        estimated_sessions,
+                    }
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+    let remote_sources_configured = sources_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.remote_sources().next().is_some());
+
+    let model_dir = crate::search::model_manager::default_model_dir(data_dir);
+    let manifest = crate::search::model_manager::default_model_manifest();
+    let semantic_model_present =
+        crate::search::model_download::check_model_installed(&model_dir, &manifest).is_ready();
+
+    // "Existing indexed DB" means a DB that actually carries content, so an
+    // empty/just-created DB still routes the user to a first index.
+    let indexed_conversation_count = if db_path.exists() {
+        crate::storage::sqlite::FrankenStorage::open(db_path)
+            .ok()
+            .and_then(|storage| storage.total_conversation_count().ok())
+            .unwrap_or(0) as u64
+    } else {
+        0
+    };
+    let existing_indexed_db = indexed_conversation_count > 0;
+
+    OnboardingObservation {
+        providers,
+        semantic_model_present,
+        remote_sources_configured,
+        existing_indexed_db,
+        indexed_conversation_count,
+    }
+}
+
+/// Human-readable onboarding summary (never a bare TUI). The rich interactive
+/// wizard shell is the dependent bead 5u82n.16.
+fn print_onboarding_human(
+    report: &crate::source_onboarding::OnboardingReport,
+    observation: &crate::source_onboarding::OnboardingObservation,
+) {
+    use colored::Colorize;
+    println!("{}", "CASS onboarding".bold());
+    if report.providers.is_empty() {
+        println!("  No agent session providers detected yet.");
+    } else {
+        let lines: Vec<String> = report
+            .providers
+            .iter()
+            .map(|p| {
+                format!(
+                    "    - {} [{}] ~{} sessions",
+                    p.name,
+                    p.readiness.as_str(),
+                    p.estimated_sessions
+                )
+            })
+            .collect();
+        println!("  Detected providers:");
+        println!("{}", lines.join("\n"));
+    }
+    if !report.excluded_providers.is_empty() {
+        println!("  Excluded providers: {}", report.excluded_providers.join(", "));
+    }
+    println!(
+        "  Estimated sessions to index: {}",
+        report.estimated_index_sessions
+    );
+    if observation.existing_indexed_db {
+        println!(
+            "  Already indexed conversations: {}",
+            observation.indexed_conversation_count
+        );
+    }
+    println!("  {}", report.semantic_note());
+    if let Some(hint) = &report.remote_hint {
+        println!("  {hint}");
+    }
+    println!();
+    println!("  {} {}", "Recommended:".bold(), report.recommended_command);
+    println!("  Undo: {}", report.rollback_note);
+}
+
+/// `cass onboarding` — read-only first-run onboarding/readiness surface. Gathers
+/// a live observation, maps it through the pure `source_onboarding::recommend`
+/// core, and emits the deterministic report (`--json` for agents, otherwise a
+/// human summary). Mutation-free (bead 5u82n.6).
+fn run_onboarding(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+) -> CliResult<()> {
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+
+    let observation = gather_onboarding_observation(&data_dir, &db_path);
+    let report = crate::source_onboarding::recommend(&observation);
+
+    if let Some(format) = output_format {
+        let mut payload = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert(
+                "data_dir".to_string(),
+                serde_json::Value::String(data_dir.display().to_string()),
+            );
+            map.insert(
+                "indexed_conversation_count".to_string(),
+                serde_json::json!(observation.indexed_conversation_count),
+            );
+        }
+        return output_structured_value(payload, format);
+    }
+
+    print_onboarding_human(&report, &observation);
+    Ok(())
+}
+
 fn diagnostics_connector_paths(
     _home: &std::path::Path,
     _config_dir: &std::path::Path,
@@ -68230,6 +69426,176 @@ fn run_triage(
         &state,
         crate::search::readiness_projection::SurfaceKind::Triage,
     );
+
+    Ok(())
+}
+
+/// Assemble and emit the redacted recovery/support evidence bundle (bead
+/// `coding_agent_session_search-6f1lm`; the `.13.3` contract). Composes the
+/// canonical readiness, next-command, source-doctor, quarantine, fleet (when
+/// applicable), and root-cause contracts — verbatim — into one share-safe
+/// bundle via [`crate::recovery_support_bundle::build_support_bundle`], so the
+/// bundle can never contradict the matching robot JSON.
+///
+/// Redaction is share-safe by default (raw payloads suppressed, content
+/// fingerprints hashed, filesystem paths truncated to basenames). `--include-
+/// full-paths` and `--include-raw-evidence` flip the [`RedactionPolicy`] and are
+/// recorded in the bundle's `opt_in_flags`. `ExecutionMode::Live` marks the
+/// provenance as a real on-host run (vs. the deterministic fixture mode the
+/// goldens use).
+fn run_support_bundle(
+    data_dir_override: &Option<PathBuf>,
+    db_override: Option<PathBuf>,
+    output_format: Option<RobotFormat>,
+    stale_threshold: u64,
+    include_full_paths: bool,
+    include_raw_evidence: bool,
+) -> CliResult<()> {
+    use crate::recovery_support_bundle as rsb;
+
+    let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
+    let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
+    let data_dir_str = data_dir.display().to_string();
+
+    // One live state snapshot (status-like: derive from the real DB-open
+    // signal), reused for both the truth table and the root-cause signals so the
+    // bundle is internally consistent and probes the data dir only once.
+    let state = state_meta_json(&data_dir, &db_path, stale_threshold, true);
+    let table = build_truth_table_from_state(&state);
+
+    // Composed canonical contracts (verbatim from the same projections the robot
+    // surfaces serialize).
+    let readiness = crate::search::readiness_projection::project(
+        &table,
+        crate::search::readiness_projection::SurfaceKind::Triage,
+    );
+    let command_envelope = table.next_command_envelope(Some(&data_dir_str));
+    let quarantine = table.quarantine.clone();
+    let root_cause = crate::root_cause_projection::project_root_cause(
+        &gather_projection_signals_from_state(&state, None),
+    );
+
+    // Local source provenance: a single read-only "local" observation derived
+    // from the live truth table — this surface performs no SSH probe, so remote
+    // fields stay at their reachable-local defaults.
+    let local_observation = crate::source_doctor_health::SourceDoctorObservation {
+        source_id: "local".to_string(),
+        host: None,
+        host_reachable: true,
+        cass_present: Some(true),
+        cass_current: Some(true),
+        source_root_readable: Some(db_path.exists()),
+        lexical_metadata_present: Some(table.lexical_metadata.present),
+        ..Default::default()
+    };
+    let source_provenance =
+        crate::source_doctor_health::SourceDoctorReport::build(&[local_observation]);
+
+    let generated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis().min(i64::MAX as u128)) as i64)
+        .unwrap_or(0);
+
+    // Share-safe default; the opt-in flags relax it and are recorded in the
+    // bundle's redaction report.
+    let mut policy = rsb::default_redaction_policy();
+    if include_full_paths {
+        policy.allow_full_paths = true;
+    }
+    if include_raw_evidence {
+        policy.private_text = crate::search::incident_redaction::PrivateTextPolicy::RawOptIn;
+    }
+
+    let inputs = rsb::SupportBundleInputs {
+        bundle_id: format!("support-bundle-{generated_at_ms}"),
+        cass_version: env!("CARGO_PKG_VERSION").to_string(),
+        // Single local host/source: identity fields are fleet/multi-source
+        // concepts and are omitted (not guessed) for the local surface.
+        host_id: None,
+        source_id: None,
+        data_dir: Some(data_dir_str),
+        config_dir: None,
+        model_dir: None,
+        command_provenance: "cass support-bundle".to_string(),
+        generated_at_ms,
+        fixture_id: None,
+        readiness,
+        command_envelope,
+        source_provenance,
+        quarantine,
+        fleet: None,
+        root_cause,
+        proof_logs: Vec::new(),
+    };
+
+    let bundle = rsb::build_support_bundle(inputs, policy, rsb::ExecutionMode::Live);
+
+    let structured_format = output_format.or_else(robot_format_from_env).map(|fmt| {
+        if matches!(fmt, RobotFormat::Sessions) {
+            RobotFormat::Compact
+        } else {
+            fmt
+        }
+    });
+
+    if let Some(fmt) = structured_format {
+        let payload = serde_json::to_value(&bundle).unwrap_or(serde_json::Value::Null);
+        return output_structured_value(payload, fmt);
+    }
+
+    // Bounded, share-safety-first human summary. Reuses the v6vuz human
+    // readiness projection for the readiness line so it matches the other
+    // surfaces verbatim.
+    let human = crate::search::human_readiness_summary::project_human_summary(
+        &table,
+        crate::search::readiness_projection::SurfaceKind::Status,
+    );
+    println!("CASS support bundle");
+    println!();
+    println!("  Bundle ID: {}", bundle.manifest.bundle_id);
+    println!("  cass version: {}", bundle.manifest.cass_version);
+    println!("  Mode: live");
+    println!(
+        "  Share-safe: {}",
+        if bundle.is_share_safe() {
+            "yes"
+        } else {
+            "no (opt-in evidence included)"
+        }
+    );
+    println!(
+        "  Manifest complete: {}",
+        if bundle.manifest.is_complete() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!();
+    println!("{}", human.headline);
+    println!("  Safest next step: {}", human.safest_next_action);
+    println!();
+    println!("Redaction posture:");
+    if !bundle.redaction.fields_suppressed.is_empty() {
+        println!(
+            "  Suppressed: {}",
+            bundle.redaction.fields_suppressed.join(", ")
+        );
+    }
+    if !bundle.redaction.fields_truncated.is_empty() {
+        println!(
+            "  Truncated to basename: {}",
+            bundle.redaction.fields_truncated.join(", ")
+        );
+    }
+    if !bundle.redaction.opt_in_flags.is_empty() {
+        println!(
+            "  Opt-in available: {}",
+            bundle.redaction.opt_in_flags.join(", ")
+        );
+    }
+    println!();
+    println!("Machine output: cass support-bundle --json");
 
     Ok(())
 }
@@ -82888,6 +84254,10 @@ impl IndexStallWatchdog {
         )
     }
 
+    fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     fn with_abort_policy(
         data_dir: PathBuf,
         progress_interval: Duration,
@@ -83063,7 +84433,7 @@ fn index_stall_warning_lines(payload: &serde_json::Value) -> (String, String) {
     (summary, diagnostics)
 }
 
-fn abort_after_index_stall_if_requested(payload: &serde_json::Value) {
+fn abort_after_index_stall_if_requested(payload: &serde_json::Value, data_dir: &Path) {
     if payload
         .get("abort_process")
         .and_then(serde_json::Value::as_bool)
@@ -83072,6 +84442,11 @@ fn abort_after_index_stall_if_requested(payload: &serde_json::Value) {
         eprintln!(
             "cass index made no indexing progress past the abort threshold; exiting with code 70."
         );
+        // #296: before the bounded exit (which skips destructors), best-effort
+        // checkpoint the canonical WAL so the killed run leaves a recoverable
+        // DB instead of a multi-GB orphaned WAL. Stale locks are reaped by the
+        // next startup's flock-based recovery.
+        crate::indexer::best_effort_abort_wal_checkpoint(data_dir);
         std::process::exit(70);
     }
 }
@@ -83735,7 +85110,7 @@ fn run_index_with_data(
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 pb.println(summary);
                 pb.println(diagnostics);
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
 
             std::thread::sleep(Duration::from_millis(50));
@@ -83810,7 +85185,7 @@ fn run_index_with_data(
                 let (summary, diagnostics) = index_stall_warning_lines(&payload);
                 eprintln!("{summary}");
                 eprintln!("{diagnostics}");
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
 
             std::thread::sleep(Duration::from_millis(200));
@@ -83868,7 +85243,7 @@ fn run_index_with_data(
             if let Some(payload) = stall_watchdog.observe(&index_progress, elapsed_ms) {
                 emit_event(payload.clone());
                 emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
 
             std::thread::sleep(Duration::from_millis(100));
@@ -83889,7 +85264,7 @@ fn run_index_with_data(
                 // machine-readable stall signal on stdout before any external
                 // timeout kills the run.
                 emit_robot_stall_event_on_stdout(&payload);
-                abort_after_index_stall_if_requested(&payload);
+                abort_after_index_stall_if_requested(&payload, stall_watchdog.data_dir());
             }
             std::thread::sleep(Duration::from_millis(100));
         }

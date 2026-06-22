@@ -1412,6 +1412,74 @@
       "has_json_output": true
     },
     {
+      "name": "support-bundle",
+      "description": "Assemble a redacted, share-safe recovery/support evidence bundle",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "stale-threshold",
+          "description": "Staleness threshold in seconds (default: 300)",
+          "arg_type": "option",
+          "value_type": "integer",
+          "required": false,
+          "default": "300"
+        },
+        {
+          "name": "include-full-paths",
+          "description": "Include full filesystem paths in the bundle (default: basename-only)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "include-raw-evidence",
+          "description": "Include raw session/tool payloads in the bundle (default: suppressed)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "state",
       "description": "Quick state/health check (alias of status)",
       "arguments": [
@@ -1631,6 +1699,44 @@
           "value_type": "integer",
           "required": false,
           "default": "300"
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
+      "name": "onboarding",
+      "description": "First-run source onboarding + readiness wizard. Read-only: explains what CASS found, what it will index, what is missing, and the single safest next command. Scriptable via `--json`; never launches a bare TUI",
+      "arguments": [
+        {
+          "name": "data-dir",
+          "description": "Override data dir",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (for automation)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
         },
         {
           "name": "robot-format",
@@ -2703,6 +2809,62 @@
       "has_json_output": false
     },
     {
+      "name": "forget",
+      "description": "Prune an already-indexed subset of conversations by source-path glob (dry-run by default; `--apply` to commit). Removes matching rows from the canonical DB and rebuilds derived search/analytics assets",
+      "arguments": [
+        {
+          "name": "source-glob",
+          "description": "Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`)",
+          "arg_type": "option",
+          "value_type": "string",
+          "required": true
+        },
+        {
+          "name": "db",
+          "description": "Override db path",
+          "arg_type": "option",
+          "value_type": "path",
+          "required": false
+        },
+        {
+          "name": "apply",
+          "description": "Actually delete the matching conversations. Without this, runs as a dry-run (inspect only)",
+          "arg_type": "flag",
+          "required": false,
+          "default": "false",
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "json",
+          "description": "Output as JSON (`--robot` also works)",
+          "arg_type": "flag",
+          "required": false,
+          "enum_values": [
+            "true",
+            "false"
+          ]
+        },
+        {
+          "name": "robot-format",
+          "description": "Output format for robot mode (overrides --json when specified)",
+          "arg_type": "option",
+          "value_type": "enum",
+          "required": false,
+          "enum_values": [
+            "json",
+            "jsonl",
+            "compact",
+            "sessions",
+            "toon"
+          ]
+        }
+      ],
+      "has_json_output": true
+    },
+    {
       "name": "mirror",
       "description": "Inspect and prune raw-mirror evidence under explicit operator control",
       "arguments": [],
@@ -2717,6 +2879,12 @@
     {
       "name": "models",
       "description": "Manage semantic search models",
+      "arguments": [],
+      "has_json_output": false
+    },
+    {
+      "name": "lessons",
+      "description": "Mine and query durable lessons from local evidence (commits, beads, proofs)",
       "arguments": [],
       "has_json_output": false
     },
