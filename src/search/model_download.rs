@@ -2093,7 +2093,10 @@ mod tests {
         // now expects `model.safetensors`. The fixture ships no real weights, so
         // write a small placeholder — check_model_installed only verifies file
         // presence + the `.verified` marker, never hashing fixture content.
-        fs::write(target_dir.join("model.safetensors"), b"placeholder-safetensors")?;
+        fs::write(
+            target_dir.join("model.safetensors"),
+            b"placeholder-safetensors",
+        )?;
 
         // Copy config files
         for file in &[

@@ -243,16 +243,10 @@ impl FastEmbedder {
     /// Load an embedder by name from the data directory.
     pub fn load_by_name(data_dir: &Path, embedder_name: &str) -> EmbedderResult<Self> {
         let canonical_name = Self::canonical_name(embedder_name).ok_or_else(|| {
-            Self::unavailable_error(
-                embedder_name,
-                format!("unknown embedder: {embedder_name}"),
-            )
+            Self::unavailable_error(embedder_name, format!("unknown embedder: {embedder_name}"))
         })?;
         let model_dir = Self::runtime_model_dir_for(data_dir, canonical_name).ok_or_else(|| {
-            Self::unavailable_error(
-                embedder_name,
-                format!("unknown embedder: {embedder_name}"),
-            )
+            Self::unavailable_error(embedder_name, format!("unknown embedder: {embedder_name}"))
         })?;
         let config = Self::config_for(canonical_name).ok_or_else(|| {
             Self::unavailable_error(
@@ -394,7 +388,9 @@ mod tests {
     fn config_for_known_models() {
         assert_eq!(FastEmbedder::config_for("minilm").unwrap().dimension, 384);
         assert_eq!(
-            FastEmbedder::config_for("snowflake-arctic-s").unwrap().dimension,
+            FastEmbedder::config_for("snowflake-arctic-s")
+                .unwrap()
+                .dimension,
             384
         );
         assert_eq!(

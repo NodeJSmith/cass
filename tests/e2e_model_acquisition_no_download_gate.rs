@@ -195,7 +195,10 @@ fn status_and_verify_emit_acquisition_block_and_prove_no_auto_download() -> Resu
     // No model file may have appeared — the filesystem proof that status did
     // not download anything.
     let model_dir = minilm_model_dir(&status)?;
-    if std::path::Path::new(&model_dir).join("model.safetensors").exists() {
+    if std::path::Path::new(&model_dir)
+        .join("model.safetensors")
+        .exists()
+    {
         return Err(format!(
             "status must not download model.safetensors; one appeared under {model_dir}"
         ));
