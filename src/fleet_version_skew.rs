@@ -223,7 +223,17 @@ pub fn assess_host(host: &HostDoctorReport, current_repo_version: &str) -> Versi
         } else {
             CapabilityGap::None
         }
-    } else if observed_ver.major < current_ver.major || minimal_tier {
+    } else if observed_ver.major < current_ver.major
+        || minimal_tier
+        // Under 0.x semver a minor bump IS a breaking change, so a pre-1.0 host
+        // that is a minor version behind (e.g. 0.4.x vs 0.6.x — the csd /
+        // mac-mini-max fleet case this module was built for) may genuinely lack
+        // the repair/doctor surfaces. Classify it as a Major gap so it takes the
+        // deliberate installer path and upgrades before repair, rather than a
+        // blind `self-update` from a binary too old to trust. A pure patch gap
+        // within the same 0.x minor (e.g. 0.6.10 vs 0.6.13) stays Minor.
+        || (current_ver.major == 0 && observed_ver.minor < current_ver.minor)
+    {
         CapabilityGap::Major
     } else {
         CapabilityGap::Minor
