@@ -39241,181 +39241,27 @@ fn accumulate_doctor_raw_mirror_backfill_receipt(
 }
 
 fn collect_doctor_raw_mirror_backfill_report(
-    data_dir: &Path,
-    db_path: &Path,
-    raw_mirror: &DoctorRawMirrorReport,
-    apply: bool,
+    _data_dir: &Path,
+    _db_path: &Path,
+    _raw_mirror: &DoctorRawMirrorReport,
+    _apply: bool,
 ) -> DoctorRawMirrorBackfillReport {
-    let mut report = DoctorRawMirrorBackfillReport {
+    // Raw mirror backfill disabled — feature removed in fork.
+    return DoctorRawMirrorBackfillReport {
         schema_version: 1,
         backfill_generation: DOCTOR_RAW_MIRROR_BACKFILL_GENERATION,
-        mode: if apply {
-            "safe_auto_run".to_string()
-        } else {
-            "check".to_string()
-        },
+        mode: "disabled".to_string(),
         status: "skipped".to_string(),
         read_only_external_source_dirs: true,
         notes: vec![
-            "Backfill only writes cass raw-mirror manifests/blobs and db_links; it never creates, rewrites, moves, or deletes provider session logs.".to_string(),
-            "DB-only projections are explicitly lower-authority evidence and are never marked as raw upstream captures.".to_string(),
-            "parse_loss_unknown=true means doctor captured current live bytes after the archive row already existed, so it cannot prove those bytes are identical to the original parse input.".to_string(),
+            "Raw mirror backfill disabled in fork.".to_string(),
         ],
         forensic_bundle: doctor_forensic_bundle_uncaptured("not_required_read_only_or_no_mutation"),
         ..DoctorRawMirrorBackfillReport::default()
     };
 
-    if !db_path.exists() {
-        report.status = "skipped".to_string();
-        report
-            .notes
-            .push("Backfill skipped until the cass archive database exists.".to_string());
-        return report;
-    }
-
-    let query_result = open_franken_cli_read_db(
-        db_path.to_path_buf(),
-        "doctor raw mirror backfill",
-        Duration::from_secs(1),
-    )
-    .and_then(|conn| {
-        let query_result =
-            query_doctor_raw_mirror_backfill_candidates(&conn).map_err(|e| CliError {
-                code: 9,
-                kind: CliErrorKind::DbQuery.kind_str(),
-                message: format!("Failed to query doctor raw mirror backfill candidates: {e}"),
-                hint: None,
-                retryable: false,
-            });
-        let close_result = close_franken_cli_read_db(conn, db_path, "doctor raw mirror backfill");
-        match (query_result, close_result) {
-            (Ok(rows), Ok(())) => Ok(rows),
-            (Err(err), _) | (_, Err(err)) => Err(err),
-        }
-    });
-
-    let candidates = match query_result {
-        Ok(candidates) => {
-            report.db_available = true;
-            candidates
-        }
-        Err(err) => {
-            report.db_available = true;
-            report.status = "warn".to_string();
-            report.db_query_error = Some(err.message.clone());
-            report
-                .warnings
-                .push("Could not query archive rows for raw mirror backfill.".to_string());
-            return report;
-        }
-    };
-
-    let (by_conversation_id, by_source_key) = doctor_raw_mirror_existing_evidence_maps(raw_mirror);
-    if apply {
-        let dry_run_receipts = candidates
-            .iter()
-            .map(|candidate| {
-                doctor_raw_mirror_backfill_candidate_receipt(
-                    data_dir,
-                    candidate,
-                    &by_conversation_id,
-                    &by_source_key,
-                    false,
-                )
-            })
-            .collect::<Vec<_>>();
-        if dry_run_receipts
-            .iter()
-            .any(doctor_raw_mirror_backfill_receipt_would_mutate)
-        {
-            report.forensic_bundle =
-                capture_doctor_forensic_bundle(DoctorForensicBundleCaptureInput {
-                    operation_id: "doctor-raw-mirror-backfill",
-                    data_dir,
-                    db_path,
-                    index_path: &crate::search::tantivy::expected_index_dir(data_dir),
-                    plan: None,
-                    quarantine_report: None,
-                    extra_file_artifacts: &[],
-                });
-            if report.forensic_bundle.status != "captured" {
-                let reason = report
-                    .forensic_bundle
-                    .blocked_reason
-                    .clone()
-                    .unwrap_or_else(|| "forensic bundle capture did not complete".to_string());
-                let blocked_reason =
-                    format!("forensic bundle capture failed before raw mirror backfill: {reason}");
-                report.status = "blocked".to_string();
-                report.warnings.push(blocked_reason.clone());
-                for mut receipt in dry_run_receipts {
-                    if doctor_raw_mirror_backfill_receipt_would_mutate(&receipt) {
-                        receipt.action = "blocked_forensic_bundle_capture_failed".to_string();
-                        receipt.warnings.push(blocked_reason.clone());
-                        receipt.forensic_bundle = report.forensic_bundle.clone();
-                    }
-                    accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
-                }
-                report.total_candidate_count = report.receipts.len();
-                return report;
-            }
-        }
-    }
-
-    for candidate in &candidates {
-        let mut receipt = doctor_raw_mirror_backfill_candidate_receipt(
-            data_dir,
-            candidate,
-            &by_conversation_id,
-            &by_source_key,
-            apply,
-        );
-        let mutating_receipt = receipt.raw_source_captured
-            || receipt.raw_mirror_db_linked
-            || receipt.action == "capture_live_source_failed"
-            || receipt.action == "existing_raw_manifest_link_failed";
-        if report.forensic_bundle.status == "captured" && mutating_receipt {
-            receipt.forensic_bundle = report.forensic_bundle.clone();
-        }
-        accumulate_doctor_raw_mirror_backfill_receipt(&mut report, receipt);
-    }
-    report.total_candidate_count = report.receipts.len();
-
-    if report.capture_failure_count > 0 {
-        report.status = "partial".to_string();
-        report.warnings.push(
-            "Some raw mirror backfill actions failed; no provider source files were modified."
-                .to_string(),
-        );
-    } else if apply
-        && (report.captured_live_source_count > 0 || report.existing_raw_manifest_link_count > 0)
-    {
-        report.status = "applied".to_string();
-    } else if !apply
-        && (report.eligible_live_source_count > 0 || report.existing_raw_manifest_link_count > 0)
-    {
-        report.status = "planned".to_string();
-    } else if report.db_projection_only_count > 0 || report.changed_source_hash_count > 0 {
-        report.status = "warn".to_string();
-    } else {
-        report.status = "clean".to_string();
-    }
-
-    if report.source_missing_count > 0 {
-        report.warnings.push(format!(
-            "{} archive conversation(s) have missing upstream files and remain DB-only unless a prior raw mirror manifest can be linked",
-            report.source_missing_count
-        ));
-    }
-    if report.changed_source_hash_count > 0 {
-        report.warnings.push(format!(
-            "{} archive conversation(s) have live source bytes that differ from already preserved raw mirror evidence",
-            report.changed_source_hash_count
-        ));
-    }
-
-    report
 }
+
 
 fn doctor_coverage_confidence_tier(
     archive_conversation_count: usize,
