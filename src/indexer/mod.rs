@@ -23863,76 +23863,14 @@ fn prepare_conversation_for_ingest(
 }
 
 fn capture_connector_sources_before_parse(
-    connector: &(dyn crate::connectors::Connector + Send),
-    ctx: &crate::connectors::ScanContext,
-    data_dir: &Path,
-    provider: &str,
-    fallback_roots: &[ScanRoot],
-    since_ts: Option<i64>,
-    active_source_filter: &ActiveSessionSourceFilter,
+    _connector: &(dyn crate::connectors::Connector + Send),
+    _ctx: &crate::connectors::ScanContext,
+    _data_dir: &Path,
+    _provider: &str,
+    _fallback_roots: &[ScanRoot],
+    _since_ts: Option<i64>,
+    _active_source_filter: &ActiveSessionSourceFilter,
 ) {
-    match connector.discover_source_files(ctx) {
-        Ok(sources) if !sources.is_empty() => {
-            let primary_source_count = sources
-                .iter()
-                .filter(|source| {
-                    source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
-                })
-                .count();
-            let defer_primary_sources =
-                primary_source_count > PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT;
-            if defer_primary_sources {
-                tracing::info!(
-                    provider,
-                    primary_source_count,
-                    limit = PREPARSE_PRIMARY_SOURCE_CAPTURE_LIMIT,
-                    "deferring large primary source raw-mirror capture to per-conversation streaming path"
-                );
-            }
-            for source in sources {
-                if should_skip_active_session_source(
-                    active_source_filter,
-                    &source.origin.source_id,
-                    &source.source_path,
-                ) {
-                    continue;
-                }
-                if defer_primary_sources
-                    && source.role == crate::connectors::DiscoveredSourceRole::PrimarySessionLog
-                {
-                    continue;
-                }
-                capture_discovered_source_file_before_parse(data_dir, provider, &source);
-            }
-        }
-        Ok(_) => {
-            for root in fallback_roots {
-                capture_scan_sources_before_parse(
-                    data_dir,
-                    provider,
-                    root,
-                    since_ts,
-                    active_source_filter,
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                provider,
-                error = %error,
-                "provider source discovery failed; falling back to legacy explicit-root preparse capture"
-            );
-            for root in fallback_roots {
-                capture_scan_sources_before_parse(
-                    data_dir,
-                    provider,
-                    root,
-                    since_ts,
-                    active_source_filter,
-                );
-            }
-        }
-    }
 }
 
 fn should_skip_raw_mirror_capture_for_logical_source(path: &Path) -> bool {
@@ -24158,48 +24096,7 @@ fn capture_scan_root_file_before_parse(
     }
 }
 
-fn attach_raw_mirror_capture(data_dir: &Path, conv: &mut NormalizedConversation) {
-    if should_skip_raw_mirror_capture_for_logical_source(&conv.source_path) {
-        tracing::debug!(
-            agent = %conv.agent_slug,
-            source_path = %conv.source_path.display(),
-            "skipping raw-mirror capture for logical non-file parsed conversation source"
-        );
-        return;
-    }
-
-    let (source_id, origin_kind, origin_host) = raw_mirror_origin_from_metadata(&conv.metadata);
-    let db_link = raw_mirror_db_link_for_conversation(conv);
-    match crate::raw_mirror::capture_source_file(crate::raw_mirror::RawMirrorCaptureInput {
-        data_dir,
-        provider: &conv.agent_slug,
-        source_id: &source_id,
-        origin_kind: &origin_kind,
-        origin_host: origin_host.as_deref(),
-        source_path: &conv.source_path,
-        db_links: std::slice::from_ref(&db_link),
-    }) {
-        Ok(record) => {
-            attach_raw_mirror_metadata(conv, &record);
-            tracing::debug!(
-                agent = %conv.agent_slug,
-                source_id = %source_id,
-                manifest_id = %record.manifest_id,
-                blob_blake3 = %record.blob_blake3,
-                already_present = record.already_present,
-                "captured parsed conversation source into raw mirror before archive upsert"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                agent = %conv.agent_slug,
-                source_id = %source_id,
-                source_path = %conv.source_path.display(),
-                error = %error,
-                "failed to capture parsed conversation source into raw mirror before archive upsert"
-            );
-        }
-    }
+fn attach_raw_mirror_capture(_data_dir: &Path, _conv: &mut NormalizedConversation) {
 }
 
 fn raw_mirror_db_link_for_conversation(

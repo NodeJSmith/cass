@@ -1430,9 +1430,6 @@ pub enum Commands {
         #[arg(long, visible_alias = "robot")]
         json: bool,
     },
-    /// Inspect and prune raw-mirror evidence under explicit operator control
-    #[command(subcommand)]
-    Mirror(MirrorCommand),
     /// Manage remote sources (P5.x)
     #[command(subcommand)]
     Sources(SourcesCommand),
@@ -7942,9 +7939,6 @@ async fn execute_cli(
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_forget_command(source_glob, db, apply, cli, structured_format)?;
-                }
-                Commands::Mirror(subcmd) => {
-                    run_mirror_command(subcmd, cli)?;
                 }
                 Commands::Swarm(subcmd) => {
                     run_swarm_command(subcmd, cli)?;
@@ -19486,7 +19480,6 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::Timeline { .. }) => "timeline".to_string(),
         Some(Commands::Quarantine(..)) => "quarantine".to_string(),
         Some(Commands::Forget { .. }) => "forget".to_string(),
-        Some(Commands::Mirror(..)) => "mirror".to_string(),
         Some(Commands::Sources(..)) => "sources".to_string(),
         Some(Commands::Models(..)) => "models".to_string(),
         Some(Commands::Fleet(..)) => "fleet".to_string(),
@@ -19772,9 +19765,6 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         }
         Commands::Doctor { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Timeline { json, .. } => {
-            resolve_subcommand_structured_format(cli, *json).is_some()
-        }
-        Commands::Mirror(MirrorCommand::Prune { json, .. }) => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
         Commands::Forget { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
@@ -37279,12 +37269,25 @@ fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -
     })
 }
 
-fn collect_doctor_raw_mirror_report(data_dir: &Path, full: bool) -> DoctorRawMirrorReport {
-    collect_doctor_raw_mirror_report_with_threshold(
-        data_dir,
-        doctor_raw_mirror_size_warn_threshold_bytes(),
-        full,
-    )
+fn collect_doctor_raw_mirror_report(data_dir: &Path, _full: bool) -> DoctorRawMirrorReport {
+    // Raw mirror scan disabled — feature removed in fork.
+    let root = doctor_raw_mirror_root(data_dir);
+    let root_path = root.display().to_string();
+    DoctorRawMirrorReport {
+        schema_version: DOCTOR_RAW_MIRROR_SCHEMA_VERSION,
+        status: "absent".to_string(),
+        root_path: root_path.clone(),
+        redacted_root_path: doctor_redacted_path(&root_path, data_dir),
+        exists: root.exists(),
+        sensitive_paths_included: false,
+        raw_content_included: false,
+        layout: doctor_raw_mirror_layout_report(),
+        policy: doctor_raw_mirror_policy_report(),
+        summary: DoctorRawMirrorSummary::default(),
+        manifests: Vec::new(),
+        warnings: Vec::new(),
+        notes: Vec::new(),
+    }
 }
 
 fn collect_doctor_raw_mirror_report_with_threshold(
