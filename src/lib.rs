@@ -37389,7 +37389,11 @@ fn collect_doctor_raw_mirror_report_with_threshold(
             *blob_reference_counts
                 .entry(manifest.blob_blake3.clone())
                 .or_default() += 1;
-            if manifest.blob_checksum_status == DoctorArtifactChecksumStatus::Matched {
+            if matches!(
+                manifest.blob_checksum_status,
+                DoctorArtifactChecksumStatus::Matched
+                    | DoctorArtifactChecksumStatus::NotRecorded
+            ) {
                 verified_blob_bytes
                     .entry(manifest.blob_blake3.clone())
                     .or_insert(manifest.blob_size_bytes);
