@@ -952,8 +952,12 @@ impl PartialEq<CanonicalMutationCounts> for NonWatchIngestOutcome {
 pub struct IndexingProgress {
     pub total: AtomicUsize,
     pub current: AtomicUsize,
-    // Simple phase indicator: 0=Idle, 1=Scanning, 2=Indexing
+    // Simple phase indicator: 0=Idle, 1=Scanning, 2=Indexing, 3=Embedding
     pub phase: AtomicUsize,
+    /// Number of messages embedded so far during the semantic embedding phase.
+    pub semantic_current: AtomicUsize,
+    /// Total number of messages queued for embedding during the semantic embedding phase.
+    pub semantic_total: AtomicUsize,
     pub is_rebuilding: AtomicBool,
     /// Number of coding agents discovered so far during scanning
     pub discovered_agents: AtomicUsize,
@@ -1052,12 +1056,13 @@ impl IndexingProgress {
         match phase {
             1 => "scanning",
             2 => "indexing",
+            3 => "embedding",
             _ => "preparing",
         }
     }
 
     /// Human-readable label for the current phase.
-    /// 0 = preparing (pre-scan), 1 = scanning, 2 = indexing.
+    /// 0 = preparing (pre-scan), 1 = scanning, 2 = indexing, 3 = embedding.
     pub fn phase_label(&self) -> &'static str {
         Self::phase_label_for(self.phase.load(Ordering::Relaxed))
     }
@@ -14373,6 +14378,10 @@ pub fn run_index(
         } else {
             tracing::info!(embedder = %opts.embedder, "starting semantic indexing");
 
+            if let Some(progress) = opts.progress.as_ref() {
+                progress.phase.store(3, Ordering::Relaxed);
+            }
+
             let semantic_indexer = SemanticIndexer::new(&opts.embedder, Some(&opts.data_dir))?;
             let mut semantic_read_storage = FrankenStorage::open_readonly(&opts.db_path)
                 .with_context(|| {
@@ -14395,7 +14404,12 @@ pub fn run_index(
             });
 
             // Generate embeddings
-            let embedded_messages = semantic_indexer.embed_messages(&embedding_inputs)?;
+            let embedded_messages = match opts.progress.as_ref() {
+                Some(progress) => {
+                    semantic_indexer.embed_messages_with_progress(&embedding_inputs, progress)?
+                }
+                None => semantic_indexer.embed_messages(&embedding_inputs)?,
+            };
             tracing::info!(
                 embedded_count = embedded_messages.len(),
                 "generated embeddings"

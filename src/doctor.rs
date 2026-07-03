@@ -77,6 +77,7 @@ pub struct DoctorCommandRequest {
     pub dry_run: bool,
     pub yes: bool,
     pub plan_fingerprint: Option<String>,
+    pub full: bool,
 }
 
 impl DoctorCommandSurface {
@@ -184,6 +185,7 @@ impl DoctorCommandRequest {
             verbose,
             force_rebuild,
             allow_repeated_repair,
+            false,
         )
     }
 
@@ -208,6 +210,7 @@ impl DoctorCommandRequest {
         verbose: bool,
         force_rebuild: bool,
         allow_repeated_repair: bool,
+        full: bool,
     ) -> CliResult<Self> {
         let backup_command = if backups_list {
             Some(DoctorBackupCommand::List)
@@ -295,6 +298,7 @@ impl DoctorCommandRequest {
             dry_run,
             yes,
             plan_fingerprint,
+            full,
         };
         request.validate()?;
         Ok(request)
@@ -802,6 +806,7 @@ pub(crate) fn execute_doctor_command_with_wrap(
         request.surface,
         request.mode,
         request.plan_fingerprint,
+        request.full,
         wrap,
     )
 }
@@ -971,6 +976,7 @@ mod tests {
             dry_run: false,
             yes: false,
             plan_fingerprint: None,
+            full: false,
         };
         let err = request
             .validate()
@@ -1285,6 +1291,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .expect_err("archive-normalize apply must reject an empty fingerprint");
         assert_eq!(archive_normalize_err.code, 2);
@@ -1308,6 +1315,7 @@ mod tests {
             false,
             true,
             Some(String::new()),
+            false,
             false,
             false,
             false,
@@ -1340,6 +1348,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .expect("archive-scan should map to read-only scan mode");
 
@@ -1368,6 +1377,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .expect_err("archive-scan must reject repair dry-run controls");
         assert!(err.message.contains("always read-only"));
@@ -1392,6 +1402,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
             false,
             false,
@@ -1425,6 +1436,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .expect("archive-normalize apply should require yes and fingerprint");
 
@@ -1450,6 +1462,7 @@ mod tests {
             false,
             true,
             None,
+            false,
             false,
             false,
             false,

@@ -295,6 +295,7 @@ fn raw_mirror_and_doctor_modules_are_public_embedding_surfaces() -> Result<(), S
         false,
         false,
         false,
+        false,
     )
     .map_err(|err| format!("build public doctor check request: {err}"))?;
     assert_eq!(doctor_request.surface, DoctorCommandSurface::Check);

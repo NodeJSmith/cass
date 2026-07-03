@@ -959,6 +959,10 @@ pub enum Commands {
         /// Permit a mutating repair even when a previous failure marker exists
         #[arg(long)]
         allow_repeated_repair: bool,
+        /// Run exhaustive verification including per-blob blake3 content hashing.
+        /// Without this flag, raw mirror verification uses size-only checks for speed.
+        #[arg(long, default_value_t = false)]
+        full: bool,
 
         // --- world-class-doctor pass-2: per-run artifact subcommands ---
         /// List per-run artifact directories under `<data_dir>/doctor/runs/`. Read-only.
@@ -2166,6 +2170,9 @@ pub enum ModelsCommand {
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        /// Output as JSON (`--robot` also works)
+        #[arg(long, visible_alias = "robot")]
+        json: bool,
     },
     /// Verify model integrity (SHA256 checksums)
     Verify {
@@ -7536,6 +7543,7 @@ async fn execute_cli(
                     verbose,
                     force_rebuild,
                     allow_repeated_repair,
+                    full,
                     ls,
                     undo,
                     robot_triage,
@@ -7768,6 +7776,7 @@ async fn execute_cli(
                             verbose,
                             force_rebuild,
                             allow_repeated_repair,
+                            full,
                         )?;
                         doctor::execute_doctor_command_with_wrap(request, wrap)?;
                     }
@@ -32328,7 +32337,7 @@ fn capture_doctor_forensic_bundle(
     }
 
     let source_inventory = collect_doctor_source_inventory(input.data_dir, input.db_path);
-    let raw_mirror_report = collect_doctor_raw_mirror_report(input.data_dir);
+    let raw_mirror_report = collect_doctor_raw_mirror_report(input.data_dir, true);
     let quarantine_report = input
         .quarantine_report
         .cloned()
@@ -37019,6 +37028,7 @@ fn doctor_verify_raw_mirror_manifest(
     root: &Path,
     manifest_path: &Path,
     manifest: DoctorRawMirrorManifestFile,
+    full: bool,
 ) -> DoctorRawMirrorManifestReport {
     let manifest_path_string = manifest_path.display().to_string();
     let invalid =
@@ -37123,39 +37133,56 @@ fn doctor_verify_raw_mirror_manifest(
         ),
         Ok(metadata) => {
             let size_matches = metadata.len() == manifest.blob_size_bytes;
-            match doctor_file_blake3(&blob_path) {
-                Ok(actual_hash) if actual_hash == manifest.blob_blake3 && size_matches => {
-                    match manifest_checksum_status {
-                        DoctorArtifactChecksumStatus::Mismatched => (
-                            DoctorArtifactChecksumStatus::Matched,
-                            "manifest_drift".to_string(),
-                            Some("manifest_blake3 does not match manifest metadata".to_string()),
-                        ),
-                        DoctorArtifactChecksumStatus::NotRecorded => (
-                            DoctorArtifactChecksumStatus::Matched,
-                            "manifest_unverified".to_string(),
-                            Some(
-                                "manifest_blake3 is not recorded; metadata integrity cannot be verified"
-                                    .to_string(),
+            if full {
+                match doctor_file_blake3(&blob_path) {
+                    Ok(actual_hash) if actual_hash == manifest.blob_blake3 && size_matches => {
+                        match manifest_checksum_status {
+                            DoctorArtifactChecksumStatus::Mismatched => (
+                                DoctorArtifactChecksumStatus::Matched,
+                                "manifest_drift".to_string(),
+                                Some("manifest_blake3 does not match manifest metadata".to_string()),
                             ),
-                        ),
-                        _ => (
-                            DoctorArtifactChecksumStatus::Matched,
-                            "verified".to_string(),
-                            None,
-                        ),
+                            DoctorArtifactChecksumStatus::NotRecorded => (
+                                DoctorArtifactChecksumStatus::Matched,
+                                "manifest_unverified".to_string(),
+                                Some(
+                                    "manifest_blake3 is not recorded; metadata integrity cannot be verified"
+                                        .to_string(),
+                                ),
+                            ),
+                            _ => (
+                                DoctorArtifactChecksumStatus::Matched,
+                                "verified".to_string(),
+                                None,
+                            ),
+                        }
                     }
+                    Ok(_) => (
+                        DoctorArtifactChecksumStatus::Mismatched,
+                        "checksum_mismatch".to_string(),
+                        Some("blob bytes or size do not match manifest".to_string()),
+                    ),
+                    Err(err) => (
+                        DoctorArtifactChecksumStatus::Mismatched,
+                        "checksum_mismatch".to_string(),
+                        Some(format!("failed to hash blob: {err}")),
+                    ),
                 }
-                Ok(_) => (
+            } else if size_matches {
+                (
+                    DoctorArtifactChecksumStatus::NotRecorded,
+                    "size_verified".to_string(),
+                    None,
+                )
+            } else {
+                (
                     DoctorArtifactChecksumStatus::Mismatched,
-                    "checksum_mismatch".to_string(),
-                    Some("blob bytes or size do not match manifest".to_string()),
-                ),
-                Err(err) => (
-                    DoctorArtifactChecksumStatus::Mismatched,
-                    "checksum_mismatch".to_string(),
-                    Some(format!("failed to hash blob: {err}")),
-                ),
+                    "size_mismatch".to_string(),
+                    Some(
+                        "blob size does not match manifest (run with --full for content hash verification)"
+                            .to_string(),
+                    ),
+                )
             }
         }
         Err(_) => (
@@ -37252,16 +37279,18 @@ fn doctor_raw_mirror_size_warning(total_blob_bytes: u64, threshold_bytes: u64) -
     })
 }
 
-fn collect_doctor_raw_mirror_report(data_dir: &Path) -> DoctorRawMirrorReport {
+fn collect_doctor_raw_mirror_report(data_dir: &Path, full: bool) -> DoctorRawMirrorReport {
     collect_doctor_raw_mirror_report_with_threshold(
         data_dir,
         doctor_raw_mirror_size_warn_threshold_bytes(),
+        full,
     )
 }
 
 fn collect_doctor_raw_mirror_report_with_threshold(
     data_dir: &Path,
     size_warn_threshold_bytes: u64,
+    full: bool,
 ) -> DoctorRawMirrorReport {
     let root = doctor_raw_mirror_root(data_dir);
     let root_path = root.display().to_string();
@@ -37329,9 +37358,9 @@ fn collect_doctor_raw_mirror_report_with_threshold(
                             .ok()
                             .and_then(|content| serde_json::from_str(&content).ok())
                         {
-                            Some(manifest) => {
-                                doctor_verify_raw_mirror_manifest(data_dir, &root, path, manifest)
-                            }
+                            Some(manifest) => doctor_verify_raw_mirror_manifest(
+                                data_dir, &root, path, manifest, full,
+                            ),
                             None => doctor_raw_mirror_invalid_manifest_report(
                                 data_dir,
                                 path,
@@ -37640,7 +37669,7 @@ fn doctor_archive_finding(input: DoctorArchiveFindingInput<'_>) -> DoctorArchive
 
 fn build_doctor_archive_scan_context(data_dir: &Path, db_path: &Path) -> DoctorArchiveScanContext {
     let source_inventory = collect_doctor_source_inventory(data_dir, db_path);
-    let raw_mirror = collect_doctor_raw_mirror_report(data_dir);
+    let raw_mirror = collect_doctor_raw_mirror_report(data_dir, true);
     let raw_mirror_backfill =
         collect_doctor_raw_mirror_backfill_report(data_dir, db_path, &raw_mirror, false);
     let sole_copy_warnings = build_doctor_sole_copy_warnings(&raw_mirror_backfill);
@@ -47568,7 +47597,7 @@ fn build_doctor_baseline_snapshot(
     let source_inventory = collect_doctor_source_inventory(data_dir, db_path);
     let remote_source_sync =
         collect_doctor_remote_source_sync_report(data_dir, &sources_path, &source_inventory);
-    let raw_mirror = collect_doctor_raw_mirror_report(data_dir);
+    let raw_mirror = collect_doctor_raw_mirror_report(data_dir, true);
     let raw_mirror_backfill =
         collect_doctor_raw_mirror_backfill_report(data_dir, db_path, &raw_mirror, false);
     let sole_copy_warnings = build_doctor_sole_copy_warnings(&raw_mirror_backfill);
@@ -62249,7 +62278,7 @@ mod doctor_asset_taxonomy_tests {
             }],
         );
         write_raw_mirror_test_manifest(&data_dir, &manifest, raw_bytes);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
         assert_eq!(raw_mirror.status, "verified");
         let source_inventory =
             build_doctor_source_inventory_report(&data_dir, false, None, Vec::new(), Vec::new());
@@ -62378,7 +62407,7 @@ mod doctor_asset_taxonomy_tests {
         );
         write_raw_mirror_test_manifest(&data_dir, &manifest_a, bytes_a);
         write_raw_mirror_test_manifest(&data_dir, &manifest_b, bytes_b);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
         let source_inventory =
             build_doctor_source_inventory_report(&data_dir, false, None, Vec::new(), Vec::new());
         let source_authority =
@@ -64804,7 +64833,7 @@ paths = ["~/.claude/projects"]
             Vec::new(),
         );
         write_raw_mirror_test_manifest(&data_dir, &unlinked_manifest, unlinked_bytes);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
 
         let backfill = DoctorRawMirrorBackfillReport {
             schema_version: 1,
@@ -65142,7 +65171,7 @@ paths = ["~/.claude/projects"]
             }],
         );
         write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
         let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
 
         assert_eq!(
@@ -65182,7 +65211,7 @@ paths = ["~/.claude/projects"]
         let db_path = data_dir.join("agent_search.db");
         let source_inventory =
             build_doctor_source_inventory_report(&data_dir, false, None, Vec::new(), Vec::new());
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
         let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
 
         assert_eq!(report.decision, DoctorSourceAuthorityDecision::Refused);
@@ -65214,7 +65243,7 @@ paths = ["~/.claude/projects"]
         }];
         let source_inventory =
             build_doctor_source_inventory_report(&data_dir, true, None, rows, Vec::new());
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
         let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
 
         assert_eq!(report.coverage_delta.remote_source_count, 1);
@@ -65426,7 +65455,7 @@ paths = ["~/.claude/projects"]
         manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
         write_raw_mirror_test_manifest(&data_dir, &manifest, raw_bytes);
 
-        let report = collect_doctor_raw_mirror_report(&data_dir);
+        let report = collect_doctor_raw_mirror_report(&data_dir, true);
         let payload = serde_json::to_value(&report).expect("raw mirror report json");
         let rendered = serde_json::to_string(&payload).expect("raw mirror rendered json");
 
@@ -65559,7 +65588,7 @@ paths = ["~/.claude/projects"]
         std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
         std::fs::write(tmp_dir.join("capture.tmp"), b"partial").expect("write tmp");
 
-        let report = collect_doctor_raw_mirror_report(&data_dir);
+        let report = collect_doctor_raw_mirror_report(&data_dir, true);
         assert_eq!(report.status, "warn");
         assert_eq!(report.summary.manifest_count, 3);
         assert_eq!(report.summary.verified_blob_count, 2);
@@ -65622,7 +65651,7 @@ paths = ["~/.claude/projects"]
             raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
         write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
 
-        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, 1);
+        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, 1, true);
 
         assert_eq!(report.status, "warn");
         assert_eq!(report.summary.total_blob_bytes, bytes.len() as u64);
@@ -65649,7 +65678,7 @@ paths = ["~/.claude/projects"]
         std::os::unix::fs::symlink(&outside_target, manifest_dir.join("linked.json"))
             .expect("create manifest symlink");
 
-        let report = collect_doctor_raw_mirror_report(&data_dir);
+        let report = collect_doctor_raw_mirror_report(&data_dir, true);
         assert_eq!(report.status, "warn");
         assert_eq!(report.summary.manifest_count, 1);
         assert_eq!(report.summary.invalid_manifest_count, 1);
@@ -65696,7 +65725,7 @@ paths = ["~/.claude/projects"]
         )
         .expect("write raw mirror manifest");
 
-        let report = collect_doctor_raw_mirror_report(&data_dir);
+        let report = collect_doctor_raw_mirror_report(&data_dir, true);
         assert_eq!(report.status, "warn");
         assert_eq!(report.summary.manifest_count, 1);
         assert_eq!(report.summary.invalid_manifest_count, 1);
@@ -65739,7 +65768,7 @@ paths = ["~/.claude/projects"]
         )
         .expect("write raw mirror manifest without blob");
 
-        let report = collect_doctor_raw_mirror_report(&data_dir);
+        let report = collect_doctor_raw_mirror_report(&data_dir, true);
         assert_eq!(report.status, "warn");
         assert_eq!(report.summary.manifest_count, 1);
         assert_eq!(report.summary.missing_blob_count, 1);
@@ -65751,6 +65780,90 @@ paths = ["~/.claude/projects"]
         assert_eq!(
             report.manifests[0].blob_checksum_status,
             DoctorArtifactChecksumStatus::Missing
+        );
+    }
+
+    #[test]
+    fn raw_mirror_report_size_only_verification_skips_blake3_when_not_full() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/source.jsonl");
+        let bytes = b"{\"type\":\"message\",\"text\":\"size only\"}\n";
+        let manifest =
+            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
+        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+
+        let full_report = collect_doctor_raw_mirror_report(&data_dir, true);
+        assert_eq!(full_report.status, "verified");
+        assert_eq!(full_report.manifests[0].status, "verified");
+        assert_eq!(
+            full_report.manifests[0].blob_checksum_status,
+            DoctorArtifactChecksumStatus::Matched
+        );
+
+        let light_report = collect_doctor_raw_mirror_report(&data_dir, false);
+        assert_eq!(light_report.manifests[0].status, "size_verified");
+        assert_eq!(
+            light_report.manifests[0].blob_checksum_status,
+            DoctorArtifactChecksumStatus::NotRecorded,
+            "size-only verification should not claim content hash was checked"
+        );
+        assert_eq!(light_report.summary.manifest_count, 1);
+    }
+
+    #[test]
+    fn raw_mirror_report_size_only_detects_size_mismatch_without_full() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/source.jsonl");
+        let bytes = b"{\"type\":\"message\",\"text\":\"original\"}\n";
+        let manifest =
+            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
+        let (blob_path, _) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+
+        std::fs::write(&blob_path, b"wrong size content that differs in length from original")
+            .expect("overwrite blob with wrong-size content");
+
+        let report = collect_doctor_raw_mirror_report(&data_dir, false);
+        assert_eq!(report.manifests[0].status, "size_mismatch");
+        assert_eq!(
+            report.manifests[0].blob_checksum_status,
+            DoctorArtifactChecksumStatus::Mismatched
+        );
+        assert!(
+            report.manifests[0]
+                .invalid_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("--full"),
+            "size mismatch hint should mention --full for deeper verification"
+        );
+    }
+
+    #[test]
+    fn raw_mirror_report_size_only_passes_when_content_differs_but_size_matches() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let data_dir = temp.path().join("cass-data");
+        let source_path = data_dir.join("sessions/source.jsonl");
+        let bytes = b"original-content-here!!";
+        let manifest =
+            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
+        let (blob_path, _) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
+
+        let corrupted = b"corrupted-content-too!!";
+        assert_eq!(bytes.len(), corrupted.len(), "test requires same-length content");
+        std::fs::write(&blob_path, corrupted).expect("overwrite blob with same-size content");
+
+        let light_report = collect_doctor_raw_mirror_report(&data_dir, false);
+        assert_eq!(
+            light_report.manifests[0].status, "size_verified",
+            "size-only mode cannot detect same-size content corruption"
+        );
+
+        let full_report = collect_doctor_raw_mirror_report(&data_dir, true);
+        assert_eq!(
+            full_report.manifests[0].status, "checksum_mismatch",
+            "full mode catches content corruption that size-only misses"
         );
     }
 
@@ -65889,7 +66002,7 @@ paths = ["~/.claude/projects"]
         manifest.manifest_blake3 = None;
         write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
 
-        let before_raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let before_raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
         let context =
             build_doctor_archive_scan_context(&data_dir, &data_dir.join("agent_search.db"));
         let mut plan = build_doctor_archive_normalize_plan(
@@ -65915,7 +66028,7 @@ paths = ["~/.claude/projects"]
             "annotation should be written additively"
         );
 
-        let after_raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        let after_raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
         assert_eq!(
             before_raw_mirror.summary.manifest_count,
             after_raw_mirror.summary.manifest_count
@@ -70475,6 +70588,7 @@ fn wait_with_progress<T>(
         let mut last_phase = usize::MAX;
         let mut last_current = usize::MAX;
         let mut last_agents = usize::MAX;
+        let mut last_semantic_current = usize::MAX;
         let mut last_update = Instant::now();
 
         loop {
@@ -70487,6 +70601,8 @@ fn wait_with_progress<T>(
             let current = progress.current.load(Ordering::Relaxed);
             let agents = progress.discovered_agents.load(Ordering::Relaxed);
             let is_rebuilding = progress.is_rebuilding.load(Ordering::Relaxed);
+            let semantic_current = progress.semantic_current.load(Ordering::Relaxed);
+            let semantic_total = progress.semantic_total.load(Ordering::Relaxed);
 
             let agent_names: Vec<String> = progress
                 .discovered_agent_names
@@ -70497,6 +70613,7 @@ fn wait_with_progress<T>(
             let phase_str = match phase {
                 1 => "Scanning",
                 2 => "Indexing",
+                3 => "Embedding",
                 _ => "Preparing",
             };
 
@@ -70538,6 +70655,16 @@ fn wait_with_progress<T>(
                 } else {
                     format!("{}{}: Processing...", phase_str, rebuild_indicator)
                 }
+            } else if phase == 3 {
+                if semantic_total > 0 {
+                    let pct = (semantic_current as f64 / semantic_total as f64 * 100.0).min(100.0);
+                    format!(
+                        "{}{}: {}/{} messages ({:.0}%)",
+                        phase_str, rebuild_indicator, semantic_current, semantic_total, pct
+                    )
+                } else {
+                    format!("{}{}: preparing...", phase_str, rebuild_indicator)
+                }
             } else {
                 format!("{}{}...", phase_str, rebuild_indicator)
             };
@@ -70546,6 +70673,7 @@ fn wait_with_progress<T>(
             let should_update = phase != last_phase
                 || current != last_current
                 || agents != last_agents
+                || semantic_current != last_semantic_current
                 || now.duration_since(last_update).as_millis() > 500;
 
             if should_update {
@@ -70553,6 +70681,7 @@ fn wait_with_progress<T>(
                 last_phase = phase;
                 last_current = current;
                 last_agents = agents;
+                last_semantic_current = semantic_current;
                 last_update = now;
             }
 
@@ -70569,6 +70698,7 @@ fn wait_with_progress<T>(
         let mut last_agents = 0;
         let mut last_current = 0;
         let mut last_scan_current = 0;
+        let mut last_semantic_current = 0;
 
         loop {
             if handle.is_finished() {
@@ -70579,11 +70709,14 @@ fn wait_with_progress<T>(
             let total = progress.total.load(Ordering::Relaxed);
             let current = progress.current.load(Ordering::Relaxed);
             let agents = progress.discovered_agents.load(Ordering::Relaxed);
+            let semantic_current = progress.semantic_current.load(Ordering::Relaxed);
+            let semantic_total = progress.semantic_total.load(Ordering::Relaxed);
 
             if phase != last_phase {
                 match phase {
                     1 => eprintln!("Scanning for agents..."),
                     2 => eprintln!("Indexing conversations..."),
+                    3 => eprintln!("Embedding messages..."),
                     _ => {}
                 }
                 last_phase = phase;
@@ -70610,6 +70743,18 @@ fn wait_with_progress<T>(
                     eprintln!("  Indexed {} conversations", current);
                 }
                 last_current = current;
+            }
+
+            if phase == 3
+                && semantic_current > last_semantic_current
+                && (semantic_current.is_multiple_of(100) || semantic_current == semantic_total)
+            {
+                if semantic_total > 0 {
+                    eprintln!("  Embedded {}/{} messages", semantic_current, semantic_total);
+                } else {
+                    eprintln!("  Embedded {} messages", semantic_current);
+                }
+                last_semantic_current = semantic_current;
             }
 
             std::thread::sleep(Duration::from_millis(200));
@@ -72907,6 +73052,7 @@ pub(crate) fn run_doctor_impl(
     command_surface: doctor::DoctorCommandSurface,
     execution_mode: doctor::DoctorExecutionMode,
     requested_plan_fingerprint: Option<String>,
+    full: bool,
     wrap: WrapConfig,
 ) -> CliResult<()> {
     use colored::*;
@@ -73769,7 +73915,7 @@ pub(crate) fn run_doctor_impl(
     }
 
     let raw_mirror_scan_started = Instant::now();
-    let mut raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+    let mut raw_mirror = collect_doctor_raw_mirror_report(&data_dir, full);
     doctor_push_timing_span(
         &mut timing_spans,
         "raw_mirror_scan",
@@ -73793,7 +73939,7 @@ pub(crate) fn run_doctor_impl(
             raw_mirror_backfill.captured_live_source_count,
             raw_mirror_backfill.existing_raw_manifest_link_count
         ));
-        raw_mirror = collect_doctor_raw_mirror_report(&data_dir);
+        raw_mirror = collect_doctor_raw_mirror_report(&data_dir, full);
     }
     doctor_push_timing_span(
         &mut timing_spans,
@@ -84438,10 +84584,19 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
         let phase = progress.phase.load(Ordering::Relaxed);
         let current = progress.current.load(Ordering::Relaxed);
         let total = progress.total.load(Ordering::Relaxed);
+        let (current, total) = if phase == 3 {
+            (
+                progress.semantic_current.load(Ordering::Relaxed),
+                progress.semantic_total.load(Ordering::Relaxed),
+            )
+        } else {
+            (current, total)
+        };
         if phase != last_phase || current != last_current || total != last_total {
             let phase_str = match phase {
                 1 => "scanning",
                 2 => "indexing",
+                3 => "embedding",
                 _ => "preparing",
             };
             if total > 0 {
@@ -84462,12 +84617,21 @@ fn refresh_index_inline(db_override: Option<PathBuf>, data_dir_override: Option<
     let final_phase = progress.phase.load(Ordering::Relaxed);
     let final_current = progress.current.load(Ordering::Relaxed);
     let final_total = progress.total.load(Ordering::Relaxed);
+    let (final_current, final_total) = if final_phase == 3 {
+        (
+            progress.semantic_current.load(Ordering::Relaxed),
+            progress.semantic_total.load(Ordering::Relaxed),
+        )
+    } else {
+        (final_current, final_total)
+    };
     if (final_phase != last_phase || final_current != last_current || final_total != last_total)
         && final_total > 0
     {
         let phase_str = match final_phase {
             1 => "scanning",
             2 => "indexing",
+            3 => "embedding",
             _ => "preparing",
         };
         eprintln!("  {phase_str}: {final_current}/{final_total}");
@@ -84789,9 +84953,15 @@ impl IndexStallWatchdog {
         let phase_code = index_progress
             .phase
             .load(std::sync::atomic::Ordering::Relaxed);
-        let current = index_progress
-            .current
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let current = if phase_code == 3 {
+            index_progress
+                .semantic_current
+                .load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            index_progress
+                .current
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
 
         if phase_code != self.last_phase {
             self.last_phase = phase_code;
@@ -85691,6 +85861,7 @@ fn run_index_with_data(
         let mut last_phase = usize::MAX;
         let mut last_current = usize::MAX;
         let mut last_agents = usize::MAX;
+        let mut last_semantic_current = usize::MAX;
         let mut last_update = std::time::Instant::now();
         let mut stall_watchdog =
             IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
@@ -85708,6 +85879,8 @@ fn run_index_with_data(
             let current = index_progress.current.load(Ordering::Relaxed);
             let agents = index_progress.discovered_agents.load(Ordering::Relaxed);
             let is_rebuilding = index_progress.is_rebuilding.load(Ordering::Relaxed);
+            let semantic_current = index_progress.semantic_current.load(Ordering::Relaxed);
+            let semantic_total = index_progress.semantic_total.load(Ordering::Relaxed);
 
             // Get agent names for display
             let agent_names: Vec<String> = index_progress
@@ -85719,6 +85892,7 @@ fn run_index_with_data(
             let phase_str = match phase {
                 1 => "Scanning",
                 2 => "Indexing",
+                3 => "Embedding",
                 _ => "Preparing",
             };
 
@@ -85761,6 +85935,17 @@ fn run_index_with_data(
                 } else {
                     format!("{}{}: Processing...", phase_str, rebuild_indicator)
                 }
+            } else if phase == 3 {
+                // Embedding phase - show progress
+                if semantic_total > 0 {
+                    let pct = (semantic_current as f64 / semantic_total as f64 * 100.0).min(100.0);
+                    format!(
+                        "{}{}: {}/{} messages ({:.0}%)",
+                        phase_str, rebuild_indicator, semantic_current, semantic_total, pct
+                    )
+                } else {
+                    format!("{}{}: preparing...", phase_str, rebuild_indicator)
+                }
             } else {
                 format!("{}{}...", phase_str, rebuild_indicator)
             };
@@ -85770,6 +85955,7 @@ fn run_index_with_data(
             let should_update = phase != last_phase
                 || current != last_current
                 || agents != last_agents
+                || semantic_current != last_semantic_current
                 || now.duration_since(last_update).as_millis() > 500;
 
             if should_update {
@@ -85777,6 +85963,7 @@ fn run_index_with_data(
                 last_phase = phase;
                 last_current = current;
                 last_agents = agents;
+                last_semantic_current = semantic_current;
                 last_update = now;
             }
 
@@ -85806,6 +85993,7 @@ fn run_index_with_data(
         let mut last_agents = 0;
         let mut last_current = 0;
         let mut last_scan_current = 0;
+        let mut last_semantic_current = 0;
         let mut stall_watchdog =
             IndexStallWatchdog::aborting_phase_two(data_dir.clone(), progress_interval)
                 .watch_aware(watch)
@@ -85820,12 +86008,15 @@ fn run_index_with_data(
             let total = index_progress.total.load(Ordering::Relaxed);
             let current = index_progress.current.load(Ordering::Relaxed);
             let agents = index_progress.discovered_agents.load(Ordering::Relaxed);
+            let semantic_current = index_progress.semantic_current.load(Ordering::Relaxed);
+            let semantic_total = index_progress.semantic_total.load(Ordering::Relaxed);
 
             // Print status on phase change
             if phase != last_phase {
                 match phase {
                     1 => eprintln!("Scanning for agents..."),
                     2 => eprintln!("Indexing conversations..."),
+                    3 => eprintln!("Embedding messages..."),
                     _ => {}
                 }
                 last_phase = phase;
@@ -85855,6 +86046,19 @@ fn run_index_with_data(
                     eprintln!("  Indexed {} conversations", current);
                 }
                 last_current = current;
+            }
+
+            // Print embedding progress every 100 messages
+            if phase == 3
+                && semantic_current > last_semantic_current
+                && semantic_current % 100 == 0
+            {
+                if semantic_total > 0 {
+                    eprintln!("  Embedded {}/{} messages", semantic_current, semantic_total);
+                } else {
+                    eprintln!("  Embedded {} messages", semantic_current);
+                }
+                last_semantic_current = semantic_current;
             }
 
             if let Some(payload) =
@@ -95808,6 +96012,7 @@ fn run_models_command(cmd: ModelsCommand, cli: &Cli) -> CliResult<()> {
             from_file,
             yes,
             data_dir,
+            json: _,
         } => run_models_install(
             &model,
             mirror.as_deref(),

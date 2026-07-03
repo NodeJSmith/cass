@@ -305,20 +305,27 @@ impl LoadingContext {
 /// Snapshot of indexer progress atomics, polled each tick.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IndexProgressSnapshot {
-    /// 0=Idle, 1=Scanning, 2=Indexing
+    /// 0=Idle, 1=Scanning, 2=Indexing, 3=Embedding
     phase: usize,
     current: usize,
     total: usize,
     _is_rebuilding: bool,
     agents_discovered: usize,
+    semantic_current: usize,
+    semantic_total: usize,
 }
 
 impl IndexProgressSnapshot {
     fn ratio(&self) -> f64 {
-        if self.total == 0 {
+        let (current, total) = if self.phase == 3 {
+            (self.semantic_current, self.semantic_total)
+        } else {
+            (self.current, self.total)
+        };
+        if total == 0 {
             0.0
         } else {
-            (self.current as f64 / self.total as f64).clamp(0.0, 1.0)
+            (current as f64 / total as f64).clamp(0.0, 1.0)
         }
     }
 
@@ -326,6 +333,7 @@ impl IndexProgressSnapshot {
         match self.phase {
             1 => "Scanning",
             2 => "Indexing",
+            3 => "Embedding",
             _ => "Idle",
         }
     }
@@ -7934,6 +7942,21 @@ impl CassApp {
                         "Indexing {}/{} ({}%)",
                         snap.current,
                         snap.total,
+                        (r * 100.0) as u32
+                    );
+                    FtuiProgressBar::new()
+                        .ratio(r)
+                        .label(&label)
+                        .style(bg_style)
+                        .gauge_style(gauge_style)
+                        .render(area, frame);
+                } else if snap.phase == 3 && snap.semantic_total > 0 {
+                    // Determinate: show "Embedding 42/100 (42%)"
+                    let r = snap.ratio();
+                    let label = format!(
+                        "Embedding {}/{} ({}%)",
+                        snap.semantic_current,
+                        snap.semantic_total,
                         (r * 100.0) as u32
                     );
                     FtuiProgressBar::new()
@@ -19736,6 +19759,8 @@ impl super::ftui_adapter::Model for CassApp {
                         total: progress.total.load(Relaxed),
                         _is_rebuilding: progress.is_rebuilding.load(Relaxed),
                         agents_discovered: progress.discovered_agents.load(Relaxed),
+                        semantic_current: progress.semantic_current.load(Relaxed),
+                        semantic_total: progress.semantic_total.load(Relaxed),
                     };
                     let snap = &self.index_progress_snapshot;
                     self.status = if snap.phase == 2 && snap.total > 0 {
@@ -19747,6 +19772,13 @@ impl super::ftui_adapter::Model for CassApp {
                         )
                     } else if snap.phase == 1 {
                         format!("Scanning... ({} agents found)", snap.agents_discovered)
+                    } else if snap.phase == 3 && snap.semantic_total > 0 {
+                        format!(
+                            "Embedding {}/{} ({}%)",
+                            snap.semantic_current,
+                            snap.semantic_total,
+                            (snap.ratio() * 100.0) as u32
+                        )
                     } else {
                         "Refreshing index...".to_string()
                     };

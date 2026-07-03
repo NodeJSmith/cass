@@ -2,6 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +17,7 @@ use frankensqlite::compat::{ConnectionExt, ParamValue, RowExt};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
+use crate::indexer::IndexingProgress;
 use crate::indexer::memoization::{
     ContentAddressedMemoCache, MemoCacheAuditRecord, MemoContentHash, MemoKey, MemoLookup,
 };
@@ -1623,23 +1626,47 @@ impl SemanticIndexer {
     }
 
     pub fn embed_messages(&self, messages: &[EmbeddingInput]) -> Result<Vec<EmbeddedMessage>> {
-        self.embed_messages_with_sink(messages, &SemanticProgressSink::disabled())
+        self.embed_messages_with_sink(messages, &SemanticProgressSink::disabled(), None)
+    }
+
+    /// Variant of [`embed_messages`] that reports batch-level progress into
+    /// the shared [`IndexingProgress`] struct so the CLI spinner and TUI can
+    /// render live embedding progress instead of a bare "preparing" state.
+    pub fn embed_messages_with_progress(
+        &self,
+        messages: &[EmbeddingInput],
+        progress: &Arc<IndexingProgress>,
+    ) -> Result<Vec<EmbeddedMessage>> {
+        self.embed_messages_with_sink(messages, &SemanticProgressSink::disabled(), Some(progress))
     }
 
     /// Variant of [`embed_messages`] that emits `embed_batch_*` events
     /// into the given JSONL sink. The sink is silent unless
     /// `CASS_SEMANTIC_PROGRESS_JSONL` is set, so this path is safe to
-    /// take in production.
+    /// take in production. `progress`, when set, receives live batch-level
+    /// updates for the CLI spinner / TUI to render.
     pub fn embed_messages_with_sink(
         &self,
         messages: &[EmbeddingInput],
         sink: &SemanticProgressSink,
+        progress: Option<&Arc<IndexingProgress>>,
     ) -> Result<Vec<EmbeddedMessage>> {
         if messages.is_empty() {
             return Ok(Vec::new());
         }
 
-        let show_progress = std::io::stderr().is_terminal();
+        if let Some(progress) = progress {
+            progress
+                .semantic_total
+                .store(messages.len(), Ordering::Relaxed);
+            progress.semantic_current.store(0, Ordering::Relaxed);
+        }
+
+        // When the shared IndexingProgress is wired up, the outer CLI
+        // spinner / TUI renders embedding progress from those atomics, so
+        // suppress this indicatif bar to avoid two competing progress
+        // displays fighting over the same terminal line.
+        let show_progress = std::io::stderr().is_terminal() && progress.is_none();
         let pb = ProgressBar::new(saturating_u64_from_usize(messages.len()));
         if show_progress {
             let style = ProgressStyle::default_bar()
@@ -1724,6 +1751,11 @@ impl SemanticIndexer {
                 flush_prepared_batch(batch, &mut embeddings, &pb, self.embedder.as_ref())?;
                 let elapsed_ms = saturating_u64_from_millis(batch_started.elapsed().as_millis());
                 rows_processed = rows_processed.saturating_add(batch_rows);
+                if let Some(progress) = progress {
+                    progress
+                        .semantic_current
+                        .store(rows_processed as usize, Ordering::Relaxed);
+                }
                 if warn_after_ms > 0 && elapsed_ms > warn_after_ms {
                     tracing::warn!(
                         batch_index,
@@ -2154,7 +2186,7 @@ impl SemanticIndexer {
             .as_ref()
             .map_or(0, |checkpoint| checkpoint.docs_embedded);
 
-        let embeddings = self.embed_messages_with_sink(messages, sink)?;
+        let embeddings = self.embed_messages_with_sink(messages, sink, None)?;
         let embedded_docs = u64::try_from(embeddings.len()).unwrap_or(u64::MAX);
         if sink.is_active() {
             sink.emit(
