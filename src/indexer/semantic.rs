@@ -726,18 +726,19 @@ pub(crate) fn saturating_u32_from_i64(raw: i64) -> u32 {
     }
 }
 
-fn canonical_embedding_created_at_ms(message_id: u64, created_at: Option<i64>) -> i64 {
-    // `created_at_ms` feeds time-range filters in the vector index
-    // (src/search/vector_index.rs range predicates) and contributes to
-    // `stable_hit_hash`. Defaulting a NULL created_at to 0 silently
-    // masquerades the message as Unix-epoch (1970), which is indistinguishable
-    // from a legitimately-ancient row in downstream filters. Emit a warn
-    // so operators see NULL-created_at rows in the logs instead of only
-    // finding them by puzzling over 1970 timestamps in semantic hits.
-    created_at.unwrap_or_else(|| {
+// Falls back to conversation started_at when message created_at is NULL.
+// This value feeds vector-index time-range filters and stable_hit_hash;
+// defaulting to 0 masquerades the row as 1970, breaking both.
+fn canonical_embedding_created_at_ms(
+    message_id: u64,
+    created_at: Option<i64>,
+    conversation_started_at: Option<i64>,
+) -> i64 {
+    created_at.or(conversation_started_at).unwrap_or_else(|| {
         tracing::warn!(
             message_id,
-            "semantic backfill: row has NULL created_at; defaulting to 0 (Unix epoch). \
+            "semantic backfill: row has NULL created_at and no conversation started_at; \
+             defaulting to 0 (Unix epoch). \
              Downstream time-range filters will treat this message as 1970-01-01."
         );
         0
@@ -783,6 +784,7 @@ fn embedding_input_from_packet_message(
     agent_id: u32,
     workspace_id: u32,
     source_id_hash: u32,
+    conversation_started_at: Option<i64>,
     message: &crate::model::conversation_packet::ConversationPacketMessage,
 ) -> Option<EmbeddingInput> {
     let Some(raw_message_id) = message.message_id else {
@@ -803,7 +805,11 @@ fn embedding_input_from_packet_message(
     };
     Some(EmbeddingInput {
         message_id,
-        created_at_ms: canonical_embedding_created_at_ms(message_id, message.created_at),
+        created_at_ms: canonical_embedding_created_at_ms(
+            message_id,
+            message.created_at,
+            conversation_started_at,
+        ),
         agent_id,
         workspace_id,
         source_id: source_id_hash,
@@ -836,6 +842,7 @@ fn embedding_inputs_from_conversation_packet(
                         agent_id,
                         workspace_id,
                         source_id_hash,
+                        row.started_at,
                         message,
                     )
                 })
@@ -968,6 +975,7 @@ pub(crate) fn semantic_inputs_from_packets(
                 context.agent_id,
                 context.workspace_id,
                 source_id_hash,
+                packet.payload.timestamps.started_at,
                 message,
             ) {
                 inputs.push(input);
@@ -4631,6 +4639,25 @@ mod tests {
         assert!(
             err.contains("length mismatch"),
             "error should mention length mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn canonical_created_at_falls_back_to_conversation_started_at() {
+        assert_eq!(
+            canonical_embedding_created_at_ms(1, Some(100), Some(200)),
+            100,
+            "should prefer message created_at when present"
+        );
+        assert_eq!(
+            canonical_embedding_created_at_ms(2, None, Some(200)),
+            200,
+            "should fall back to conversation started_at when created_at is NULL"
+        );
+        assert_eq!(
+            canonical_embedding_created_at_ms(3, None, None),
+            0,
+            "should default to 0 when both are NULL"
         );
     }
 }

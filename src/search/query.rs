@@ -7527,7 +7527,7 @@ impl SearchClient {
         let mut sql = format!(
             "SELECT c.id, {title_expr}, m.content, \
                  COALESCE((SELECT a.slug FROM agents a WHERE a.id = c.agent_id), 'unknown'), \
-                 w.path, c.source_path, m.created_at, m.idx, \
+                 w.path, c.source_path, COALESCE(m.created_at, c.started_at), m.idx, \
                  {normalized_source_sql}, c.origin_host, s.kind
              FROM messages m
              JOIN conversations c ON m.conversation_id = c.id
@@ -7556,11 +7556,11 @@ impl SearchClient {
         }
 
         if let Some(created_from) = filters.created_from {
-            sql.push_str(" AND m.created_at >= ?");
+            sql.push_str(" AND COALESCE(m.created_at, c.started_at) >= ?");
             params.push(ParamValue::from(created_from));
         }
         if let Some(created_to) = filters.created_to {
-            sql.push_str(" AND m.created_at <= ?");
+            sql.push_str(" AND COALESCE(m.created_at, c.started_at) <= ?");
             params.push(ParamValue::from(created_to));
         }
 
@@ -7582,7 +7582,7 @@ impl SearchClient {
         }
 
         sql.push_str(&format!(
-            " ORDER BY CASE WHEN m.created_at IS NULL THEN 1 ELSE 0 END, m.created_at {order}, m.id {order} LIMIT ? OFFSET ?"
+            " ORDER BY CASE WHEN COALESCE(m.created_at, c.started_at) IS NULL THEN 1 ELSE 0 END, COALESCE(m.created_at, c.started_at) {order}, m.id {order} LIMIT ? OFFSET ?"
         ));
         params.push(ParamValue::from(limit as i64));
         params.push(ParamValue::from(offset as i64));
@@ -12460,7 +12460,8 @@ mod tests {
                 source_id TEXT,
                 origin_host TEXT,
                 title TEXT,
-                source_path TEXT NOT NULL
+                source_path TEXT NOT NULL,
+                started_at INTEGER
              );
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
              CREATE TABLE messages (
@@ -12474,8 +12475,8 @@ mod tests {
         )?;
         conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
         conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, NULL, NULL, 'browse title', '/tmp/browse.jsonl')",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
+             VALUES(1, 1, NULL, NULL, NULL, 'browse title', '/tmp/browse.jsonl', NULL)",
         )?;
         conn.execute(
             "INSERT INTO messages(id, conversation_id, idx, content, created_at)
@@ -12514,6 +12515,100 @@ mod tests {
         assert_eq!(hits[0].workspace, "");
         assert_eq!(hits[0].source_id, "local");
         assert_eq!(hits[0].origin_kind, "local");
+
+        Ok(())
+    }
+
+    #[test]
+    fn browse_by_date_falls_back_to_conversation_started_at() -> Result<()> {
+        let conn = Connection::open(":memory:")?;
+        conn.execute_batch(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, slug TEXT NOT NULL);
+             CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY,
+                agent_id INTEGER NOT NULL,
+                workspace_id INTEGER,
+                source_id TEXT,
+                origin_host TEXT,
+                title TEXT,
+                source_path TEXT NOT NULL,
+                started_at INTEGER
+             );
+             CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                idx INTEGER,
+                content TEXT NOT NULL,
+                created_at INTEGER
+             );
+             CREATE TABLE sources (id TEXT PRIMARY KEY, kind TEXT);",
+        )?;
+        conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
+        conn.execute(
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
+             VALUES(1, 1, NULL, NULL, NULL, 'conv with started_at', '/tmp/fallback.jsonl', 500)",
+        )?;
+        conn.execute(
+            "INSERT INTO messages(id, conversation_id, idx, content, created_at)
+             VALUES(1, 1, 0, 'message with null created_at', NULL)",
+        )?;
+
+        let client = SearchClient {
+            reader: None,
+            sqlite: Mutex::new(Some(SendConnection(conn))),
+            sqlite_path: None,
+            prefix_cache: Mutex::new(CacheShards::new(*CACHE_TOTAL_CAP, *CACHE_BYTE_CAP)),
+            reload_on_search: true,
+            last_reload: Mutex::new(None),
+            last_generation: Mutex::new(None),
+            reload_epoch: Arc::new(AtomicU64::new(0)),
+            warm_tx: None,
+            _warm_handle: None,
+            metrics: Metrics::default(),
+            cache_namespace: format!("v{CACHE_KEY_VERSION}|schema:test"),
+            semantic: Mutex::new(None),
+            last_tantivy_total_count: Mutex::new(None),
+        };
+
+        // Unfiltered: message should appear with conversation's started_at as its timestamp
+        let hits = client.browse_by_date(
+            SearchFilters::default(),
+            5,
+            0,
+            true,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].created_at, Some(500), "should display conversation started_at");
+
+        // Date-range filter: should include the message when the range covers started_at
+        let hits = client.browse_by_date(
+            SearchFilters {
+                created_from: Some(400),
+                created_to: Some(600),
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            true,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 1, "should be included when range covers conversation started_at");
+
+        // Date-range filter: should exclude when range misses started_at
+        let hits = client.browse_by_date(
+            SearchFilters {
+                created_from: Some(600),
+                created_to: Some(700),
+                ..SearchFilters::default()
+            },
+            5,
+            0,
+            true,
+            FieldMask::FULL,
+        )?;
+        assert_eq!(hits.len(), 0, "should be excluded when range misses conversation started_at");
 
         Ok(())
     }
@@ -13409,7 +13504,8 @@ mod tests {
                 source_id TEXT,
                 origin_host TEXT,
                 title TEXT,
-                source_path TEXT NOT NULL
+                source_path TEXT NOT NULL,
+                started_at INTEGER
              );
              CREATE TABLE workspaces (id INTEGER PRIMARY KEY, path TEXT NOT NULL);
              CREATE TABLE messages (
@@ -13423,8 +13519,8 @@ mod tests {
         )?;
         conn.execute("INSERT INTO agents(id, slug) VALUES(1, 'codex')")?;
         conn.execute(
-            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path)
-             VALUES(1, 1, NULL, 'local', NULL, 'browse title', '/tmp/browse-shared.jsonl')",
+            "INSERT INTO conversations(id, agent_id, workspace_id, source_id, origin_host, title, source_path, started_at)
+             VALUES(1, 1, NULL, 'local', NULL, 'browse title', '/tmp/browse-shared.jsonl', NULL)",
         )?;
         let shared_prefix = "shared-prefix ".repeat(48);
         let first = format!("{shared_prefix}first browse-only tail");
