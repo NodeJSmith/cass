@@ -31,7 +31,6 @@ jobs:
     timeout-minutes: 5
     env:
       HAS_HOMEBREW_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
-      HAS_SCOOP_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN != '' }}
     steps:
       - name: Check package manager token availability
         run: |
@@ -39,11 +38,6 @@ jobs:
             echo "::warning::HOMEBREW_TAP_TOKEN not configured — Homebrew tap update will be skipped after release."
           else
             echo "HOMEBREW_TAP_TOKEN is configured."
-          fi
-          if [[ "${HAS_SCOOP_TOKEN}" != "true" ]]; then
-            echo "::warning::SCOOP_BUCKET_TOKEN not configured — Scoop bucket update will be skipped after release."
-          else
-            echo "SCOOP_BUCKET_TOKEN is configured."
           fi
 
   build:
@@ -55,60 +49,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux x86_64 - ubuntu-24.04 (glibc 2.39); ort-sys prebuilt ONNX
-          # Runtime binaries require glibc ≥2.38, so 22.04 cannot link.
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact_name: cass
             asset_name: cass-linux-amd64
             cargo_flags: ""
-          # Linux x86_64 baseline - same target as above but built with
-          # `--no-default-features --features qr,encryption` so the
-          # prebuilt Microsoft ONNX Runtime binary (which carries
-          # AVX/AVX2 dispatch code Rust's RUSTFLAGS cannot reach) is not
-          # linked. Required for pre-AVX2 Linux hosts (Sandy/Ivy Bridge);
-          # see cass#256.
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            artifact_name: cass
-            asset_name: cass-linux-amd64-baseline
-            cargo_flags: "--no-default-features --features qr,encryption"
-          # Linux ARM64 - same glibc constraint as x86_64. No baseline
-          # variant: aarch64 has no AVX2 lineage to worry about.
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact_name: cass
-            asset_name: cass-linux-arm64
-            cargo_flags: ""
-          # macOS Intel - DISABLED: ort-sys doesn't provide prebuilt ONNX Runtime binaries
-          # for x86_64-apple-darwin. Intel Mac users can build from source.
-          # - os: macos-15
-          #   target: x86_64-apple-darwin
-          #   artifact_name: cass
-          #   asset_name: cass-darwin-amd64
-          # macOS Apple Silicon - no baseline variant needed (Apple
-          # Silicon has no x86 AVX2 exposure).
           - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: cass
             asset_name: cass-darwin-arm64
             cargo_flags: ""
-          # Windows - default (semantic-enabled) build.
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: cass.exe
-            asset_name: cass-windows-amd64
-            cargo_flags: ""
-          # Windows baseline - `--no-default-features --features
-          # qr,encryption` drops the prebuilt Microsoft ONNX Runtime
-          # binary so pre-AVX2 Windows hosts (Sandy/Ivy Bridge, e.g. the
-          # i7-3770K reporter in cass#256) no longer crash with
-          # STATUS_ILLEGAL_INSTRUCTION at static init.
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: cass.exe
-            asset_name: cass-windows-amd64-baseline
-            cargo_flags: "--no-default-features --features qr,encryption"
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -141,33 +91,6 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
-      - name: Configure Windows MSVC CRT for cc-rs
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # esaxx-rs requests /MT via cc-rs, while ONNX Runtime ships /MD objects.
-          # Disable cc-rs defaults and choose /MD explicitly so all linked objects agree.
-          "CRATE_CC_NO_DEFAULTS=1" >> $env:GITHUB_ENV
-          "CFLAGS=/MD" >> $env:GITHUB_ENV
-          "CXXFLAGS=/MD" >> $env:GITHUB_ENV
-
-      - name: Pin Windows release codegen to x86-64-v2 (Sandy/Ivy Bridge baseline)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # Issue #256: cass v0.6.2's Windows binary illegal-instructions on
-          # pre-AVX2 CPUs (e.g. Ivy Bridge i7-3770K). The default Windows
-          # codegen on hosted runners pulls AVX2 intrinsics from transitive
-          # crates (or the runner CPU's native feature set), which Sandy/Ivy
-          # Bridge does not implement. Pin the distributed binary to the
-          # x86-64-v2 microarch level (SSE4.2 + POPCNT, no AVX/AVX2) so it
-          # runs on every 64-bit Windows host shipped since ~2009.
-          #
-          # If a v3 (Haswell+) variant is ever wanted we should ship it as a
-          # separate matrix entry with its own asset name - never change the
-          # default `cass-windows-amd64.zip` baseline.
-          "RUSTFLAGS=-C target-cpu=x86-64-v2" >> $env:GITHUB_ENV
-
       - name: Install OpenSSL (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -175,39 +98,9 @@ jobs:
           echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
       - name: Build release
-        # `matrix.cargo_flags` is empty for default builds and
-        # "--no-default-features --features qr,encryption" for the cass#256
-        # `-baseline` builds (Linux/Windows amd64) that ship without
-        # fastembed + the prebuilt Microsoft ONNX Runtime binary.
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.cargo_flags }}
 
-      - name: Smoke-test baseline binary (Unix)
-        if: runner.os != 'Windows' && contains(matrix.asset_name, '-baseline')
-        shell: bash
-        run: |
-          set -euo pipefail
-          BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
-          # cass#256: a baseline binary must (1) run `--version` cleanly
-          # and (2) answer a tiny robot-mode command without loading ONNX
-          # Runtime. The JSON feature flag is pinned by the robot golden
-          # tests, where status/health have deterministic fixtures.
-          "$BINARY" --version
-          STATUS_FEATURE="$("$BINARY" api-version --json | python3 -c 'import json,sys;print(json.load(sys.stdin).get("api_version", -1))')"
-          echo "api_version (baseline): ${STATUS_FEATURE}"
-
-      - name: Smoke-test baseline binary (Windows)
-        if: runner.os == 'Windows' && contains(matrix.asset_name, '-baseline')
-        shell: pwsh
-        run: |
-          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
-          # cass#256: confirm the baseline binary at least answers
-          # `--version` on the Windows runner (which has AVX2 itself -
-          # the real pre-AVX2 validation happens off-CI on user hardware).
-          & $binary --version
-          if ($LASTEXITCODE -ne 0) { throw "baseline cass.exe --version failed: exit $LASTEXITCODE" }
-
-      - name: Verify binary architecture (Unix)
-        if: runner.os != 'Windows'
+      - name: Verify binary architecture
         shell: bash
         run: |
           set -euo pipefail
@@ -247,28 +140,7 @@ jobs:
 
           echo "Architecture verification passed for ${{ matrix.target }}"
 
-      - name: Verify binary architecture (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
-          # Read PE header to verify machine type
-          $bytes = [System.IO.File]::ReadAllBytes($binary)
-          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
-          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
-          # 0x8664 = AMD64, 0x14c = i386, 0xAA64 = ARM64
-          switch ("${{ matrix.target }}") {
-            "x86_64-pc-windows-msvc" {
-              if ($machine -ne 0x8664) {
-                Write-Error "Expected AMD64 (0x8664) but got 0x$($machine.ToString('X4'))"
-                exit 1
-              }
-            }
-          }
-          Write-Output "Architecture verification passed: machine type 0x$($machine.ToString('X4'))"
-
-      - name: Create tarball with checksum (Unix)
-        if: runner.os != 'Windows'
+      - name: Create tarball with checksum
         run: |
           mkdir -p dist
           TARBALL="${{ matrix.asset_name }}.tar.gz"
@@ -282,25 +154,6 @@ jobs:
             cat "$TARBALL.sha256"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Create zip with checksum (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $zipName = "${{ matrix.asset_name }}.zip"
-          $legacyZipName = "coding-agent-search-x86_64-pc-windows-msvc.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" -DestinationPath "dist/$zipName"
-          cd dist
-          Copy-Item $zipName $legacyZipName
-          $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
-          "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
-          "$hash  $legacyZipName" | Out-File -Encoding ASCII "$legacyZipName.sha256"
-          Write-Output "### ${{ matrix.target }}" | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
-          Write-Output '```' | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
-          Get-Content "$zipName.sha256" | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
-          Get-Content "$legacyZipName.sha256" | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
-          Write-Output '```' | Out-File -Append -Encoding UTF8 $env:GITHUB_STEP_SUMMARY
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -687,12 +540,10 @@ jobs:
           }
 
           linux_amd64="$(resolve_checksum "cass-linux-amd64.tar.gz")"
-          linux_arm64="$(resolve_checksum "cass-linux-arm64.tar.gz")"
           darwin_arm64="$(resolve_checksum "cass-darwin-arm64.tar.gz")"
 
           for item in \
             "linux_amd64:${linux_amd64}" \
-            "linux_arm64:${linux_arm64}" \
             "darwin_arm64:${darwin_arm64}"; do
             name="${item%%:*}"
             value="${item#*:}"
@@ -704,7 +555,6 @@ jobs:
 
           {
             echo "linux_amd64=${linux_amd64}"
-            echo "linux_arm64=${linux_arm64}"
             echo "darwin_arm64=${darwin_arm64}"
           } >> "$GITHUB_OUTPUT"
 
@@ -721,7 +571,6 @@ jobs:
               "version": "${{ needs.release.outputs.version }}",
               "checksums": {
                 "cass-linux-amd64.tar.gz": "${{ steps.checksums.outputs.linux_amd64 }}",
-                "cass-linux-arm64.tar.gz": "${{ steps.checksums.outputs.linux_arm64 }}",
                 "cass-darwin-arm64.tar.gz": "${{ steps.checksums.outputs.darwin_arm64 }}"
               }
             }
@@ -734,7 +583,6 @@ jobs:
           echo "   Version: ${{ needs.release.outputs.version }}"
           echo "   Checksums:"
           echo "     cass-linux-amd64.tar.gz: ${{ steps.checksums.outputs.linux_amd64 }}"
-          echo "     cass-linux-arm64.tar.gz: ${{ steps.checksums.outputs.linux_arm64 }}"
           echo "     cass-darwin-arm64.tar.gz: ${{ steps.checksums.outputs.darwin_arm64 }}"
 
       - name: Verify live Homebrew formula matches release
@@ -819,72 +667,3 @@ jobs:
           echo "::error::Actual cass-darwin-arm64.tar.gz ${actual_darwin_arm64}"
           exit 1
 
-  notify-scoop-bucket:
-    name: Notify Scoop Bucket
-    runs-on: ubuntu-latest
-    needs: release
-    timeout-minutes: 5
-    # Don't fail the release if notification fails (token may not be configured)
-    continue-on-error: true
-    env:
-      HAS_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN != '' }}
-    steps:
-      - name: Check for token
-        id: check
-        run: |
-          if [[ "${{ env.HAS_TOKEN }}" != "true" ]]; then
-            echo "::warning::SCOOP_BUCKET_TOKEN not configured, skipping notification"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            {
-              echo "### Manual Scoop bucket update required"
-              echo ""
-              echo "SCOOP_BUCKET_TOKEN is not configured in this repository, so the release workflow could not dispatch the bucket update automatically."
-              echo ""
-              echo "Run the downstream workflow manually:"
-              echo '```bash'
-              echo "gh workflow run auto-update.yml --repo Dicklesworthstone/scoop-bucket -f tool=cass -f version=${{ needs.release.outputs.version }}"
-              echo '```'
-              echo ""
-              echo "Workflow URL: https://github.com/Dicklesworthstone/scoop-bucket/actions/workflows/auto-update.yml"
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Resolve Windows checksum
-        if: steps.check.outputs.skip != 'true'
-        id: checksums
-        shell: bash
-        run: |
-          BASE_URL="https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}"
-          windows_amd64="$(curl -fsSL "${BASE_URL}/cass-windows-amd64.zip.sha256" | awk '{print $1}')"
-          if [[ ! "${windows_amd64}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Invalid checksum for windows_amd64: ${windows_amd64}"
-            exit 1
-          fi
-          echo "windows_amd64=${windows_amd64}" >> "$GITHUB_OUTPUT"
-
-      - name: Trigger manifest update
-        if: steps.check.outputs.skip != 'true'
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3
-        with:
-          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
-          repository: Dicklesworthstone/scoop-bucket
-          event-type: manifest-update
-          client-payload: |
-            {
-              "tool": "cass",
-              "version": "${{ needs.release.outputs.version }}",
-              "url": "https://github.com/Dicklesworthstone/coding_agent_session_search/releases/download/v${{ needs.release.outputs.version }}/cass-windows-amd64.zip",
-              "hash": "${{ steps.checksums.outputs.windows_amd64 }}",
-              "asset_name": "cass-windows-amd64.zip"
-            }
-
-      - name: Log dispatch
-        if: steps.check.outputs.skip != 'true'
-        run: |
-          echo "Dispatched manifest-update event to scoop-bucket"
-          echo "   Tool: cass"
-          echo "   Version: ${{ needs.release.outputs.version }}"
-          echo "   Asset: cass-windows-amd64.zip"
-          echo "   Checksum: ${{ steps.checksums.outputs.windows_amd64 }}"
