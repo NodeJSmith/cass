@@ -351,8 +351,8 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         build_hnsw: bool,
 
-        /// Embedder to use for semantic indexing (hash, fastembed)
-        #[arg(long, default_value = "fastembed")]
+        /// Embedder to use for semantic indexing (jina, fastembed, hash)
+        #[arg(long, default_value = "jina")]
         embedder: String,
 
         /// Override data dir (index + db). Defaults to platform data dir.

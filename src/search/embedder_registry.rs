@@ -44,7 +44,7 @@ use super::fastembed_embedder::FastEmbedder;
 use super::hash_embedder::HashEmbedder;
 
 /// Default embedder name when none specified.
-pub const DEFAULT_EMBEDDER: &str = "minilm";
+pub const DEFAULT_EMBEDDER: &str = "jina";
 
 /// Hash embedder name (always available).
 pub const HASH_EMBEDDER: &str = "hash";
@@ -106,6 +106,11 @@ impl RegisteredEmbedder {
             return None;
         }
 
+        #[cfg(feature = "onnx-embedder")]
+        if self.name == "jina" {
+            return Some(crate::search::onnx_embedder::JinaEmbedder::model_dir(data_dir));
+        }
+
         FastEmbedder::model_dir_for(data_dir, self.name)
     }
 
@@ -114,7 +119,11 @@ impl RegisteredEmbedder {
         if !self.requires_model_files {
             return &[];
         }
-        // All ONNX-based embedders use the same file structure
+        #[cfg(feature = "onnx-embedder")]
+        if self.name == "jina" {
+            static JINA_FILES: &[&str] = &["model_q4.onnx", "tokenizer.json"];
+            return JINA_FILES;
+        }
         REQUIRED_ONNX_FILES
     }
 
@@ -166,7 +175,20 @@ impl RegisteredEmbedder {
 /// Models marked with `bakeoff_eligible: true` are candidates for the embedding bake-off
 /// (released after 2025-11-01). The baseline (minilm) is not eligible but used for comparison.
 pub static EMBEDDERS: &[RegisteredEmbedder] = &[
-    // === Baseline (not eligible for bake-off) ===
+    // === Primary (ONNX-based, requires onnx-embedder feature) ===
+    RegisteredEmbedder {
+        name: "jina",
+        id: "jina-v2-small-512",
+        dimension: 512,
+        is_semantic: true,
+        description: "Jina v2 small - 8K token context, code-aware embeddings (ONNX)",
+        requires_model_files: true,
+        release_date: "2023-10-30",
+        huggingface_id: "jinaai/jina-embeddings-v2-small-en",
+        size_bytes: 73_000_000,
+        is_baseline: false,
+    },
+    // === Native frankentorch embedders ===
     RegisteredEmbedder {
         name: "minilm",
         id: "minilm-384",
@@ -179,7 +201,6 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         size_bytes: 90_000_000,
         is_baseline: true,
     },
-    // === Bake-off Eligible Models (released >= 2025-11-01, verified checksums) ===
     RegisteredEmbedder {
         name: "snowflake-arctic-s",
         id: "snowflake-arctic-s-384",
@@ -384,7 +405,12 @@ fn load_embedder_by_name(data_dir: &Path, name: &str) -> EmbedderResult<Arc<dyn 
             let embedder = HashEmbedder::default();
             Ok(Arc::new(embedder))
         }
-        // All ONNX-based embedders (baseline and bake-off candidates)
+        #[cfg(feature = "onnx-embedder")]
+        "jina" => {
+            let embedder = crate::search::onnx_embedder::JinaEmbedder::load(data_dir)?;
+            Ok(Arc::new(embedder))
+        }
+        // All native/frankentorch-based embedders
         "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
             let embedder = FastEmbedder::load_by_name(data_dir, name)?;
             Ok(Arc::new(embedder))

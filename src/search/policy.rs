@@ -148,7 +148,7 @@ impl ModelDownloadPolicy {
 pub const DEFAULT_FAST_TIER_EMBEDDER: &str = "hash";
 
 /// Default quality-tier embedder name (requires ML model files).
-pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "minilm";
+pub const DEFAULT_QUALITY_TIER_EMBEDDER: &str = "jina";
 
 /// Default reranker name (requires cross-encoder model files).
 pub const DEFAULT_RERANKER: &str = "ms-marco-minilm";
@@ -158,8 +158,8 @@ pub const DEFAULT_RERANKER: &str = "ms-marco-minilm";
 /// Fast-tier embedding dimension (hash embedder).
 pub const DEFAULT_FAST_DIMENSION: usize = 256;
 
-/// Quality-tier embedding dimension (MiniLM).
-pub const DEFAULT_QUALITY_DIMENSION: usize = 384;
+/// Quality-tier embedding dimension (Jina v2 small).
+pub const DEFAULT_QUALITY_DIMENSION: usize = 512;
 
 /// Quality-tier score weight when blending (0.0-1.0).
 pub const DEFAULT_QUALITY_WEIGHT: f32 = 0.7;

@@ -66,6 +66,8 @@ walkdir = "2.5.0"
 glob = "0.3.3"
 base64 = ">=0.21"
 blake3 = "1.8.5"
+ort = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
 mime_guess = "2.0.5"
 pulldown-cmark = { version = "0.13.3", default-features = false, features = ["html"] }
 chrono = { version = "0.4.44", features = ["serde"] }
@@ -138,7 +140,7 @@ security-framework = "3.7.0"
 openssl = { version = "0.10.79", features = ["vendored"] }
 
 [features]
-default = ["qr", "encryption", "semantic"]
+default = ["qr", "encryption", "semantic", "onnx-embedder"]
 qr = ["dep:qrcode", "dep:image"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 backtrace = []
@@ -152,6 +154,7 @@ backtrace = []
 # lexical-only binary; semantic search modes then return a clear error while
 # lexical search and all other functionality remain fully available.
 semantic = ["frankensearch/native"]
+onnx-embedder = ["dep:ort", "dep:tokenizers"]
 # Opt-in: upgrade sibling repo rev/worktree drift from warning to hard error and
 # validate the optional /data/projects path checkouts before enabling local overrides.
 strict-path-dep-validation = []

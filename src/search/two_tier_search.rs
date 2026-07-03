@@ -83,7 +83,7 @@ impl Default for TwoTierConfig {
     fn default() -> Self {
         Self {
             fast_dimension: 256,
-            quality_dimension: 384,
+            quality_dimension: 512,
             quality_weight: 0.7,
             max_refinement_docs: 100,
             fast_only: false,

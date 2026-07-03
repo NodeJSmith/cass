@@ -705,8 +705,8 @@ fn load_semantic_context_inner(
         }
     };
 
-    let embedder = match FastEmbedder::load_by_name(data_dir, canonical_name) {
-        Ok(embedder) => Arc::new(embedder) as Arc<dyn Embedder>,
+    let embedder = match crate::search::embedder_registry::get_embedder(data_dir, Some(canonical_name)) {
+        Ok(embedder) => embedder,
         Err(err) => {
             return SemanticSetup {
                 availability: SemanticAvailability::LoadFailed {

@@ -1582,6 +1582,15 @@ pub struct SemanticIndexer {
 impl SemanticIndexer {
     pub fn new(embedder_type: &str, data_dir: Option<&Path>) -> Result<Self> {
         let embedder: Box<dyn Embedder> = match embedder_type {
+            #[cfg(feature = "onnx-embedder")]
+            "jina" => {
+                let dir = data_dir
+                    .ok_or_else(|| anyhow::anyhow!("data_dir required for jina embedder"))?;
+                Box::new(
+                    crate::search::onnx_embedder::JinaEmbedder::load(dir)
+                        .map_err(|e| anyhow::anyhow!("jina embedder unavailable: {e}"))?,
+                )
+            }
             "fastembed" | "minilm" | "snowflake-arctic-s" | "nomic-embed" => {
                 let dir = data_dir
                     .ok_or_else(|| anyhow::anyhow!("data_dir required for fastembed embedder"))?;

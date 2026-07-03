@@ -4579,6 +4579,26 @@ impl SearchClient {
             )));
         }
 
+        #[cfg(feature = "onnx-embedder")]
+        if embedder_id == crate::search::onnx_embedder::JinaEmbedder::embedder_id_static() {
+            let data_dir = self
+                .sqlite_path
+                .as_ref()
+                .and_then(|path| path.parent())
+                .ok_or_else(|| anyhow!("cannot resolve data dir for jina embedder load"))?;
+            let embedder = crate::search::onnx_embedder::JinaEmbedder::load(data_dir)
+                .with_context(|| "loading Jina ONNX embedder")?;
+            if embedder.dimension() != dimension {
+                bail!(
+                    "progressive embedder dimension mismatch: {} index expects {}, model has {}",
+                    embedder_id,
+                    dimension,
+                    embedder.dimension()
+                );
+            }
+            return Ok(Arc::new(embedder));
+        }
+
         if let Some(embedder_name) =
             crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
         {

@@ -36,6 +36,8 @@ pub mod fastembed_embedder;
 pub mod fastembed_reranker;
 pub(crate) mod fleet_cheap_probes;
 pub mod hash_embedder;
+#[cfg(feature = "onnx-embedder")]
+pub mod onnx_embedder;
 pub(crate) mod human_readiness_summary;
 pub(crate) mod incident_categories;
 pub(crate) mod incident_redaction;

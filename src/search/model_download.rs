@@ -744,8 +744,32 @@ impl ModelManifest {
     // ==================== Lookup Functions ====================
 
     /// Get manifest by embedder name.
+    pub fn jina_v2_small() -> Self {
+        Self {
+            id: "jina-embeddings-v2-small-en".into(),
+            repo: "xenova/jina-embeddings-v2-small-en".into(),
+            revision: "523cadcb9c2e71c7153fc46016e1fe79acb4f58f".into(),
+            files: vec![
+                ModelFile {
+                    name: "onnx/model_q4.onnx".into(),
+                    sha256: "3d8cfdea4bbe155029cc3f33ad9e27381291f8244aad64e23ad4d7792b33cadb"
+                        .into(),
+                    size: 73188661,
+                },
+                ModelFile {
+                    name: "tokenizer.json".into(),
+                    sha256: "e9f999ac74497843ed9f4303246a8f43d9f100ee8aab8e133667903f447ceb48"
+                        .into(),
+                    size: 711573,
+                },
+            ],
+            license: "Apache-2.0".into(),
+        }
+    }
+
     pub fn for_embedder(name: &str) -> Option<Self> {
         match name {
+            "jina" => Some(Self::jina_v2_small()),
             "minilm" => Some(Self::minilm_v2()),
             "snowflake-arctic-s" => Some(Self::snowflake_arctic_s()),
             "nomic-embed" => Some(Self::nomic_embed()),

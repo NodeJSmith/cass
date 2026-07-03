@@ -124,6 +124,7 @@ impl FastEmbedder {
             "minilm" => MINILM_DIR_NAME,
             "snowflake-arctic-s" => "snowflake-arctic-embed-s",
             "nomic-embed" => "nomic-embed-text-v1.5",
+            "jina" => "jina-embeddings-v2-small-en",
             _ => return None,
         };
         Some(data_dir.join("models").join(dir_name))
@@ -148,6 +149,9 @@ impl FastEmbedder {
             "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
                 Some("nomic-embed")
             }
+            "jina" | "jina-v2-small" | "jina-v2-small-512" | "jina-embeddings-v2-small-en" => {
+                Some("jina")
+            }
             _ => None,
         }
     }
@@ -171,6 +175,12 @@ impl FastEmbedder {
                 embedder_id: "nomic-embed-768".to_string(),
                 model_id: "nomic-embed-text-v1.5".to_string(),
                 dimension: 768,
+                pooling: Pooling::Mean,
+            }),
+            "jina" => Some(OnnxEmbedderConfig {
+                embedder_id: "jina-v2-small-512".to_string(),
+                model_id: "jina-embeddings-v2-small-en".to_string(),
+                dimension: 512,
                 pooling: Pooling::Mean,
             }),
             _ => None,
