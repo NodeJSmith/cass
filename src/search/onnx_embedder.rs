@@ -45,10 +45,7 @@ impl JinaEmbedder {
         if !tokenizer_path.is_file() {
             return Err(SearchError::EmbedderUnavailable {
                 model: MODEL_NAME.to_string(),
-                reason: format!(
-                    "tokenizer not found at {}",
-                    tokenizer_path.display()
-                ),
+                reason: format!("tokenizer not found at {}", tokenizer_path.display()),
             });
         }
 
@@ -82,19 +79,14 @@ impl JinaEmbedder {
             .iter()
             .map(|&m| m as i64)
             .collect();
-        let token_type_ids: Vec<i64> = encoding
-            .get_type_ids()
-            .iter()
-            .map(|&t| t as i64)
-            .collect();
+        let token_type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
 
         let seq_len = input_ids.len();
 
         let ids_tensor = Tensor::from_array((vec![1i64, seq_len as i64], input_ids))
             .map_err(|e| embedding_failed(&format!("input_ids tensor: {e}")))?;
-        let mask_tensor =
-            Tensor::from_array((vec![1i64, seq_len as i64], attention_mask.clone()))
-                .map_err(|e| embedding_failed(&format!("attention_mask tensor: {e}")))?;
+        let mask_tensor = Tensor::from_array((vec![1i64, seq_len as i64], attention_mask.clone()))
+            .map_err(|e| embedding_failed(&format!("attention_mask tensor: {e}")))?;
         let type_tensor = Tensor::from_array((vec![1i64, seq_len as i64], token_type_ids))
             .map_err(|e| embedding_failed(&format!("token_type_ids tensor: {e}")))?;
 

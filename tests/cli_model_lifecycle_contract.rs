@@ -43,7 +43,8 @@ fn models_install_from_file_keeps_acquisition_data_dir_scoped() -> Result<(), St
                 mirror: None,
                 from_file: Some(from_file),
                 yes: true,
-                data_dir: Some(data_dir), json: _,
+                data_dir: Some(data_dir),
+                json: _,
             })) if model == "all-minilm-l6-v2"
                 && from_file.display().to_string() == "/seeded/models/all-minilm-l6-v2"
                 && data_dir.display().to_string() == "/cass/models" =>
@@ -79,7 +80,8 @@ fn models_install_from_mirror_keeps_acquisition_data_dir_scoped() -> Result<(), 
                 mirror: Some(mirror),
                 from_file: None,
                 yes: true,
-                data_dir: Some(data_dir), json: _,
+                data_dir: Some(data_dir),
+                json: _,
             })) if model == "all-minilm-l6-v2"
                 && mirror == "https://mirror.example/models"
                 && data_dir.display().to_string() == "/cass/models" =>
@@ -133,7 +135,8 @@ fn models_install_defaults_to_standard_model_with_confirmation() -> Result<(), S
                 mirror: None,
                 from_file: None,
                 yes: false,
-                data_dir: Some(data_dir), json: _,
+                data_dir: Some(data_dir),
+                json: _,
             })) if model == "all-minilm-l6-v2"
                 && data_dir.display().to_string() == "/cass/models" =>
             {

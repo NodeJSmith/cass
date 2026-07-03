@@ -37394,8 +37394,7 @@ fn collect_doctor_raw_mirror_report_with_threshold(
                 .or_default() += 1;
             if matches!(
                 manifest.blob_checksum_status,
-                DoctorArtifactChecksumStatus::Matched
-                    | DoctorArtifactChecksumStatus::NotRecorded
+                DoctorArtifactChecksumStatus::Matched | DoctorArtifactChecksumStatus::NotRecorded
             ) {
                 verified_blob_bytes
                     .entry(manifest.blob_blake3.clone())
@@ -39253,15 +39252,11 @@ fn collect_doctor_raw_mirror_backfill_report(
         mode: "disabled".to_string(),
         status: "skipped".to_string(),
         read_only_external_source_dirs: true,
-        notes: vec![
-            "Raw mirror backfill disabled in fork.".to_string(),
-        ],
+        notes: vec!["Raw mirror backfill disabled in fork.".to_string()],
         forensic_bundle: doctor_forensic_bundle_uncaptured("not_required_read_only_or_no_mutation"),
         ..DoctorRawMirrorBackfillReport::default()
     };
-
 }
-
 
 fn doctor_coverage_confidence_tier(
     archive_conversation_count: usize,
@@ -65674,8 +65669,11 @@ paths = ["~/.claude/projects"]
             raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
         let (blob_path, _) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
 
-        std::fs::write(&blob_path, b"wrong size content that differs in length from original")
-            .expect("overwrite blob with wrong-size content");
+        std::fs::write(
+            &blob_path,
+            b"wrong size content that differs in length from original",
+        )
+        .expect("overwrite blob with wrong-size content");
 
         let report = collect_doctor_raw_mirror_report(&data_dir, false);
         assert_eq!(report.manifests[0].status, "size_mismatch");
@@ -65704,7 +65702,11 @@ paths = ["~/.claude/projects"]
         let (blob_path, _) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
 
         let corrupted = b"corrupted-content-too!!";
-        assert_eq!(bytes.len(), corrupted.len(), "test requires same-length content");
+        assert_eq!(
+            bytes.len(),
+            corrupted.len(),
+            "test requires same-length content"
+        );
         std::fs::write(&blob_path, corrupted).expect("overwrite blob with same-size content");
 
         let light_report = collect_doctor_raw_mirror_report(&data_dir, false);
@@ -70603,7 +70605,10 @@ fn wait_with_progress<T>(
                 && (semantic_current.is_multiple_of(100) || semantic_current == semantic_total)
             {
                 if semantic_total > 0 {
-                    eprintln!("  Embedded {}/{} messages", semantic_current, semantic_total);
+                    eprintln!(
+                        "  Embedded {}/{} messages",
+                        semantic_current, semantic_total
+                    );
                 } else {
                     eprintln!("  Embedded {} messages", semantic_current);
                 }
@@ -85902,12 +85907,13 @@ fn run_index_with_data(
             }
 
             // Print embedding progress every 100 messages
-            if phase == 3
-                && semantic_current > last_semantic_current
-                && semantic_current % 100 == 0
+            if phase == 3 && semantic_current > last_semantic_current && semantic_current % 100 == 0
             {
                 if semantic_total > 0 {
-                    eprintln!("  Embedded {}/{} messages", semantic_current, semantic_total);
+                    eprintln!(
+                        "  Embedded {}/{} messages",
+                        semantic_current, semantic_total
+                    );
                 } else {
                     eprintln!("  Embedded {} messages", semantic_current);
                 }

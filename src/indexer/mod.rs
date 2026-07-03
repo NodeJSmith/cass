@@ -24096,8 +24096,7 @@ fn capture_scan_root_file_before_parse(
     }
 }
 
-fn attach_raw_mirror_capture(_data_dir: &Path, _conv: &mut NormalizedConversation) {
-}
+fn attach_raw_mirror_capture(_data_dir: &Path, _conv: &mut NormalizedConversation) {}
 
 fn raw_mirror_db_link_for_conversation(
     conv: &NormalizedConversation,

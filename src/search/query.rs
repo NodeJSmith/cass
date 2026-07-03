@@ -12592,15 +12592,13 @@ mod tests {
         };
 
         // Unfiltered: message should appear with conversation's started_at as its timestamp
-        let hits = client.browse_by_date(
-            SearchFilters::default(),
-            5,
-            0,
-            true,
-            FieldMask::FULL,
-        )?;
+        let hits = client.browse_by_date(SearchFilters::default(), 5, 0, true, FieldMask::FULL)?;
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].created_at, Some(500), "should display conversation started_at");
+        assert_eq!(
+            hits[0].created_at,
+            Some(500),
+            "should display conversation started_at"
+        );
 
         // Date-range filter: should include the message when the range covers started_at
         let hits = client.browse_by_date(
@@ -12614,7 +12612,11 @@ mod tests {
             true,
             FieldMask::FULL,
         )?;
-        assert_eq!(hits.len(), 1, "should be included when range covers conversation started_at");
+        assert_eq!(
+            hits.len(),
+            1,
+            "should be included when range covers conversation started_at"
+        );
 
         // Date-range filter: should exclude when range misses started_at
         let hits = client.browse_by_date(
@@ -12628,7 +12630,11 @@ mod tests {
             true,
             FieldMask::FULL,
         )?;
-        assert_eq!(hits.len(), 0, "should be excluded when range misses conversation started_at");
+        assert_eq!(
+            hits.len(),
+            0,
+            "should be excluded when range misses conversation started_at"
+        );
 
         Ok(())
     }

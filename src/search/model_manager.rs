@@ -705,17 +705,18 @@ fn load_semantic_context_inner(
         }
     };
 
-    let embedder = match crate::search::embedder_registry::get_embedder(data_dir, Some(canonical_name)) {
-        Ok(embedder) => embedder,
-        Err(err) => {
-            return SemanticSetup {
-                availability: SemanticAvailability::LoadFailed {
-                    context: format!("model load: {err}"),
-                },
-                context: None,
-            };
-        }
-    };
+    let embedder =
+        match crate::search::embedder_registry::get_embedder(data_dir, Some(canonical_name)) {
+            Ok(embedder) => embedder,
+            Err(err) => {
+                return SemanticSetup {
+                    availability: SemanticAvailability::LoadFailed {
+                        context: format!("model load: {err}"),
+                    },
+                    context: None,
+                };
+            }
+        };
 
     let roles = Some(HashSet::from([ROLE_USER, ROLE_ASSISTANT]));
 

@@ -147,6 +147,24 @@ Extract `with_intra_threads(4)` to a named constant:
 const ONNX_INTRA_THREADS: usize = 4;
 ```
 
+## Change 7: Unit tests for mean_pool_and_normalize
+
+File: `src/search/onnx_embedder.rs`
+
+Add a `#[cfg(test)] mod tests` block covering `mean_pool_and_normalize`:
+- All-ones mask (uniform pooling)
+- Partial mask (some tokens masked out)
+- All-zero mask (edge case — should return zero vector)
+- Normalization check (output should be unit length)
+
+For the full ONNX load/embed path, add an `#[ignore]` integration test gated on a model-dir env var, matching the pattern in `fastembed_embedder.rs`.
+
+## Change 8: Update RuntimeLoadability probe comment
+
+File: `src/search/model_acquisition.rs`, line ~113-116
+
+The `probe_cheap_host()` function hardcodes `cpu_has_avx2 = true` with a comment saying that's safe because "the pure-Rust frankentorch embedder has no ONNX and no AVX requirement." That comment is now wrong since ort is back. Update it to note that AVX2 is required when the onnx-embedder feature is active, and that all target machines have AVX2.
+
 ## Verification
 
 After all changes:

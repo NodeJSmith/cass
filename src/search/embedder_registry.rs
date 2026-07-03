@@ -108,7 +108,9 @@ impl RegisteredEmbedder {
 
         #[cfg(feature = "onnx-embedder")]
         if self.name == "jina" {
-            return Some(crate::search::onnx_embedder::JinaEmbedder::model_dir(data_dir));
+            return Some(crate::search::onnx_embedder::JinaEmbedder::model_dir(
+                data_dir,
+            ));
         }
 
         FastEmbedder::model_dir_for(data_dir, self.name)
