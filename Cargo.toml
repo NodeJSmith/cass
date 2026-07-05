@@ -121,10 +121,6 @@ hkdf = "0.12"  # Must match hmac 0.12 / sha2 0.10 / aes-gcm 0.10 digest family; 
 zeroize = { version = "1.8.2", features = ["derive"] }
 flate2 = "1.1.9"
 rand = "0.10"
-
-# QR code generation (optional, for recovery secret QR codes)
-qrcode = { version = "0.14.1", optional = true }
-image = { version = "0.25.10", optional = true, default-features = false, features = ["png"] }
 unicode-width = "0.2.2"
 
 # macOS keychain access (optional, for ChatGPT decryption)
@@ -138,8 +134,7 @@ security-framework = "3.7.0"
 openssl = { version = "0.10.79", features = ["vendored"] }
 
 [features]
-default = ["qr", "encryption", "semantic", "onnx-embedder"]
-qr = ["dep:qrcode", "dep:image"]
+default = ["encryption", "semantic", "onnx-embedder"]
 encryption = []  # Enables HTML export encryption (deps already included for ChatGPT)
 backtrace = []
 # `semantic` enables embedding/reranking via the pure-Rust `frankensearch/native`
@@ -148,7 +143,7 @@ backtrace = []
 # removed the prebuilt Microsoft ONNX Runtime (fastembed) entirely, which
 # dissolves the AVX2 static-init crash (cass#256) — every binary now runs on
 # any CPU, so there is no longer a separate `-baseline` artifact. Disabling
-# `semantic` (e.g. `--no-default-features --features qr,encryption`) builds a
+# `semantic` (e.g. `--no-default-features --features encryption`) builds a
 # lexical-only binary; semantic search modes then return a clear error while
 # lexical search and all other functionality remain fully available.
 semantic = ["frankensearch/native"]
@@ -183,11 +178,6 @@ fsqlite-types = { version = "=0.1.11", package = "fsqlite-types" }
 [[bin]]
 name = "cass"
 path = "src/main.rs"
-test = false
-
-[[bin]]
-name = "cass-pages-perf-bundle"
-path = "src/bin/cass-pages-perf-bundle.rs"
 test = false
 
 [profile.dev]
@@ -315,7 +305,3 @@ path = "tests/docs/mod.rs"
 [[test]]
 name = "upgrade"
 path = "tests/upgrade/mod.rs"
-
-[[test]]
-name = "recovery"
-path = "tests/recovery/mod.rs"
