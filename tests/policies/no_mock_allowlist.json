@@ -22,6 +22,16 @@
       "cfg_test_only": true,
       "permanent": true,
       "note": "Creates test ResourceInfo struct for unit testing check_resources() and can_compile(). Complemented by real resource probe tests."
+    },
+    {
+      "path": "tests/cli_flag_precedence.rs",
+      "pattern": "fake_home",
+      "rationale": "Test function name describing isolated HOME directory fixture — not a mock object",
+      "owner": "cli-team",
+      "review_date": "2026-12-27",
+      "cfg_test_only": true,
+      "permanent": true,
+      "note": "False positive: function name contains 'fake' but creates a real temp directory as HOME"
     }
   ],
   "excluded_paths": [
