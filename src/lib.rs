@@ -5,13 +5,11 @@ pub mod bakeoff;
 pub mod bookmarks;
 pub mod connector_ingest_diagnostics;
 pub mod connectors;
-pub mod context_pack;
 pub mod conversation_view;
 pub mod crash_replay;
 #[cfg(unix)]
 pub mod daemon;
 pub mod daemon_runtime_state;
-pub mod dependency_drift;
 pub mod dependency_pin_correlation;
 pub mod doctor;
 pub(crate) mod doctor_chokepoint;
@@ -30,7 +28,6 @@ pub mod fleet_platform_compat;
 pub mod fleet_probe;
 pub mod fleet_upgrade_rehearsal;
 pub mod fleet_version_skew;
-pub mod guide_planner;
 pub mod html_export;
 pub mod incident_discovery;
 pub mod indexer;
@@ -41,15 +38,12 @@ pub mod model;
 pub mod pages;
 pub mod perf_evidence;
 pub mod policy_registry;
-pub mod privacy_exposure;
 pub mod proof_artifact;
 pub mod query_cost_planner;
 pub mod raw_mirror;
 pub(crate) mod recipes_robot_docs;
 pub(crate) mod recovery_support_bundle;
 pub mod release_verify;
-pub mod repro_capsule;
-pub mod resource_plan;
 pub mod robot_budget_envelope;
 pub mod root_cause_projection;
 pub mod root_cause_taxonomy;
@@ -65,8 +59,6 @@ pub mod time_parser;
 pub mod top_session_summary;
 pub mod topology_budget;
 pub mod update_check;
-pub mod workflow_analytics;
-pub mod workflow_macros;
 
 use anyhow::Result;
 use base64::prelude::*;
@@ -775,28 +767,6 @@ pub enum Commands {
     /// CASS found, what it will index, what is missing, and the single safest
     /// next command. Scriptable via `--json`; never launches a bare TUI.
     Onboarding {
-        /// Override data dir
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
-        /// Output as JSON (for automation)
-        #[arg(long, visible_alias = "robot")]
-        json: bool,
-    },
-    /// Intent-to-command planner for guided safe workflows. Read-only: maps an
-    /// operator intent (fix-ci, investigate-search-miss, prepare-release,
-    /// repair-assets, export-session, onboard-source, support-capsule) to an
-    /// exact safe command plan — steps, prerequisites, proof gates, forbidden
-    /// shortcuts, rch target-dir hints, cost/risk, privacy notes, and stop
-    /// conditions. Never mutates and never launches a bare TUI. Omit the intent
-    /// to list the known intents.
-    Guide {
-        /// Operator intent to plan (omit to list the known intents). Multiple
-        /// words are joined, e.g. `cass guide rebuild index`.
-        intent: Vec<String>,
-        /// Deterministic preflight-facts source: a JSON file shaped like
-        /// `{ "facts": { "<fact>": true, ... }, "intent"?: "<intent>" }`.
-        #[arg(long)]
-        fixture: Option<PathBuf>,
         /// Override data dir
         #[arg(long)]
         data_dir: Option<PathBuf>,
@@ -2597,7 +2567,6 @@ fn command_accepts_leading_structured_flag(command: &str) -> bool {
             | "expand"
             | "export-html"
             | "fleet"
-            | "guide"
             | "health"
             | "import"
             | "index"
@@ -2629,7 +2598,7 @@ fn data_dir_insertion_index(rest: &[String], command_index: usize) -> Option<usi
     let command = rest.get(command_index)?.to_ascii_lowercase();
     match command.as_str() {
         "tui" | "index" | "search" | "pack" | "stats" | "diag" | "storage" | "dedup" | "status"
-        | "triage" | "support-bundle" | "state" | "health" | "onboarding" | "guide" | "doctor"
+        | "triage" | "support-bundle" | "state" | "health" | "onboarding" | "doctor"
         | "context" | "sessions" | "timeline" | "daemon" => Some(command_index + 1),
         "mirror" => rest
             .get(command_index + 1)
@@ -2800,7 +2769,7 @@ mod robot_docs_shorthand_regression_tests {
 
     #[test]
     fn other_real_subcommands_are_not_rewritten() {
-        for sub in &["diag", "sources", "analytics", "health", "Doctor", "guide"] {
+        for sub in &["diag", "sources", "analytics", "health", "Doctor"] {
             let mut rest = vec![sub.to_string(), "--json".to_string()];
             let mut corrections = Vec::new();
             recover_robot_docs_topic_shorthands(&mut rest, &mut corrections);
@@ -2818,14 +2787,12 @@ mod robot_docs_shorthand_regression_tests {
 
     #[test]
     fn topic_shorthand_still_fires_for_non_subcommands() {
-        // Note: `guide` is intentionally absent — it is now a real top-level
-        // subcommand (`cass guide <intent>`), so the shorthand must NOT fire for
-        // it (covered by `other_real_subcommands_are_not_rewritten`).
         for (alias, expected_topic) in &[
             ("schemas", "schemas"),
             ("exit-codes", "exit-codes"),
             ("examples", "examples"),
             ("env", "env"),
+            ("guide", "guide"),
         ] {
             let mut rest = vec![alias.to_string(), "--json".to_string()];
             let mut corrections = Vec::new();
@@ -5481,7 +5448,6 @@ const CANONICAL_TOP_LEVEL_COMMANDS: &[&str] = &[
     "triage",
     "support-bundle",
     "onboarding",
-    "guide",
     "introspect",
     "api-version",
     "release-verify",
@@ -6994,21 +6960,6 @@ async fn execute_cli(
                 Commands::Onboarding { data_dir, json } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
                     run_onboarding(&data_dir, cli.db.clone(), structured_format)?;
-                }
-                Commands::Guide {
-                    intent,
-                    fixture,
-                    data_dir,
-                    json,
-                } => {
-                    let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_guide(
-                        &intent,
-                        fixture.as_deref(),
-                        &data_dir,
-                        cli.db.clone(),
-                        structured_format,
-                    )?;
                 }
                 Commands::Doctor {
                     data_dir,
@@ -11767,7 +11718,6 @@ fn describe_command(cli: &Cli) -> String {
         Some(Commands::RobotDocs { topic }) => format!("robot-docs:{topic:?}"),
         Some(Commands::Health { .. }) => "health".to_string(),
         Some(Commands::Onboarding { .. }) => "onboarding".to_string(),
-        Some(Commands::Guide { .. }) => "guide".to_string(),
         Some(Commands::Doctor { .. }) => "doctor".to_string(),
         Some(Commands::Context { .. }) => "context".to_string(),
         Some(Commands::Sessions { .. }) => "sessions".to_string(),
@@ -12032,7 +11982,6 @@ fn is_robot_mode(command: &Commands, cli: &Cli) -> bool {
         Commands::Onboarding { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
         }
-        Commands::Guide { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Pages { json, .. } => resolve_subcommand_structured_format(cli, *json).is_some(),
         Commands::Sessions { json, .. } => {
             resolve_subcommand_structured_format(cli, *json).is_some()
@@ -58331,192 +58280,6 @@ fn run_onboarding(
 
     print_onboarding_human(&report, &observation);
     Ok(())
-}
-
-/// `cass guide [INTENT]` — read-only intent-to-command planner (bead
-/// `…5u82n.1`). Resolves an operator intent to a safe advisory command plan via
-/// the workflow macro registry, classifies live preflight readiness, and emits
-/// the plan (`--json` for agents, otherwise a human summary). Mutation-free.
-///
-/// Live mode derives the determinable preflight facts (db present, lexical index
-/// present, search assets ready) from a single `state_meta_json` snapshot; facts
-/// it cannot determine are left for the operator to confirm. `--fixture <file>`
-/// supplies `{ "facts": {…}, "intent"?: "…" }` for deterministic scenarios.
-fn run_guide(
-    intent_words: &[String],
-    fixture: Option<&Path>,
-    data_dir_override: &Option<PathBuf>,
-    db_override: Option<PathBuf>,
-    output_format: Option<RobotFormat>,
-) -> CliResult<()> {
-    let mut intent = intent_words.join(" ");
-
-    // Fixture mode: facts (and optionally a default intent) from a checked-in file.
-    let (facts, source_kind, fixture_id): (Option<serde_json::Value>, &str, String) = if let Some(
-        path,
-    ) = fixture
-    {
-        let raw = std::fs::read_to_string(path).map_err(|err| CliError {
-                code: 10,
-                kind: CliErrorKind::Config.kind_str(),
-                message: format!("could not read guide fixture {}: {err}", path.display()),
-                hint: Some(
-                    "Pass --fixture <file> with a JSON object like {\"facts\": {\"db_present\": true}}."
-                        .to_string(),
-                ),
-                retryable: false,
-            })?;
-        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|err| CliError {
-            code: 10,
-            kind: CliErrorKind::Config.kind_str(),
-            message: format!("invalid guide fixture {}: {err}", path.display()),
-            hint: Some("The fixture must be a JSON object with a `facts` map.".to_string()),
-            retryable: false,
-        })?;
-        if intent.trim().is_empty()
-            && let Some(fixture_intent) = parsed.get("intent").and_then(serde_json::Value::as_str)
-        {
-            intent = fixture_intent.to_string();
-        }
-        let facts = parsed.get("facts").cloned();
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("fixture")
-            .to_string();
-        (facts, "fixture", id)
-    } else {
-        // Live mode: derive the determinable facts from one state snapshot.
-        let data_dir = data_dir_override.clone().unwrap_or_else(default_data_dir);
-        let db_path = db_override.unwrap_or_else(|| data_dir.join("agent_search.db"));
-        let state = state_meta_json(&data_dir, &db_path, 300, true);
-        let db_present = state
-            .pointer("/database/exists")
-            .and_then(serde_json::Value::as_bool);
-        let index_present = state
-            .pointer("/index/exists")
-            .and_then(serde_json::Value::as_bool);
-        let rebuild_active = state
-            .pointer("/rebuild/active")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let search_assets_ready = match (index_present, db_present) {
-            (Some(idx), Some(db)) => Some(idx && db && !rebuild_active),
-            _ => None,
-        };
-        let facts = crate::guide_planner::preflight_facts(
-            index_present,
-            db_present,
-            search_assets_ready,
-            None,
-            None,
-        );
-        (Some(facts), "live", "live".to_string())
-    };
-
-    let payload =
-        crate::guide_planner::render_guide_plan(&intent, facts.as_ref(), source_kind, &fixture_id);
-
-    if let Some(format) = output_format {
-        return output_structured_value(payload, format);
-    }
-
-    print_guide_human(&payload);
-    Ok(())
-}
-
-/// Human-readable guide summary (never a bare TUI). The richer interactive
-/// shell is a later dependent surface; this stays terse and copy-safe.
-fn print_guide_human(payload: &serde_json::Value) {
-    use colored::Colorize;
-    let intent = payload
-        .pointer("/intent/raw")
-        .and_then(serde_json::Value::as_str);
-    match intent {
-        None => {
-            // Catalog mode.
-            println!("{}", "CASS guide — known intents".bold());
-            if let Some(intents) = payload
-                .get("known_intents")
-                .and_then(serde_json::Value::as_array)
-            {
-                for entry in intents {
-                    let name = entry
-                        .get("intent")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let summary = entry
-                        .get("summary")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    println!("  - {} — {summary}", name.cyan());
-                }
-            }
-            println!();
-            println!("  Plan one: cass guide <intent> --json");
-        }
-        Some(raw) => {
-            let recognized = payload
-                .pointer("/intent/recognized")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if !recognized {
-                println!("{} {}", "Unknown intent:".bold(), raw);
-                println!("  Try one of the known intents:");
-                if let Some(intents) = payload
-                    .get("known_intents")
-                    .and_then(serde_json::Value::as_array)
-                {
-                    for entry in intents {
-                        if let Some(name) = entry.get("intent").and_then(serde_json::Value::as_str)
-                        {
-                            println!("    - {}", name.cyan());
-                        }
-                    }
-                }
-                println!("  Docs: cass robot-docs guide");
-                return;
-            }
-            let title = payload
-                .pointer("/plan/title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let readiness = payload
-                .get("readiness")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            println!("{} {}", "Guide:".bold(), title);
-            println!("  Intent: {raw}  |  Readiness: {readiness}");
-            if let Some(steps) = payload
-                .pointer("/plan/steps")
-                .and_then(serde_json::Value::as_array)
-            {
-                println!("  Steps:");
-                for step in steps {
-                    let order = step
-                        .get("order")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    let intent = step
-                        .get("intent")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    let gate = step
-                        .get("proof_gate")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("");
-                    println!("    {order}. {intent}  (proof: {gate})");
-                }
-            }
-            if let Some(action) = payload
-                .get("recommended_action")
-                .and_then(serde_json::Value::as_str)
-            {
-                println!("  Next: {action}");
-            }
-            println!("  (advisory only — nothing is executed; pass --json for the full plan)");
-        }
-    }
 }
 
 fn diagnostics_connector_paths(
