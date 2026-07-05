@@ -15,6 +15,20 @@
 #   CARGO_GUARD_NO_SCOPE=1   bypass systemd scope (CI, non-systemd hosts)
 set -uo pipefail
 
+# Block test execution — cargo test crashes WSL2 due to page cache exhaustion
+# from 74GB of test binaries + mmap'd Tantivy indexes + SQLite WAL files.
+# Use CI for test verification. Remove this block once the test suite is trimmed.
+for arg in "$@"; do
+    if [[ "$arg" == "test" ]]; then
+        echo "ERROR: cargo test is disabled locally — it crashes WSL2." >&2
+        echo "Use CI for test verification, or run specific tests with:" >&2
+        echo "  cargo-guarded check   (compilation only, safe)" >&2
+        echo "  Set CARGO_GUARD_ALLOW_TEST=1 to override." >&2
+        [[ -n "${CARGO_GUARD_ALLOW_TEST:-}" ]] && break
+        exit 1
+    fi
+done
+
 LOCK="${XDG_RUNTIME_DIR:-$HOME/.cache}/cargo-build.lock"
 LOCK_TIMEOUT=600  # 10 minutes
 
