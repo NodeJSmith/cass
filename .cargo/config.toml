@@ -2,8 +2,9 @@
 # https://doc.rust-lang.org/cargo/reference/config.html
 
 [build]
-# Cap parallelism to avoid OOM-crashing WSL (24 GB RAM, 12 cores).
-# Each rustc + linker can use 1-2 GB; uncapped builds crashed WSL 2026-07-04.
+# Cap build parallelism (24 GB RAM, 12 cores).
+# Test parallelism is the bigger WSL crash risk — capped separately in
+# .config/nextest.toml (nextest) and bin/cargo-guarded (cargo test).
 jobs = 4
 
 [env]

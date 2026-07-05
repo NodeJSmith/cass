@@ -1174,7 +1174,7 @@ mod tests {
     fn test_config_defaults() {
         let config = TwoTierConfig::default();
         assert_eq!(config.fast_dimension, 256);
-        assert_eq!(config.quality_dimension, 384);
+        assert_eq!(config.quality_dimension, 512);
         assert!((config.quality_weight - 0.7).abs() < 0.001);
         assert_eq!(config.max_refinement_docs, 100);
         assert!(!config.fast_only);

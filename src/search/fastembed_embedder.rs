@@ -1,4 +1,4 @@
-//! Pure-Rust ML embedder.
+//! Pure-Rust ML embedder — the frankentorch-native backend.
 //!
 //! Loads a local safetensors model + tokenizer bundle and produces semantic
 //! embeddings via frankensearch's [`NativeEmbedder`](frankensearch::NativeEmbedder)
@@ -7,13 +7,20 @@
 //! it expects the model files to be present on disk and returns a clear error
 //! when they are missing.
 //!
+//! This is *not* the only embedding path: the `jina` embedder uses a separate
+//! ONNX backend (see `onnx_embedder.rs`, gated behind the `onnx-embedder`
+//! feature). This module covers the native frankentorch family only
+//! (`minilm`, `snowflake-arctic-s`, `nomic-embed`).
+//!
 //! The type is still named `FastEmbedder` for call-site stability (the registry,
-//! model management, and vector-index naming reference it), but the FastEmbed /
-//! ONNX backend was removed in cass #308: `ort 2.0.0-rc.12` could not run the
-//! `all-MiniLM-L6-v2` `LayerNormalization` export, and its prebuilt AVX/AVX2
-//! vendor binaries crashed pre-AVX2 CPUs at static init (#256/#307). The
-//! pure-Rust backend has neither problem — no AVX-static-init hazard, so a single
-//! binary runs everywhere (the `-baseline` artifact is no longer needed).
+//! model management, and vector-index naming reference it), but the original
+//! FastEmbed / ONNX backend it replaced was removed in cass #308: `ort
+//! 2.0.0-rc.12` could not run the `all-MiniLM-L6-v2` `LayerNormalization`
+//! export, and its prebuilt AVX/AVX2 vendor binaries crashed pre-AVX2 CPUs at
+//! static init (#256/#307). The pure-Rust backend has neither problem — no
+//! AVX-static-init hazard, so a single binary runs everywhere (the `-baseline`
+//! artifact is no longer needed) for the models it covers. ONNX later came
+//! back for the `jina` embedder specifically, via `onnx_embedder.rs`.
 //!
 //! Only the 384-dim `all-MiniLM-L6-v2` family is supported by the native backend
 //! today (the `snowflake-arctic-s` MiniLM variant shares its architecture; the
@@ -124,7 +131,6 @@ impl FastEmbedder {
             "minilm" => MINILM_DIR_NAME,
             "snowflake-arctic-s" => "snowflake-arctic-embed-s",
             "nomic-embed" => "nomic-embed-text-v1.5",
-            "jina" => "jina-embeddings-v2-small-en",
             _ => return None,
         };
         Some(data_dir.join("models").join(dir_name))
@@ -149,9 +155,6 @@ impl FastEmbedder {
             "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
                 Some("nomic-embed")
             }
-            "jina" | "jina-v2-small" | "jina-v2-small-512" | "jina-embeddings-v2-small-en" => {
-                Some("jina")
-            }
             _ => None,
         }
     }
@@ -175,12 +178,6 @@ impl FastEmbedder {
                 embedder_id: "nomic-embed-768".to_string(),
                 model_id: "nomic-embed-text-v1.5".to_string(),
                 dimension: 768,
-                pooling: Pooling::Mean,
-            }),
-            "jina" => Some(OnnxEmbedderConfig {
-                embedder_id: "jina-v2-small-512".to_string(),
-                model_id: "jina-embeddings-v2-small-en".to_string(),
-                dimension: 512,
                 pooling: Pooling::Mean,
             }),
             _ => None,

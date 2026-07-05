@@ -17,7 +17,10 @@
 //!
 //! | Name | ID | Dimension | Type | Notes |
 //! |------|-----|-----------|------|-------|
-//! | minilm | minilm-384 | 384 | ML | Default semantic embedder |
+//! | jina | jina-v2-small-512 | 512 | ONNX | Default semantic embedder; 8K token context, code-aware |
+//! | minilm | minilm-384 | 384 | ML (native) | Baseline, pure-Rust frankentorch backend |
+//! | snowflake-arctic-s | snowflake-arctic-s-384 | 384 | ML (native) | MiniLM-compatible dimension |
+//! | nomic-embed | nomic-embed-768 | 768 | ML (native) | Long context, Matryoshka support |
 //! | hash | fnv1a-384 | 384 | Hash | Always available fallback |
 //!
 //! # Example
@@ -74,6 +77,10 @@ pub struct RegisteredEmbedder {
     pub size_bytes: u64,
     /// Whether this is a baseline model (not eligible for bake-off).
     pub is_baseline: bool,
+    /// On-disk directory name under `<data_dir>/models/`.
+    pub dir_name: &'static str,
+    /// CLI/config aliases that resolve to this embedder (lowercase).
+    pub aliases: &'static [&'static str],
 }
 
 /// Files required for the pure-Rust (frankentorch) embedder: a safetensors
@@ -105,15 +112,13 @@ impl RegisteredEmbedder {
         if !self.requires_model_files {
             return None;
         }
+        Some(data_dir.join("models").join(self.dir_name))
+    }
 
-        #[cfg(feature = "onnx-embedder")]
-        if self.name == "jina" {
-            return Some(crate::search::onnx_embedder::JinaEmbedder::model_dir(
-                data_dir,
-            ));
-        }
-
-        FastEmbedder::model_dir_for(data_dir, self.name)
+    /// Resolve the runtime model directory, honoring the
+    /// `FRANKENSEARCH_MODEL_DIR` env override.
+    pub fn runtime_model_dir(&self, data_dir: &Path) -> Option<PathBuf> {
+        super::fastembed_embedder::model_dir_override().or_else(|| self.model_dir(data_dir))
     }
 
     /// Get required model files for this embedder.
@@ -189,6 +194,8 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         huggingface_id: "jinaai/jina-embeddings-v2-small-en",
         size_bytes: 73_000_000,
         is_baseline: false,
+        dir_name: "jina-embeddings-v2-small-en",
+        aliases: &["jina-v2-small", "jina-v2-small-512", "jina-embeddings-v2-small-en"],
     },
     // === Native frankentorch embedders ===
     RegisteredEmbedder {
@@ -202,6 +209,8 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         huggingface_id: "sentence-transformers/all-MiniLM-L6-v2",
         size_bytes: 90_000_000,
         is_baseline: true,
+        dir_name: "all-MiniLM-L6-v2",
+        aliases: &["fastembed", "all-minilm-l6-v2", "minilm-384"],
     },
     RegisteredEmbedder {
         name: "snowflake-arctic-s",
@@ -214,6 +223,8 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         huggingface_id: "Snowflake/snowflake-arctic-embed-s",
         size_bytes: 130_000_000,
         is_baseline: false,
+        dir_name: "snowflake-arctic-embed-s",
+        aliases: &["snowflake", "snowflake-arctic-embed-s", "snowflake-arctic-s-384"],
     },
     RegisteredEmbedder {
         name: "nomic-embed",
@@ -226,6 +237,8 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         huggingface_id: "nomic-ai/nomic-embed-text-v1.5",
         size_bytes: 280_000_000,
         is_baseline: false,
+        dir_name: "nomic-embed-text-v1.5",
+        aliases: &["nomic", "nomic-embed-text-v1.5", "nomic-embed-768"],
     },
     // === Fallback (always available) ===
     RegisteredEmbedder {
@@ -239,8 +252,20 @@ pub static EMBEDDERS: &[RegisteredEmbedder] = &[
         huggingface_id: "",
         size_bytes: 0,
         is_baseline: true,
+        dir_name: "",
+        aliases: &[],
     },
 ];
+
+/// Look up a registered embedder by name, id, or alias (case-insensitive).
+pub fn resolve_embedder(name: &str) -> Option<&'static RegisteredEmbedder> {
+    let lower = name.trim().to_ascii_lowercase();
+    EMBEDDERS.iter().find(|e| {
+        e.name == lower
+            || e.id == lower
+            || e.aliases.iter().any(|a| *a == lower)
+    })
+}
 
 /// Embedder registry with data directory context.
 pub struct EmbedderRegistry {
@@ -268,16 +293,9 @@ impl EmbedderRegistry {
             .collect()
     }
 
-    /// Get embedder info by name.
+    /// Get embedder info by name, id, or alias.
     pub fn get(&self, name: &str) -> Option<&'static RegisteredEmbedder> {
-        let name_lower = FastEmbedder::canonical_name(name)
-            .unwrap_or_else(|| name.trim())
-            .to_ascii_lowercase();
-        EMBEDDERS.iter().find(|e| {
-            e.name == name_lower
-                || e.id == name_lower
-                || e.id.starts_with(&format!("{}-", name_lower))
-        })
+        resolve_embedder(name)
     }
 
     /// Check if an embedder is available by name.
@@ -345,7 +363,7 @@ impl EmbedderRegistry {
         })?;
 
         if !embedder.is_available(&self.data_dir) {
-            let model_dir = FastEmbedder::runtime_model_dir_for(&self.data_dir, embedder.name);
+            let model_dir = embedder.runtime_model_dir(&self.data_dir);
             let missing = model_dir
                 .as_ref()
                 .map(|dir| {

@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# safe-test — run cargo tests with resource monitoring and automatic kill.
+#
+# Runs tests in the background, polls system memory/swap every few seconds,
+# and kills the test process if resource usage crosses safety thresholds
+# before WSL can crash.
+#
+# Usage:
+#   bin/safe-test                    # full suite, 4 threads
+#   bin/safe-test --threads 2        # override thread count
+#   bin/safe-test --ramp             # incremental ramp: 1 → 2 → 4 threads
+#   bin/safe-test -- --exact foo     # pass extra args to cargo test
+#
+# Env knobs:
+#   SAFE_TEST_MEM_PCT    kill threshold as % of total RAM  (default 85)
+#   SAFE_TEST_SWAP_PCT   kill threshold as % of total swap (default 50)
+#   SAFE_TEST_POLL_SEC   polling interval in seconds       (default 3)
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+MEM_THRESHOLD=${SAFE_TEST_MEM_PCT:-85}
+SWAP_THRESHOLD=${SAFE_TEST_SWAP_PCT:-50}
+POLL_INTERVAL=${SAFE_TEST_POLL_SEC:-3}
+THREADS=4
+RAMP=0
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --threads) THREADS="$2"; shift 2 ;;
+        --ramp)    RAMP=1; shift ;;
+        --help|-h)
+            sed -n '2,/^[^#]/{ /^#/s/^# \?//p }' "$0"
+            exit 0
+            ;;
+        --)        shift; EXTRA_ARGS=("$@"); break ;;
+        *)         EXTRA_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# --- resource reading ---
+
+read_mem_pct() {
+    awk '/^MemTotal:/ {total=$2} /^MemAvailable:/ {avail=$2} END {printf "%.0f", (total-avail)*100/total}' /proc/meminfo
+}
+
+read_swap_pct() {
+    awk '/^SwapTotal:/ {total=$2} /^SwapFree:/ {free=$2} END {if(total>0) printf "%.0f", (total-free)*100/total; else print 0}' /proc/meminfo
+}
+
+fmt_mem() {
+    awk '/^MemTotal:/ {total=$2} /^MemAvailable:/ {avail=$2} END {printf "%.1fG / %.1fG", (total-avail)/1048576, total/1048576}' /proc/meminfo
+}
+
+fmt_swap() {
+    awk '/^SwapTotal:/ {total=$2} /^SwapFree:/ {free=$2} END {printf "%.1fG / %.1fG", (total-free)/1048576, total/1048576}' /proc/meminfo
+}
+
+# --- monitored test run ---
+
+run_monitored() {
+    local threads=$1
+    shift
+    local label="threads=$threads"
+
+    echo "▸ Running tests ($label)..."
+    echo "  Thresholds: mem ${MEM_THRESHOLD}%, swap ${SWAP_THRESHOLD}% — polling every ${POLL_INTERVAL}s"
+
+    local mem_before
+    mem_before=$(read_mem_pct)
+    echo "  Memory before: $(fmt_mem) (${mem_before}%)"
+
+    # Run cargo-guarded test in background with explicit thread count.
+    # Extra args are test-binary flags (--exact, -q, etc.) so they go after --.
+    local cmd=("$SCRIPT_DIR/cargo-guarded" test)
+    if [[ ${#} -gt 0 ]]; then
+        cmd+=("--" "$@")
+    fi
+    CARGO_GUARD_TEST_THREADS="$threads" "${cmd[@]}" 2>&1 &
+    local test_pid=$!
+
+    # Monitor loop
+    local killed=0
+    while kill -0 "$test_pid" 2>/dev/null; do
+        sleep "$POLL_INTERVAL"
+
+        local mem_pct swap_pct
+        mem_pct=$(read_mem_pct)
+        swap_pct=$(read_swap_pct)
+
+        printf "  [monitor] mem: %s%% (%s)  swap: %s%% (%s)\r" \
+            "$mem_pct" "$(fmt_mem)" "$swap_pct" "$(fmt_swap)"
+
+        if (( mem_pct >= MEM_THRESHOLD )); then
+            echo ""
+            echo "  ⚠ Memory at ${mem_pct}% (threshold: ${MEM_THRESHOLD}%) — killing tests"
+            kill -- -"$test_pid" 2>/dev/null || kill "$test_pid" 2>/dev/null
+            killed=1
+            break
+        fi
+
+        if (( swap_pct >= SWAP_THRESHOLD )); then
+            echo ""
+            echo "  ⚠ Swap at ${swap_pct}% (threshold: ${SWAP_THRESHOLD}%) — killing tests"
+            kill -- -"$test_pid" 2>/dev/null || kill "$test_pid" 2>/dev/null
+            killed=1
+            break
+        fi
+    done
+
+    wait "$test_pid" 2>/dev/null
+    local exit_code=$?
+    echo ""
+
+    local mem_after
+    mem_after=$(read_mem_pct)
+    echo "  Memory after: $(fmt_mem) (${mem_after}%)"
+
+    if (( killed )); then
+        echo "  ✗ Killed ($label) — resource threshold exceeded"
+        return 1
+    elif (( exit_code == 0 )); then
+        echo "  ✓ Passed ($label)"
+        return 0
+    else
+        echo "  ✗ Failed ($label) — exit code $exit_code"
+        return "$exit_code"
+    fi
+}
+
+# --- main ---
+
+cd "$PROJECT_ROOT"
+
+if (( RAMP )); then
+    echo "Ramping up: 1 → 2 → $THREADS threads"
+    echo ""
+
+    for t in 1 2 "$THREADS"; do
+        if ! run_monitored "$t" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; then
+            echo ""
+            echo "Ramp stopped at threads=$t"
+            exit 1
+        fi
+        echo ""
+        if (( t < THREADS )); then
+            echo "Ramp stage passed. Continuing..."
+        fi
+    done
+
+    echo "All ramp stages passed at threads=$THREADS"
+else
+    run_monitored "$THREADS" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
+fi

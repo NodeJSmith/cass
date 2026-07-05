@@ -1003,10 +1003,10 @@ mod tests {
         let p = SemanticPolicy::compiled_defaults();
         assert_eq!(p.mode, SemanticMode::HybridPreferred);
         assert_eq!(p.fast_tier_embedder, "hash");
-        assert_eq!(p.quality_tier_embedder, "minilm");
+        assert_eq!(p.quality_tier_embedder, "jina");
         assert_eq!(p.download_policy, ModelDownloadPolicy::OptIn);
         assert_eq!(p.fast_dimension, 256);
-        assert_eq!(p.quality_dimension, 384);
+        assert_eq!(p.quality_dimension, 512);
         assert!((p.quality_weight - 0.7).abs() < f32::EPSILON);
         assert_eq!(p.max_refinement_docs, 100);
         assert_eq!(p.semantic_budget_mb, 500);
@@ -1031,7 +1031,7 @@ mod tests {
         assert_eq!(p.max_backfill_threads, 4);
         // Unset fields remain default.
         assert_eq!(p.fast_tier_embedder, "hash");
-        assert_eq!(p.quality_dimension, 384);
+        assert_eq!(p.quality_dimension, 512);
     }
 
     #[test]
@@ -1408,7 +1408,7 @@ mod tests {
         let report = SemanticCapabilityReport::from_policy(&policy, cap, 0);
 
         assert_eq!(report.capability, SemanticCapability::FastTierOnly);
-        assert_eq!(report.quality_tier_embedder, "minilm");
+        assert_eq!(report.quality_tier_embedder, "jina");
         assert_eq!(report.download_policy, ModelDownloadPolicy::OptIn);
     }
 

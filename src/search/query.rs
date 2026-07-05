@@ -4599,9 +4599,8 @@ impl SearchClient {
             return Ok(Arc::new(embedder));
         }
 
-        if let Some(embedder_name) =
-            crate::search::fastembed_embedder::FastEmbedder::canonical_name(embedder_id)
-        {
+        if let Some(entry) = crate::search::embedder_registry::resolve_embedder(embedder_id) {
+            let embedder_name = entry.name;
             let data_dir = self
                 .sqlite_path
                 .as_ref()
@@ -12100,7 +12099,8 @@ mod tests {
                 source_id TEXT,
                 origin_host TEXT,
                 title TEXT,
-                source_path TEXT
+                source_path TEXT,
+                started_at INTEGER
              );
              CREATE TABLE messages (
                 id INTEGER PRIMARY KEY,

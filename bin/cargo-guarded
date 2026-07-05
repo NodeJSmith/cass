@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# cargo-guarded — serialize and resource-cap CPU-intensive cargo commands.
+#
+# Two protections:
+#   1. flock serialization — prevents concurrent compilations across subagents
+#   2. systemd user scope — cgroup caps prevent a single build from OOM-crashing WSL
+#
+# Non-compilation commands (metadata, fmt, add, etc.) bypass both.
+#
+# Env knobs:
+#   CARGO_GUARD_MEM_MAX    hard RAM ceiling for the scope   (default 8G)
+#   CARGO_GUARD_MEM_HIGH   soft RAM throttle                (default 6G)
+#   CARGO_GUARD_SWAP_MAX   swap ceiling for the scope       (default 1G)
+#   CARGO_GUARD_TEST_THREADS  test parallelism cap for `cargo test`  (default 4)
+#   CARGO_GUARD_NO_SCOPE=1   bypass systemd scope (CI, non-systemd hosts)
+set -uo pipefail
+
+LOCK="${XDG_RUNTIME_DIR:-$HOME/.cache}/cargo-build.lock"
+LOCK_TIMEOUT=600  # 10 minutes
+
+is_compile_cmd=0
+for arg in "$@"; do
+    case "$arg" in
+        build|test|check|clippy|bench|run)
+            is_compile_cmd=1
+            break
+            ;;
+    esac
+done
+
+if (( ! is_compile_cmd )); then
+    exec cargo "$@"
+fi
+
+scope_available() {
+    [[ -z "${CARGO_GUARD_NO_SCOPE:-}" ]] || return 1
+    command -v systemd-run >/dev/null 2>&1 || return 1
+    systemctl --user is-system-running >/dev/null 2>&1 || return 1
+}
+
+# For `cargo test`, inject --test-threads cap unless the caller already set it.
+# nextest uses .config/nextest.toml; this covers plain `cargo test`.
+TEST_THREADS="${CARGO_GUARD_TEST_THREADS:-4}"
+is_test_cmd=0
+has_test_threads=0
+has_separator=0
+for arg in "$@"; do
+    [[ "$arg" == "test" ]] && is_test_cmd=1
+    [[ "$arg" == --test-threads* ]] && has_test_threads=1
+    [[ "$arg" == "--" ]] && has_separator=1
+done
+
+args=("$@")
+if (( is_test_cmd && ! has_test_threads )); then
+    if (( has_separator )); then
+        args+=("--test-threads=$TEST_THREADS")
+    else
+        args+=("--" "--test-threads=$TEST_THREADS")
+    fi
+fi
+
+if ! scope_available; then
+    exec flock -w "$LOCK_TIMEOUT" "$LOCK" cargo "${args[@]}"
+fi
+
+unit="cargo-$$-$(date +%H%M%S)"
+caps=(
+    -p "MemoryMax=${CARGO_GUARD_MEM_MAX:-8G}"
+    -p "MemoryHigh=${CARGO_GUARD_MEM_HIGH:-6G}"
+    -p "MemorySwapMax=${CARGO_GUARD_SWAP_MAX:-1G}"
+)
+
+exec flock -w "$LOCK_TIMEOUT" "$LOCK" \
+    systemd-run --user --scope --collect --unit="$unit" "${caps[@]}" \
+    cargo "${args[@]}"

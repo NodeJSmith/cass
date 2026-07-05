@@ -22627,7 +22627,8 @@ fn run_cli_search(
                 if value.trim().eq_ignore_ascii_case("hash") {
                     Some("hash")
                 } else {
-                    crate::search::fastembed_embedder::FastEmbedder::canonical_name(&value)
+                    crate::search::embedder_registry::resolve_embedder(&value)
+                        .map(|e| e.name)
                 }
             });
         let requested_model = semantic_opts.model.as_deref().or(env_model);
@@ -37290,166 +37291,6 @@ fn collect_doctor_raw_mirror_report(data_dir: &Path, _full: bool) -> DoctorRawMi
     }
 }
 
-fn collect_doctor_raw_mirror_report_with_threshold(
-    data_dir: &Path,
-    size_warn_threshold_bytes: u64,
-    full: bool,
-) -> DoctorRawMirrorReport {
-    let root = doctor_raw_mirror_root(data_dir);
-    let root_path = root.display().to_string();
-    let mut report = DoctorRawMirrorReport {
-        schema_version: DOCTOR_RAW_MIRROR_SCHEMA_VERSION,
-        status: "absent".to_string(),
-        root_path: root_path.clone(),
-        redacted_root_path: doctor_redacted_path(&root_path, data_dir),
-        exists: root.exists(),
-        sensitive_paths_included: false,
-        raw_content_included: false,
-        layout: doctor_raw_mirror_layout_report(),
-        policy: doctor_raw_mirror_policy_report(),
-        summary: DoctorRawMirrorSummary::default(),
-        manifests: Vec::new(),
-        warnings: Vec::new(),
-        notes: vec![
-            "Raw mirror blobs are precious evidence and are never automatic cleanup candidates.".to_string(),
-            "A verified mirror blob remains useful when the upstream provider file has been pruned.".to_string(),
-        ],
-    };
-
-    if !root.exists() {
-        return report;
-    }
-    if std::fs::symlink_metadata(&root)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        report.status = "warn".to_string();
-        report
-            .warnings
-            .push("raw mirror root is a symlink and will not be trusted for repair".to_string());
-        return report;
-    }
-
-    report.summary.interrupted_capture_count = doctor_raw_mirror_count_interrupted_captures(&root);
-    if report.summary.interrupted_capture_count > 0 {
-        report.warnings.push(format!(
-            "{} interrupted raw mirror capture artifact(s) remain under tmp",
-            report.summary.interrupted_capture_count
-        ));
-    }
-
-    let manifest_root = root.join("manifests");
-    if manifest_root.exists() {
-        for entry in walkdir::WalkDir::new(&manifest_root)
-            .follow_links(false)
-            .into_iter()
-        {
-            match entry {
-                Ok(entry) if entry.file_type().is_file() || entry.file_type().is_symlink() => {
-                    let path = entry.path();
-                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                        continue;
-                    }
-                    let report_entry = if entry.file_type().is_symlink() {
-                        doctor_raw_mirror_invalid_manifest_report(
-                            data_dir,
-                            path,
-                            "manifest path is a symlink".to_string(),
-                        )
-                    } else {
-                        match std::fs::read_to_string(path)
-                            .ok()
-                            .and_then(|content| serde_json::from_str(&content).ok())
-                        {
-                            Some(manifest) => doctor_verify_raw_mirror_manifest(
-                                data_dir, &root, path, manifest, full,
-                            ),
-                            None => doctor_raw_mirror_invalid_manifest_report(
-                                data_dir,
-                                path,
-                                "manifest is not parseable JSON".to_string(),
-                            ),
-                        }
-                    };
-                    report.manifests.push(report_entry);
-                }
-                Ok(_) => {}
-                Err(err) => report
-                    .warnings
-                    .push(format!("failed to scan raw mirror manifest entry: {err}")),
-            }
-        }
-    }
-
-    report
-        .manifests
-        .sort_by(|left, right| left.manifest_path.cmp(&right.manifest_path));
-    report.summary.manifest_count = report.manifests.len();
-    let mut blob_reference_counts: BTreeMap<String, usize> = BTreeMap::new();
-    let mut verified_blob_bytes: BTreeMap<String, u64> = BTreeMap::new();
-    for manifest in &report.manifests {
-        if !manifest.blob_blake3.is_empty() {
-            *blob_reference_counts
-                .entry(manifest.blob_blake3.clone())
-                .or_default() += 1;
-            if matches!(
-                manifest.blob_checksum_status,
-                DoctorArtifactChecksumStatus::Matched | DoctorArtifactChecksumStatus::NotRecorded
-            ) {
-                verified_blob_bytes
-                    .entry(manifest.blob_blake3.clone())
-                    .or_insert(manifest.blob_size_bytes);
-            }
-        }
-        if manifest.blob_checksum_status == DoctorArtifactChecksumStatus::Missing {
-            report.summary.missing_blob_count += 1;
-        }
-        if manifest.blob_checksum_status == DoctorArtifactChecksumStatus::Mismatched {
-            report.summary.checksum_mismatch_count += 1;
-        }
-        if manifest.manifest_checksum_status == DoctorArtifactChecksumStatus::Mismatched {
-            report.summary.manifest_checksum_mismatch_count += 1;
-        }
-        if manifest.manifest_checksum_status == DoctorArtifactChecksumStatus::NotRecorded {
-            report.summary.manifest_checksum_not_recorded_count += 1;
-        }
-        if manifest.status == "invalid_manifest" {
-            report.summary.invalid_manifest_count += 1;
-        }
-    }
-    report.summary.duplicate_blob_reference_count = blob_reference_counts
-        .values()
-        .map(|count| count.saturating_sub(1))
-        .sum();
-    report.summary.verified_blob_count = verified_blob_bytes.len();
-    report.summary.total_blob_bytes = verified_blob_bytes.values().copied().sum();
-    if let Some(warning) =
-        doctor_raw_mirror_size_warning(report.summary.total_blob_bytes, size_warn_threshold_bytes)
-    {
-        report.warnings.push(warning);
-    }
-
-    report.status = if report.summary.invalid_manifest_count > 0
-        || report.summary.missing_blob_count > 0
-        || report.summary.checksum_mismatch_count > 0
-        || report.summary.manifest_checksum_mismatch_count > 0
-        || report.summary.manifest_checksum_not_recorded_count > 0
-        || report.summary.interrupted_capture_count > 0
-        || doctor_raw_mirror_size_warning(
-            report.summary.total_blob_bytes,
-            size_warn_threshold_bytes,
-        )
-        .is_some()
-    {
-        "warn".to_string()
-    } else if report.summary.manifest_count == 0 {
-        "empty".to_string()
-    } else {
-        "verified".to_string()
-    };
-
-    report
-}
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct DoctorArchiveCoverageSnapshot {
@@ -62099,199 +61940,7 @@ mod doctor_asset_taxonomy_tests {
         );
     }
 
-    #[test]
-    fn doctor_candidate_build_reconstructs_from_verified_raw_mirror_when_live_db_is_corrupt() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let db_path = data_dir.join("agent_search.db");
-        let index_path = data_dir.join("index");
-        let corrupt_bytes = b"not a sqlite database";
-        std::fs::write(&db_path, corrupt_bytes).expect("write corrupt live db");
 
-        let original_source = temp.path().join("pruned-session.jsonl");
-        let raw_bytes =
-            b"{\"role\":\"user\",\"content\":\"recover me\"}\nnot-json-but-still-archive-data\n";
-        let manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &original_source,
-            raw_bytes,
-            vec![DoctorRawMirrorDbLink {
-                conversation_id: Some(7),
-                message_count: Some(2),
-                source_path: Some(original_source.display().to_string()),
-                started_at_ms: Some(1_700_000_000_000),
-            }],
-        );
-        write_raw_mirror_test_manifest(&data_dir, &manifest, raw_bytes);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(raw_mirror.status, "verified");
-        let source_inventory =
-            build_doctor_source_inventory_report(&data_dir, false, None, Vec::new(), Vec::new());
-        let source_authority =
-            build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
-        assert_eq!(
-            source_authority.selected_authority,
-            Some(DoctorSourceAuthorityKind::VerifiedRawMirror)
-        );
-        let coverage_summary = DoctorCoverageSummary {
-            schema_version: 1,
-            confidence_tier: "verified_raw_mirror_coverage".to_string(),
-            raw_mirror_manifest_count: 1,
-            raw_mirror_db_link_count: 1,
-            recommended_action: "fixture".to_string(),
-            ..DoctorCoverageSummary::default()
-        };
-        let live_before = doctor_candidate_live_inventory(&db_path, &index_path);
-
-        let build = build_doctor_reconstruct_candidate(
-            &data_dir,
-            &db_path,
-            &index_path,
-            &raw_mirror,
-            &source_authority,
-            &coverage_summary,
-        );
-
-        assert_eq!(build.status, "completed", "{build:#?}");
-        assert!(build.frankensqlite_open_ok);
-        assert!(build.frankensqlite_write_ok);
-        assert_eq!(build.confidence, "verified_raw_mirror_reconstruction");
-        assert_eq!(build.candidate_conversation_count, Some(1));
-        assert_eq!(build.candidate_message_count, Some(2));
-        assert_eq!(build.parse_error_count, 1);
-        assert!(
-            build
-                .evidence_sources
-                .iter()
-                .any(|source| source.starts_with("verified_raw_mirror:manifest_id=")),
-            "verified raw mirror evidence should be explicit: {build:#?}"
-        );
-        assert_eq!(
-            build.coverage_after.coverage_source,
-            "verified_raw_mirror_candidate_archive"
-        );
-        assert!(build.live_inventory_unchanged);
-        assert_eq!(build.live_inventory_before, live_before);
-        assert_eq!(build.live_inventory_after, live_before);
-        assert_eq!(
-            std::fs::read(&db_path).expect("read live corrupt db"),
-            corrupt_bytes,
-            "candidate reconstruction must leave the corrupt live DB untouched"
-        );
-
-        let candidate_dir = PathBuf::from(build.path.as_deref().expect("candidate path"));
-        assert!(
-            candidate_dir
-                .join("evidence/raw-mirror/blobs")
-                .join(format!("{}.raw", manifest.blob_blake3))
-                .exists(),
-            "candidate should stage raw mirror blob evidence"
-        );
-        assert!(
-            candidate_dir
-                .join("evidence/raw-mirror/manifests")
-                .join(format!("{}.json", manifest.manifest_id))
-                .exists(),
-            "candidate should stage raw mirror manifest evidence"
-        );
-        let parse_log = std::fs::read_to_string(candidate_dir.join("logs/parse-errors.jsonl"))
-            .expect("read parse log");
-        assert!(parse_log.contains("\"line_number\":2"));
-        assert!(
-            !parse_log.contains("not-json-but-still-archive-data"),
-            "parse logs should preserve diagnostics without raw session content"
-        );
-        let manifest_path = PathBuf::from(build.manifest_path.as_deref().expect("manifest path"));
-        let manifest_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(manifest_path).expect("read manifest"))
-                .expect("parse candidate manifest");
-        assert_eq!(
-            manifest_json["coverage_after"]["coverage_source"].as_str(),
-            Some("verified_raw_mirror_candidate_archive")
-        );
-        assert_eq!(
-            manifest_json["confidence"].as_str(),
-            Some("verified_raw_mirror_reconstruction")
-        );
-    }
-
-    #[test]
-    fn doctor_candidate_raw_mirror_reconstruction_suppresses_duplicate_db_links() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let db_path = data_dir.join("agent_search.db");
-        let index_path = data_dir.join("index");
-        std::fs::write(&db_path, b"corrupt").expect("write corrupt db");
-
-        let source_a = temp.path().join("session-a.jsonl");
-        let source_b = temp.path().join("session-b.jsonl");
-        let bytes_a = b"{\"role\":\"user\",\"content\":\"first\"}\n";
-        let bytes_b = b"{\"role\":\"assistant\",\"content\":\"duplicate\"}\n";
-        let duplicate_link = DoctorRawMirrorDbLink {
-            conversation_id: Some(42),
-            message_count: Some(1),
-            source_path: Some(source_a.display().to_string()),
-            started_at_ms: Some(1_700_000_000_000),
-        };
-        let manifest_a = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &source_a,
-            bytes_a,
-            vec![duplicate_link.clone()],
-        );
-        let manifest_b = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &source_b,
-            bytes_b,
-            vec![duplicate_link],
-        );
-        write_raw_mirror_test_manifest(&data_dir, &manifest_a, bytes_a);
-        write_raw_mirror_test_manifest(&data_dir, &manifest_b, bytes_b);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
-        let source_inventory =
-            build_doctor_source_inventory_report(&data_dir, false, None, Vec::new(), Vec::new());
-        let source_authority =
-            build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
-        let coverage_summary = DoctorCoverageSummary {
-            schema_version: 1,
-            confidence_tier: "verified_raw_mirror_coverage".to_string(),
-            raw_mirror_manifest_count: 2,
-            raw_mirror_db_link_count: 2,
-            ..DoctorCoverageSummary::default()
-        };
-
-        let build = build_doctor_reconstruct_candidate(
-            &data_dir,
-            &db_path,
-            &index_path,
-            &raw_mirror,
-            &source_authority,
-            &coverage_summary,
-        );
-
-        assert_eq!(build.status, "completed", "{build:#?}");
-        assert_eq!(build.candidate_conversation_count, Some(1));
-        assert_eq!(build.candidate_message_count, Some(1));
-        assert!(
-            build.skipped_record_count >= 1,
-            "duplicate manifest should be logged as skipped: {build:#?}"
-        );
-        let candidate_dir = PathBuf::from(build.path.as_deref().expect("candidate path"));
-        let skipped_log = std::fs::read_to_string(candidate_dir.join("logs/skipped-records.jsonl"))
-            .expect("read skipped log");
-        assert!(
-            skipped_log.contains("duplicate_raw_mirror_conversation_key"),
-            "duplicate suppression reason should be durable: {skipped_log}"
-        );
-    }
 
     #[test]
     fn doctor_candidate_staging_reports_orphaned_and_interrupted_without_gc() {
@@ -64609,225 +64258,6 @@ paths = ["~/.claude/projects"]
         );
     }
 
-    #[test]
-    fn doctor_coverage_summary_classifies_ledger_gaps_and_confidence_tiers() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let sessions_dir = data_dir.join("sessions");
-        std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
-        let live_source = sessions_dir.join("live.jsonl");
-        let missing_source = sessions_dir.join("pruned.jsonl");
-        std::fs::write(&live_source, b"live bytes").expect("write live source");
-
-        let rows = vec![
-            DoctorSourceInventoryDbRow {
-                provider: "codex".to_string(),
-                source_path: Some(live_source.display().to_string()),
-                source_id: "local".to_string(),
-                origin_host: None,
-                origin_kind: Some("local".to_string()),
-                conversation_count: 1,
-            },
-            DoctorSourceInventoryDbRow {
-                provider: "codex".to_string(),
-                source_path: Some(missing_source.display().to_string()),
-                source_id: "local".to_string(),
-                origin_host: None,
-                origin_kind: Some("local".to_string()),
-                conversation_count: 1,
-            },
-            DoctorSourceInventoryDbRow {
-                provider: "unknown".to_string(),
-                source_path: None,
-                source_id: "local".to_string(),
-                origin_host: None,
-                origin_kind: Some("local".to_string()),
-                conversation_count: 1,
-            },
-            DoctorSourceInventoryDbRow {
-                provider: "claude_code".to_string(),
-                source_path: Some("/remote/claude/session.jsonl".to_string()),
-                source_id: "workstation-a".to_string(),
-                origin_host: Some("user@workstation-a".to_string()),
-                origin_kind: Some("ssh".to_string()),
-                conversation_count: 1,
-            },
-        ];
-        let source_inventory =
-            build_doctor_source_inventory_report(&data_dir, true, None, rows, Vec::new());
-
-        let mirrored_bytes = b"{\"type\":\"message\",\"text\":\"mirrored\"}\n";
-        let mirrored_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &missing_source,
-            mirrored_bytes,
-            vec![DoctorRawMirrorDbLink {
-                conversation_id: Some(2),
-                message_count: Some(3),
-                source_path: Some(missing_source.display().to_string()),
-                started_at_ms: Some(1_700_000_000_000),
-            }],
-        );
-        write_raw_mirror_test_manifest(&data_dir, &mirrored_manifest, mirrored_bytes);
-        let unlinked_bytes = b"{\"type\":\"message\",\"text\":\"orphan mirror\"}\n";
-        let unlinked_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &sessions_dir.join("orphan.jsonl"),
-            unlinked_bytes,
-            Vec::new(),
-        );
-        write_raw_mirror_test_manifest(&data_dir, &unlinked_manifest, unlinked_bytes);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
-
-        let backfill = DoctorRawMirrorBackfillReport {
-            schema_version: 1,
-            db_available: true,
-            total_candidate_count: 3,
-            source_missing_count: 1,
-            db_projection_only_count: 1,
-            receipts: vec![
-                DoctorRawMirrorBackfillReceipt {
-                    stable_record_id: "live-row".to_string(),
-                    conversation_id: Some(1),
-                    provider: "codex".to_string(),
-                    source_id: "local".to_string(),
-                    origin_kind: "local".to_string(),
-                    message_count: 2,
-                    started_at_ms: Some(1_700_000_000_000),
-                    redacted_source_path: Some("[cass-data]/sessions/live.jsonl".to_string()),
-                    source_path_blake3: Some(doctor_raw_mirror_backfill_source_path_blake3(
-                        &live_source.display().to_string(),
-                    )),
-                    source_stat_snapshot: Some(DoctorRawMirrorBackfillSourceStatSnapshot {
-                        exists: true,
-                        file_type: "file".to_string(),
-                        size_bytes: Some(10),
-                        modified_at_ms: Some(1_700_000_000_001),
-                        content_blake3: Some("live-hash".to_string()),
-                        stat_error: None,
-                    }),
-                    ..DoctorRawMirrorBackfillReceipt::default()
-                },
-                DoctorRawMirrorBackfillReceipt {
-                    stable_record_id: "missing-mirrored-row".to_string(),
-                    conversation_id: Some(2),
-                    provider: "codex".to_string(),
-                    source_id: "local".to_string(),
-                    origin_kind: "local".to_string(),
-                    message_count: 3,
-                    started_at_ms: Some(1_700_000_000_000),
-                    redacted_source_path: Some("[cass-data]/sessions/pruned.jsonl".to_string()),
-                    source_path_blake3: Some(doctor_raw_mirror_backfill_source_path_blake3(
-                        &missing_source.display().to_string(),
-                    )),
-                    raw_source_captured: true,
-                    raw_mirror_db_linked: true,
-                    source_missing: true,
-                    parse_loss_unknown: false,
-                    raw_mirror_manifest_id: Some(mirrored_manifest.manifest_id.clone()),
-                    raw_mirror_blob_blake3: Some(mirrored_manifest.blob_blake3.clone()),
-                    raw_mirror_blob_size_bytes: Some(mirrored_bytes.len() as u64),
-                    source_stat_snapshot: Some(DoctorRawMirrorBackfillSourceStatSnapshot {
-                        exists: false,
-                        file_type: "missing".to_string(),
-                        stat_error: Some("not found".to_string()),
-                        ..DoctorRawMirrorBackfillSourceStatSnapshot::default()
-                    }),
-                    ..DoctorRawMirrorBackfillReceipt::default()
-                },
-                DoctorRawMirrorBackfillReceipt {
-                    stable_record_id: "unknown-row".to_string(),
-                    conversation_id: Some(3),
-                    provider: "unknown".to_string(),
-                    source_id: "local".to_string(),
-                    origin_kind: "local".to_string(),
-                    message_count: 5,
-                    db_projection_only: true,
-                    parse_loss_unknown: true,
-                    ..DoctorRawMirrorBackfillReceipt::default()
-                },
-            ],
-            ..DoctorRawMirrorBackfillReport::default()
-        };
-
-        let sole_copy_warnings = build_doctor_sole_copy_warnings(&backfill);
-        let summary = build_doctor_coverage_summary(
-            &source_inventory,
-            &raw_mirror,
-            &backfill,
-            &sole_copy_warnings,
-        );
-
-        assert_eq!(sole_copy_warnings.len(), 1);
-        assert_eq!(sole_copy_warnings[0].confidence_tier, "verified_raw_mirror");
-        assert!(sole_copy_warnings[0].raw_source_captured);
-        assert!(!sole_copy_warnings[0].db_projection_only);
-        let rendered_warning =
-            serde_json::to_string(&sole_copy_warnings[0]).expect("sole-copy warning json");
-        assert!(
-            !rendered_warning.contains(&missing_source.display().to_string()),
-            "sole-copy warnings must stay redacted and hash-addressed"
-        );
-
-        assert_eq!(summary.archive_conversation_count, 4);
-        assert_eq!(summary.archived_message_count, 10);
-        assert_eq!(summary.provider_count, 3);
-        assert_eq!(summary.visible_current_source_count, 1);
-        assert_eq!(summary.visible_current_source_bytes, 10);
-        assert_eq!(summary.raw_mirror_manifest_count, 2);
-        assert_eq!(summary.raw_mirror_db_link_count, 1);
-        assert_eq!(summary.db_without_raw_mirror_count, 2);
-        assert_eq!(summary.db_projection_only_count, 1);
-        assert_eq!(summary.mirror_without_db_link_count, 1);
-        assert_eq!(summary.missing_current_source_count, 1);
-        assert_eq!(summary.sole_copy_candidate_count, 1);
-        assert_eq!(summary.current_source_newer_than_archive_count, 1);
-        assert_eq!(summary.remote_source_count, 1);
-        assert_eq!(summary.unknown_mapping_count, 1);
-        assert_eq!(summary.earliest_started_at_ms, Some(1_700_000_000_000));
-        assert_eq!(summary.latest_started_at_ms, Some(1_700_000_000_000));
-        assert!(summary.coverage_reducing_live_source_rebuild_refused);
-
-        let risk = doctor_coverage_risk_summary(&summary, sole_copy_warnings.len());
-        assert_eq!(risk.status, "sole_copy_risk");
-        assert_eq!(risk.sole_copy_warning_count, 1);
-        assert_eq!(risk.raw_mirror_db_link_count, 1);
-        assert_eq!(risk.db_without_raw_mirror_count, 2);
-        assert_eq!(risk.mirror_without_db_link_count, 1);
-        assert_eq!(risk.current_source_newer_than_archive_count, 1);
-
-        assert_eq!(
-            doctor_coverage_confidence_tier(1, 0, 0, 1, 1, 0, 0),
-            "sole_copy_verified_raw_mirror"
-        );
-        assert_eq!(
-            doctor_coverage_confidence_tier(1, 1, 1, 1, 0, 0, 0),
-            "sole_copy_db_projection"
-        );
-        assert_eq!(
-            doctor_coverage_confidence_tier(1, 0, 0, 0, 1, 0, 1),
-            "current_source_newer_than_archive"
-        );
-        assert_eq!(
-            doctor_coverage_confidence_tier(0, 0, 0, 0, 0, 1, 0),
-            "raw_mirror_unlinked"
-        );
-        let mirror_only_risk = doctor_coverage_risk_summary(
-            &DoctorCoverageSummary {
-                confidence_tier: "raw_mirror_unlinked".to_string(),
-                mirror_without_db_link_count: 1,
-                recommended_action: "inspect mirror".to_string(),
-                ..DoctorCoverageSummary::default()
-            },
-            0,
-        );
-        assert_eq!(mirror_only_risk.status, "raw_mirror_unlinked");
-        assert_eq!(mirror_only_risk.mirror_without_db_link_count, 1);
-    }
 
     fn doctor_test_source_authority_report() -> DoctorSourceAuthorityReport {
         DoctorSourceAuthorityReport {
@@ -64986,71 +64416,6 @@ paths = ["~/.claude/projects"]
         );
     }
 
-    #[test]
-    fn doctor_source_authority_report_rejects_pruned_live_source_but_keeps_verified_mirror() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        std::fs::create_dir_all(&data_dir).expect("create data dir");
-        let db_path = data_dir.join("agent_search.db");
-        std::fs::write(&db_path, b"db placeholder").expect("write db placeholder");
-        let missing_source = data_dir.join("sessions/pruned.jsonl");
-        let rows = vec![DoctorSourceInventoryDbRow {
-            provider: "codex".to_string(),
-            source_path: Some(missing_source.display().to_string()),
-            source_id: "local".to_string(),
-            origin_host: None,
-            origin_kind: Some("local".to_string()),
-            conversation_count: 1,
-        }];
-        let source_inventory =
-            build_doctor_source_inventory_report(&data_dir, true, None, rows, Vec::new());
-        let bytes = b"{\"type\":\"message\",\"content\":\"preserved\"}\n";
-        let manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &missing_source,
-            bytes,
-            vec![DoctorRawMirrorDbLink {
-                conversation_id: Some(1),
-                message_count: Some(1),
-                source_path: Some(missing_source.display().to_string()),
-                started_at_ms: Some(1_733_000_000_000),
-            }],
-        );
-        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-        let raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
-        let report = build_doctor_source_authority_report(&db_path, &source_inventory, &raw_mirror);
-
-        assert_eq!(
-            report.selected_authority,
-            Some(DoctorSourceAuthorityKind::CanonicalArchiveDb)
-        );
-        assert!(
-            report.selected_authorities.iter().any(|candidate| {
-                candidate.authority == DoctorSourceAuthorityKind::VerifiedRawMirror
-                    && candidate.decision == DoctorSourceAuthorityDecision::CandidateOnly
-                    && candidate.coverage_delta == 0
-            }),
-            "verified raw mirror should remain a candidate authority when upstream is pruned: {report:#?}"
-        );
-        assert!(
-            report.rejected_authorities.iter().any(|candidate| {
-                candidate.authority == DoctorSourceAuthorityKind::LiveUpstreamSource
-                    && candidate.reason.contains("missing local conversation")
-                    && candidate.coverage_delta < 0
-                    && candidate
-                        .evidence
-                        .contains(&"coverage-shrinks-relative-to-archive".to_string())
-            }),
-            "pruned live source must be rejected with stable coverage evidence: {report:#?}"
-        );
-        assert_eq!(
-            report.checksum_evidence.summary_status,
-            DoctorArtifactChecksumStatus::Matched
-        );
-        assert_eq!(report.coverage_delta.raw_mirror_db_link_count, 1);
-    }
 
     #[test]
     fn doctor_source_authority_report_refuses_unverified_mirror_when_archive_missing() {
@@ -65117,90 +64482,7 @@ paths = ["~/.claude/projects"]
         );
     }
 
-    fn raw_mirror_test_manifest(
-        data_dir: &Path,
-        provider: &str,
-        source_id: &str,
-        original_path: &Path,
-        bytes: &[u8],
-        db_links: Vec<DoctorRawMirrorDbLink>,
-    ) -> DoctorRawMirrorManifestFile {
-        let blob_blake3 = blake3::hash(bytes).to_hex().to_string();
-        let original_path = original_path.display().to_string();
-        let original_path_blake3 = doctor_raw_mirror_original_path_blake3(&original_path);
-        let manifest_id = doctor_raw_mirror_manifest_id(
-            provider,
-            source_id,
-            "local",
-            None,
-            &original_path_blake3,
-            &blob_blake3,
-        );
-        let mut manifest = DoctorRawMirrorManifestFile {
-            schema_version: DOCTOR_RAW_MIRROR_SCHEMA_VERSION,
-            manifest_kind: DOCTOR_RAW_MIRROR_MANIFEST_KIND.to_string(),
-            manifest_id,
-            blob_hash_algorithm: DOCTOR_RAW_MIRROR_HASH_ALGORITHM.to_string(),
-            blob_relative_path: doctor_raw_mirror_blob_relative_path(&blob_blake3)
-                .expect("valid blob path"),
-            blob_size_bytes: bytes.len() as u64,
-            blob_blake3,
-            provider: provider.to_string(),
-            source_id: source_id.to_string(),
-            origin_kind: "local".to_string(),
-            origin_host: None,
-            original_path: original_path.clone(),
-            redacted_original_path: doctor_redacted_path(&original_path, data_dir),
-            original_path_blake3,
-            captured_at_ms: 1_733_000_000_000,
-            source_mtime_ms: Some(1_733_000_000_000),
-            source_size_bytes: Some(bytes.len() as u64),
-            compression: DoctorRawMirrorCompressionEnvelope {
-                state: "none".to_string(),
-                algorithm: None,
-                uncompressed_size_bytes: Some(bytes.len() as u64),
-            },
-            encryption: DoctorRawMirrorEncryptionEnvelope {
-                state: "none".to_string(),
-                algorithm: None,
-                key_id: None,
-                envelope_version: None,
-            },
-            db_links,
-            verification: DoctorRawMirrorVerificationRecord {
-                status: "captured".to_string(),
-                verifier: "test-fixture".to_string(),
-                content_blake3: None,
-                verified_at_ms: None,
-            },
-            manifest_blake3: None,
-        };
-        manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
-        manifest
-    }
 
-    fn write_raw_mirror_test_manifest(
-        data_dir: &Path,
-        manifest: &DoctorRawMirrorManifestFile,
-        bytes: &[u8],
-    ) -> (PathBuf, PathBuf) {
-        let root = doctor_raw_mirror_root(data_dir);
-        let blob_path = root.join(&manifest.blob_relative_path);
-        std::fs::create_dir_all(blob_path.parent().expect("blob parent"))
-            .expect("create blob parent");
-        std::fs::write(&blob_path, bytes).expect("write raw mirror blob");
-        let manifest_path = root.join(doctor_raw_mirror_manifest_relative_path(
-            &manifest.manifest_id,
-        ));
-        std::fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
-            .expect("create manifest parent");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(manifest).expect("manifest json"),
-        )
-        .expect("write raw mirror manifest");
-        (blob_path, manifest_path)
-    }
 
     #[test]
     fn raw_mirror_layout_rejects_hostile_paths_and_documents_permission_intent() {
@@ -65272,750 +64554,19 @@ paths = ["~/.claude/projects"]
         );
     }
 
-    #[test]
-    fn raw_mirror_report_serializes_redacted_manifest_metadata_only_by_default() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = temp
-            .path()
-            .join("workspace-with-secrets")
-            .join("private-session-with-token.jsonl");
-        let raw_bytes = b"RAW_MIRROR_SECRET_PROMPT_SHOULD_NOT_LEAK";
-        let mut manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &source_path,
-            raw_bytes,
-            Vec::new(),
-        );
-        manifest.compression = DoctorRawMirrorCompressionEnvelope {
-            state: "compressed".to_string(),
-            algorithm: Some("zstd".to_string()),
-            uncompressed_size_bytes: Some(raw_bytes.len() as u64),
-        };
-        manifest.encryption = DoctorRawMirrorEncryptionEnvelope {
-            state: "encrypted".to_string(),
-            algorithm: Some("aes-256-gcm".to_string()),
-            key_id: Some("local-key-1".to_string()),
-            envelope_version: Some(1),
-        };
-        manifest.manifest_blake3 = Some(doctor_raw_mirror_manifest_blake3(&manifest));
-        write_raw_mirror_test_manifest(&data_dir, &manifest, raw_bytes);
 
-        let report = collect_doctor_raw_mirror_report(&data_dir, true);
-        let payload = serde_json::to_value(&report).expect("raw mirror report json");
-        let rendered = serde_json::to_string(&payload).expect("raw mirror rendered json");
 
-        assert_eq!(payload["sensitive_paths_included"].as_bool(), Some(false));
-        assert_eq!(payload["raw_content_included"].as_bool(), Some(false));
-        assert!(
-            payload.get("root_path").is_none(),
-            "exact raw mirror root path must not serialize by default: {payload:#}"
-        );
-        let manifest_payload = &payload["manifests"][0];
-        assert!(manifest_payload.get("manifest_path").is_none());
-        assert!(manifest_payload.get("blob_path").is_none());
-        assert!(manifest_payload.get("original_path").is_none());
-        assert_eq!(
-            manifest_payload["redacted_original_path"].as_str(),
-            Some("[external]/private-session-with-token.jsonl")
-        );
-        assert_eq!(
-            manifest_payload["compression"]["state"].as_str(),
-            Some("compressed")
-        );
-        assert_eq!(
-            manifest_payload["compression"]["algorithm"].as_str(),
-            Some("zstd")
-        );
-        assert_eq!(
-            manifest_payload["encryption"]["state"].as_str(),
-            Some("encrypted")
-        );
-        assert_eq!(
-            manifest_payload["encryption"]["algorithm"].as_str(),
-            Some("aes-256-gcm")
-        );
-        assert!(!rendered.contains("RAW_MIRROR_SECRET_PROMPT_SHOULD_NOT_LEAK"));
-        assert!(
-            !rendered.contains(&source_path.display().to_string()),
-            "default raw mirror report must not serialize the exact source path"
-        );
-    }
 
-    #[test]
-    fn raw_mirror_manifest_identity_supports_dedup_and_distinguishes_byte_changes() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let duplicate_link = DoctorRawMirrorDbLink {
-            conversation_id: Some(7),
-            message_count: Some(2),
-            source_path: Some(source_path.display().to_string()),
-            started_at_ms: Some(1_733_000_000_000),
-        };
-        let merged =
-            doctor_raw_mirror_unique_db_links(&[duplicate_link.clone(), duplicate_link.clone()]);
-        assert_eq!(
-            merged.len(),
-            1,
-            "same-hash metadata merge must deduplicate identical db_links"
-        );
 
-        let first = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &source_path,
-            b"same bytes",
-            vec![duplicate_link],
-        );
-        let second_provider = raw_mirror_test_manifest(
-            &data_dir,
-            "claude_code",
-            "local",
-            &source_path,
-            b"same bytes",
-            Vec::new(),
-        );
-        assert_eq!(
-            first.blob_relative_path, second_provider.blob_relative_path,
-            "identical bytes should deduplicate to the same content-addressed blob"
-        );
-        assert_ne!(
-            first.manifest_id, second_provider.manifest_id,
-            "provider/source metadata remains independently addressable even when blob bytes dedup"
-        );
 
-        let changed_bytes = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &source_path,
-            b"different bytes",
-            Vec::new(),
-        );
-        assert_ne!(
-            first.blob_relative_path, changed_bytes.blob_relative_path,
-            "different bytes at the same source identity must never overwrite the existing blob"
-        );
-        assert_ne!(first.manifest_id, changed_bytes.manifest_id);
-    }
 
-    #[test]
-    fn raw_mirror_report_verifies_blobs_flags_manifest_drift_and_interrupted_captures() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"hello\"}\n";
-        let good_manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        let (blob_path, _) = write_raw_mirror_test_manifest(&data_dir, &good_manifest, bytes);
 
-        let drift_path = data_dir.join("sessions/source-drift.jsonl");
-        let mut drift_manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &drift_path, bytes, Vec::new());
-        drift_manifest.manifest_blake3 = Some("doctor-raw-mirror-manifest-v1-bad".to_string());
-        write_raw_mirror_test_manifest(&data_dir, &drift_manifest, bytes);
 
-        let unverified_bytes = b"{\"type\":\"message\",\"text\":\"needs manifest checksum\"}\n";
-        let unverified_path = data_dir.join("sessions/source-unverified.jsonl");
-        let mut unverified_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &unverified_path,
-            unverified_bytes,
-            Vec::new(),
-        );
-        unverified_manifest.manifest_blake3 = None;
-        write_raw_mirror_test_manifest(&data_dir, &unverified_manifest, unverified_bytes);
 
-        let tmp_dir = doctor_raw_mirror_root(&data_dir).join("tmp/op-1");
-        std::fs::create_dir_all(&tmp_dir).expect("create tmp dir");
-        std::fs::write(tmp_dir.join("capture.tmp"), b"partial").expect("write tmp");
 
-        let report = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(report.status, "warn");
-        assert_eq!(report.summary.manifest_count, 3);
-        assert_eq!(report.summary.verified_blob_count, 2);
-        assert_eq!(report.summary.manifest_checksum_mismatch_count, 1);
-        assert_eq!(report.summary.manifest_checksum_not_recorded_count, 1);
-        assert_eq!(report.summary.interrupted_capture_count, 1);
-        assert_eq!(report.summary.duplicate_blob_reference_count, 1);
-        assert_eq!(
-            report.summary.total_blob_bytes,
-            (bytes.len() + unverified_bytes.len()) as u64,
-            "summary byte count should reflect unique deduplicated blob storage"
-        );
-        assert!(blob_path.exists());
 
-        let good_report = report
-            .manifests
-            .iter()
-            .find(|manifest| manifest.manifest_id == good_manifest.manifest_id)
-            .expect("good manifest report");
-        assert_eq!(
-            good_report.blob_checksum_status,
-            DoctorArtifactChecksumStatus::Matched
-        );
-        assert_eq!(
-            good_report.redacted_original_path,
-            "[cass-data]/sessions/source.jsonl"
-        );
-        assert_eq!(good_report.upstream_path_exists, Some(false));
 
-        let drift_report = report
-            .manifests
-            .iter()
-            .find(|manifest| manifest.manifest_id == drift_manifest.manifest_id)
-            .expect("drift manifest report");
-        assert_eq!(drift_report.status, "manifest_drift");
-        assert_eq!(
-            drift_report.manifest_checksum_status,
-            DoctorArtifactChecksumStatus::Mismatched
-        );
 
-        let unverified_report = report
-            .manifests
-            .iter()
-            .find(|manifest| manifest.manifest_id == unverified_manifest.manifest_id)
-            .expect("unverified manifest report");
-        assert_eq!(unverified_report.status, "manifest_unverified");
-        assert_eq!(
-            unverified_report.manifest_checksum_status,
-            DoctorArtifactChecksumStatus::NotRecorded
-        );
-    }
-
-    #[test]
-    fn raw_mirror_report_warns_when_verified_blob_bytes_cross_threshold() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/large-source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"size warning\"}\n";
-        let manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-
-        let report = collect_doctor_raw_mirror_report_with_threshold(&data_dir, 1, true);
-
-        assert_eq!(report.status, "warn");
-        assert_eq!(report.summary.total_blob_bytes, bytes.len() as u64);
-        assert!(
-            report
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("raw_mirror.size")
-                    && warning.contains("cass mirror prune --older-than 90d --json")),
-            "raw mirror size warning should include the canonical prune dry-run: {report:#?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn raw_mirror_report_rejects_symlink_manifest_entries() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let root = doctor_raw_mirror_root(&data_dir);
-        let manifest_dir = root.join("manifests");
-        std::fs::create_dir_all(&manifest_dir).expect("create manifest dir");
-        let outside_target = temp.path().join("outside-manifest.json");
-        std::fs::write(&outside_target, "{}").expect("write external manifest");
-        std::os::unix::fs::symlink(&outside_target, manifest_dir.join("linked.json"))
-            .expect("create manifest symlink");
-
-        let report = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(report.status, "warn");
-        assert_eq!(report.summary.manifest_count, 1);
-        assert_eq!(report.summary.invalid_manifest_count, 1);
-        assert_eq!(
-            report.manifests[0].invalid_reason.as_deref(),
-            Some("manifest path is a symlink")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn raw_mirror_report_rejects_blob_paths_with_symlinked_ancestors() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let root = doctor_raw_mirror_root(&data_dir);
-        std::fs::create_dir_all(&root).expect("create raw mirror root");
-
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"outside blob\"}\n";
-        let manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-
-        let outside_blob_root = temp.path().join("outside-blob-root");
-        let outside_blob_path = outside_blob_root.join(
-            manifest
-                .blob_relative_path
-                .strip_prefix("blobs/")
-                .expect("blob relative path prefix"),
-        );
-        std::fs::create_dir_all(outside_blob_path.parent().expect("outside blob parent"))
-            .expect("create outside blob parent");
-        std::fs::write(&outside_blob_path, bytes).expect("write outside blob");
-        std::os::unix::fs::symlink(&outside_blob_root, root.join("blobs"))
-            .expect("create symlinked blob root");
-
-        let manifest_path = root.join(doctor_raw_mirror_manifest_relative_path(
-            &manifest.manifest_id,
-        ));
-        std::fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
-            .expect("create manifest parent");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest).expect("manifest json"),
-        )
-        .expect("write raw mirror manifest");
-
-        let report = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(report.status, "warn");
-        assert_eq!(report.summary.manifest_count, 1);
-        assert_eq!(report.summary.invalid_manifest_count, 1);
-        assert_eq!(
-            report.manifests[0].invalid_reason.as_deref(),
-            Some("blob path contains a symlinked component"),
-            "raw mirror verification must not follow symlinked blob ancestors"
-        );
-        assert_eq!(
-            report.manifests[0].manifest_id, manifest.manifest_id,
-            "symlink rejection should preserve manifest identity for diagnostics"
-        );
-        assert!(
-            !report.manifests[0].blob_path.is_empty(),
-            "symlink rejection should keep the rejected blob path visible in the report"
-        );
-        assert_eq!(
-            report.summary.verified_blob_count, 0,
-            "a blob reached through a symlinked parent must not count as verified evidence"
-        );
-    }
-
-    #[test]
-    fn raw_mirror_report_counts_missing_blob_without_relabeling_manifest_invalid() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"missing blob\"}\n";
-        let manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        let root = doctor_raw_mirror_root(&data_dir);
-        let manifest_path = root.join(doctor_raw_mirror_manifest_relative_path(
-            &manifest.manifest_id,
-        ));
-        std::fs::create_dir_all(manifest_path.parent().expect("manifest parent"))
-            .expect("create manifest parent");
-        std::fs::write(
-            &manifest_path,
-            serde_json::to_vec_pretty(&manifest).expect("manifest json"),
-        )
-        .expect("write raw mirror manifest without blob");
-
-        let report = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(report.status, "warn");
-        assert_eq!(report.summary.manifest_count, 1);
-        assert_eq!(report.summary.missing_blob_count, 1);
-        assert_eq!(
-            report.summary.invalid_manifest_count, 0,
-            "a correctly formed manifest with an absent blob should diagnose missing evidence, not manifest corruption"
-        );
-        assert_eq!(report.manifests[0].status, "missing_blob");
-        assert_eq!(
-            report.manifests[0].blob_checksum_status,
-            DoctorArtifactChecksumStatus::Missing
-        );
-    }
-
-    #[test]
-    fn raw_mirror_report_size_only_verification_skips_blake3_when_not_full() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"size only\"}\n";
-        let manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-
-        let full_report = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(full_report.status, "verified");
-        assert_eq!(full_report.manifests[0].status, "verified");
-        assert_eq!(
-            full_report.manifests[0].blob_checksum_status,
-            DoctorArtifactChecksumStatus::Matched
-        );
-
-        let light_report = collect_doctor_raw_mirror_report(&data_dir, false);
-        assert_eq!(light_report.manifests[0].status, "size_verified");
-        assert_eq!(
-            light_report.manifests[0].blob_checksum_status,
-            DoctorArtifactChecksumStatus::NotRecorded,
-            "size-only verification should not claim content hash was checked"
-        );
-        assert_eq!(light_report.summary.manifest_count, 1);
-    }
-
-    #[test]
-    fn raw_mirror_report_size_only_detects_size_mismatch_without_full() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"original\"}\n";
-        let manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        let (blob_path, _) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-
-        std::fs::write(
-            &blob_path,
-            b"wrong size content that differs in length from original",
-        )
-        .expect("overwrite blob with wrong-size content");
-
-        let report = collect_doctor_raw_mirror_report(&data_dir, false);
-        assert_eq!(report.manifests[0].status, "size_mismatch");
-        assert_eq!(
-            report.manifests[0].blob_checksum_status,
-            DoctorArtifactChecksumStatus::Mismatched
-        );
-        assert!(
-            report.manifests[0]
-                .invalid_reason
-                .as_deref()
-                .unwrap_or("")
-                .contains("--full"),
-            "size mismatch hint should mention --full for deeper verification"
-        );
-    }
-
-    #[test]
-    fn raw_mirror_report_size_only_passes_when_content_differs_but_size_matches() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"original-content-here!!";
-        let manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        let (blob_path, _) = write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-
-        let corrupted = b"corrupted-content-too!!";
-        assert_eq!(
-            bytes.len(),
-            corrupted.len(),
-            "test requires same-length content"
-        );
-        std::fs::write(&blob_path, corrupted).expect("overwrite blob with same-size content");
-
-        let light_report = collect_doctor_raw_mirror_report(&data_dir, false);
-        assert_eq!(
-            light_report.manifests[0].status, "size_verified",
-            "size-only mode cannot detect same-size content corruption"
-        );
-
-        let full_report = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(
-            full_report.manifests[0].status, "checksum_mismatch",
-            "full mode catches content corruption that size-only misses"
-        );
-    }
-
-    #[test]
-    fn archive_scan_classifies_normalizable_metadata_and_critical_archive_risks() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let bytes = b"{\"type\":\"message\",\"text\":\"dedup\"}\n";
-
-        let first_path = data_dir.join("sessions/first.jsonl");
-        let first_manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &first_path, bytes, Vec::new());
-        write_raw_mirror_test_manifest(&data_dir, &first_manifest, bytes);
-
-        let second_path = data_dir.join("sessions/second.jsonl");
-        let second_manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &second_path, bytes, Vec::new());
-        write_raw_mirror_test_manifest(&data_dir, &second_manifest, bytes);
-
-        let legacy_path = data_dir.join("sessions/legacy.jsonl");
-        let legacy_bytes = b"{\"type\":\"message\",\"text\":\"legacy\"}\n";
-        let mut legacy_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &legacy_path,
-            legacy_bytes,
-            Vec::new(),
-        );
-        legacy_manifest.manifest_blake3 = None;
-        write_raw_mirror_test_manifest(&data_dir, &legacy_manifest, legacy_bytes);
-
-        let optional_path = data_dir.join("sessions/optional.jsonl");
-        let optional_bytes = b"{\"type\":\"message\",\"text\":\"optional\"}\n";
-        let mut optional_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &optional_path,
-            optional_bytes,
-            Vec::new(),
-        );
-        optional_manifest.compression.state = "legacy-zstd".to_string();
-        optional_manifest.manifest_blake3 =
-            Some(doctor_raw_mirror_manifest_blake3(&optional_manifest));
-        write_raw_mirror_test_manifest(&data_dir, &optional_manifest, optional_bytes);
-
-        let missing_path = data_dir.join("sessions/missing.jsonl");
-        let missing_bytes = b"{\"type\":\"message\",\"text\":\"missing\"}\n";
-        let missing_manifest = raw_mirror_test_manifest(
-            &data_dir,
-            "codex",
-            "local",
-            &missing_path,
-            missing_bytes,
-            Vec::new(),
-        );
-        let root = doctor_raw_mirror_root(&data_dir);
-        let missing_manifest_path = root.join(doctor_raw_mirror_manifest_relative_path(
-            &missing_manifest.manifest_id,
-        ));
-        std::fs::create_dir_all(missing_manifest_path.parent().expect("manifest parent"))
-            .expect("create missing manifest parent");
-        std::fs::write(
-            &missing_manifest_path,
-            serde_json::to_vec_pretty(&missing_manifest).expect("manifest json"),
-        )
-        .expect("write missing-blob manifest without blob bytes");
-
-        let context =
-            build_doctor_archive_scan_context(&data_dir, &data_dir.join("agent_search.db"));
-        let finding_kinds: Vec<_> = context
-            .scan
-            .findings
-            .iter()
-            .map(|finding| finding.finding_kind.as_str())
-            .collect();
-
-        assert!(finding_kinds.contains(&"duplicate_metadata"));
-        assert!(finding_kinds.contains(&"legacy_schema_annotation"));
-        assert!(finding_kinds.contains(&"malformed_optional_fields"));
-        assert!(finding_kinds.contains(&"missing_raw_mirror_blob"));
-        assert!(!context.scan.mutation_performed);
-        assert_eq!(context.scan.issues_fixed, 0);
-        assert!(
-            context
-                .scan
-                .findings
-                .iter()
-                .filter(|finding| finding.safe_to_normalize)
-                .all(|finding| finding.recommendation.contains("archive-normalize")),
-            "safe findings should route to archive-normalize: {:#?}",
-            context.scan.findings
-        );
-        let missing = context
-            .scan
-            .findings
-            .iter()
-            .find(|finding| finding.finding_kind == "missing_raw_mirror_blob")
-            .expect("missing blob finding");
-        assert_eq!(missing.severity, "critical");
-        assert!(!missing.safe_to_normalize);
-        assert!(
-            missing.recommendation.contains("restore")
-                || missing.recommendation.contains("reconstruct")
-        );
-
-        let plan = build_doctor_archive_normalize_plan(
-            &data_dir,
-            &data_dir.join("agent_search.db"),
-            &context.scan,
-            false,
-            None,
-        );
-        assert_eq!(
-            plan.action_count, context.scan.safe_normalization_candidate_count,
-            "normalize should plan only safe additive metadata annotations"
-        );
-        assert!(
-            plan.skipped_actions
-                .iter()
-                .any(|action| action.finding_kind == "missing_raw_mirror_blob"),
-            "critical findings must be skipped rather than normalized away: {plan:#?}"
-        );
-        assert!(!plan.coverage_reduced);
-    }
-
-    #[test]
-    fn archive_normalize_apply_writes_only_additive_idempotent_annotations() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"legacy annotation\"}\n";
-        let mut manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        manifest.manifest_blake3 = None;
-        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-
-        let before_raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
-        let context =
-            build_doctor_archive_scan_context(&data_dir, &data_dir.join("agent_search.db"));
-        let mut plan = build_doctor_archive_normalize_plan(
-            &data_dir,
-            &data_dir.join("agent_search.db"),
-            &context.scan,
-            true,
-            None,
-        );
-        plan.apply_authorized = true;
-        plan.approval_status = "matched".to_string();
-        assert_eq!(plan.action_count, 1);
-
-        let first = apply_doctor_archive_normalize_plan(&data_dir, &plan);
-        assert_eq!(first.status, "applied");
-        assert_eq!(first.applied_action_count, 1);
-        assert_eq!(first.refused_action_count, 0);
-        assert!(first.mutation_performed);
-        assert!(!first.coverage_reduced);
-        let action_path = data_dir.join(&plan.actions[0].target_relative_path);
-        assert!(
-            action_path.exists(),
-            "annotation should be written additively"
-        );
-
-        let after_raw_mirror = collect_doctor_raw_mirror_report(&data_dir, true);
-        assert_eq!(
-            before_raw_mirror.summary.manifest_count,
-            after_raw_mirror.summary.manifest_count
-        );
-        assert_eq!(
-            before_raw_mirror.summary.total_blob_bytes,
-            after_raw_mirror.summary.total_blob_bytes
-        );
-        assert_eq!(
-            before_raw_mirror.manifests[0].manifest_id,
-            after_raw_mirror.manifests[0].manifest_id
-        );
-
-        let second = apply_doctor_archive_normalize_plan(&data_dir, &plan);
-        assert_eq!(second.status, "idempotent");
-        assert_eq!(second.applied_action_count, 0);
-        assert_eq!(second.already_present_count, 1);
-        assert_eq!(second.refused_action_count, 0);
-        assert!(!second.mutation_performed);
-    }
-
-    #[test]
-    fn archive_normalize_refuses_hostile_annotation_paths() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let data_dir = temp.path().join("cass-data");
-        let source_path = data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"legacy annotation\"}\n";
-        let mut manifest =
-            raw_mirror_test_manifest(&data_dir, "codex", "local", &source_path, bytes, Vec::new());
-        manifest.manifest_blake3 = None;
-        write_raw_mirror_test_manifest(&data_dir, &manifest, bytes);
-
-        let context =
-            build_doctor_archive_scan_context(&data_dir, &data_dir.join("agent_search.db"));
-        let mut plan = build_doctor_archive_normalize_plan(
-            &data_dir,
-            &data_dir.join("agent_search.db"),
-            &context.scan,
-            true,
-            None,
-        );
-        plan.apply_authorized = true;
-        plan.approval_status = "matched".to_string();
-        plan.actions[0].target_relative_path = "../escape.json".to_string();
-
-        let receipt = apply_doctor_archive_normalize_plan(&data_dir, &plan);
-        assert_eq!(receipt.status, "partial");
-        assert_eq!(receipt.applied_action_count, 0);
-        assert_eq!(receipt.refused_action_count, 1);
-        assert!(!receipt.mutation_performed);
-        assert!(
-            !temp.path().join("escape.json").exists(),
-            "hostile annotation path must not be created outside data_dir"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn archive_normalize_refuses_symlinked_annotation_targets_and_data_dirs() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let real_data_dir = temp.path().join("cass-data-real");
-        let source_path = real_data_dir.join("sessions/source.jsonl");
-        let bytes = b"{\"type\":\"message\",\"text\":\"legacy annotation\"}\n";
-        let mut manifest = raw_mirror_test_manifest(
-            &real_data_dir,
-            "codex",
-            "local",
-            &source_path,
-            bytes,
-            Vec::new(),
-        );
-        manifest.manifest_blake3 = None;
-        write_raw_mirror_test_manifest(&real_data_dir, &manifest, bytes);
-
-        let context = build_doctor_archive_scan_context(
-            &real_data_dir,
-            &real_data_dir.join("agent_search.db"),
-        );
-        let mut plan = build_doctor_archive_normalize_plan(
-            &real_data_dir,
-            &real_data_dir.join("agent_search.db"),
-            &context.scan,
-            true,
-            None,
-        );
-        plan.apply_authorized = true;
-        plan.approval_status = "matched".to_string();
-        let target_path = real_data_dir.join(&plan.actions[0].target_relative_path);
-        std::fs::create_dir_all(target_path.parent().expect("annotation parent"))
-            .expect("create annotation parent");
-        let outside = temp.path().join("outside-annotation.json");
-        std::fs::write(&outside, b"{\"outside\":true}\n").expect("write outside target");
-        std::os::unix::fs::symlink(&outside, &target_path)
-            .expect("create annotation target symlink");
-
-        let receipt = apply_doctor_archive_normalize_plan(&real_data_dir, &plan);
-        assert_eq!(receipt.status, "partial");
-        assert_eq!(receipt.applied_action_count, 0);
-        assert_eq!(receipt.refused_action_count, 1);
-        assert!(
-            receipt
-                .event_log
-                .iter()
-                .any(|event| event.message.contains("symlink")),
-            "symlink target should be refused explicitly: {receipt:#?}"
-        );
-
-        let symlinked_data_dir = temp.path().join("cass-data-link");
-        std::os::unix::fs::symlink(&real_data_dir, &symlinked_data_dir)
-            .expect("create data dir symlink");
-        let context = build_doctor_archive_scan_context(
-            &symlinked_data_dir,
-            &symlinked_data_dir.join("agent_search.db"),
-        );
-        let plan = build_doctor_archive_normalize_plan(
-            &symlinked_data_dir,
-            &symlinked_data_dir.join("agent_search.db"),
-            &context.scan,
-            true,
-            None,
-        );
-        assert_eq!(plan.status, "blocked");
-        assert!(
-            plan.safety_gates
-                .iter()
-                .any(|gate| gate.gate_id == "data-dir-root-safe" && gate.status == "fail"),
-            "symlinked data dir root should fail the root safety gate: {plan:#?}"
-        );
-        let receipt = apply_doctor_archive_normalize_plan(&symlinked_data_dir, &plan);
-        assert_eq!(receipt.status, "blocked");
-        assert!(!receipt.mutation_performed);
-    }
 
     #[test]
     fn doctor_plan_receipt_schema_report_names_required_contract_fields() {
@@ -96387,7 +94938,6 @@ fn print_fleet_upgrade_rehearsal_human(output: &FleetUpgradeRehearsalOutput) {
 /// (`quality_tier_embedder`) — that is what `cass index` and `cass search`
 /// will actually use.
 fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::{
         ModelAcquisitionPolicy, ModelManifest, classify_model_cache, model_file_path,
     };
@@ -96408,22 +94958,11 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         budget_max_bytes: acquisition_policy.max_model_bytes,
     };
 
-    // Canonicalize the policy's quality_tier_embedder to a registry name.
-    // The policy stores short aliases (e.g. "snowflake", "minilm") while
-    // ModelManifest::for_embedder expects registry names — match both.
     let policy_embedder = policy.quality_tier_embedder.as_str();
-    let active_registry_name = match policy_embedder {
-        "minilm" | "all-minilm-l6-v2" | "fastembed" | "minilm-384" => Some("minilm"),
-        "snowflake"
-        | "snowflake-arctic-s"
-        | "snowflake-arctic-embed-s"
-        | "snowflake-arctic-s-384" => Some("snowflake-arctic-s"),
-        "nomic" | "nomic-embed" | "nomic-embed-text-v1.5" | "nomic-embed-768" => {
-            Some("nomic-embed")
-        }
-        "hash" => None, // hash fallback — no model files
-        _ => None,
-    };
+    let active_registry_name =
+        crate::search::embedder_registry::resolve_embedder(policy_embedder)
+            .filter(|e| e.requires_model_files)
+            .map(|e| e.name);
 
     // Per-model status snapshot.
     struct ModelStatus {
@@ -96439,16 +94978,17 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
         acquisition: serde_json::Value,
     }
 
-    let known: &[&str] = &["minilm", "snowflake-arctic-s", "nomic-embed"];
+    let known: &[&str] = &["jina", "minilm", "snowflake-arctic-s", "nomic-embed"];
     let mut statuses: Vec<ModelStatus> = Vec::with_capacity(known.len());
     for name in known {
         let Some(manifest) = ModelManifest::for_embedder(name) else {
             continue;
         };
+        let entry = crate::search::embedder_registry::resolve_embedder(name);
         let model_dir = if active_registry_name == Some(*name) {
-            FastEmbedder::runtime_model_dir_for(&data_dir, name)
+            entry.and_then(|e| e.runtime_model_dir(&data_dir))
         } else {
-            FastEmbedder::model_dir_for(&data_dir, name)
+            entry.and_then(|e| e.model_dir(&data_dir))
         };
         let Some(model_dir) = model_dir else {
             continue;
@@ -96677,19 +95217,15 @@ fn run_models_status(output_format: Option<RobotFormat>) -> CliResult<()> {
     Ok(())
 }
 
-/// Resolve a CLI-supplied semantic model name (or alias) to the canonical
-/// registry name used by `ModelManifest::for_embedder` and
-/// `FastEmbedder::model_dir_for`. Mirrors the alias map in
-/// `src/daemon/worker.rs::resolve_embedder_kind` so the CLI surface accepts
-/// the same names the daemon worker honors. Bead:
-/// `coding_agent_session_search-v3of1`.
+/// Resolve a CLI-supplied model name (or alias) to the canonical registry name.
+///
+/// Embedders are resolved via `EmbedderRegistry`; rerankers are matched
+/// directly since they have their own registry.
 fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
+    if let Some(entry) = crate::search::embedder_registry::resolve_embedder(model_name) {
+        return Ok(entry.name);
+    }
     match model_name.to_ascii_lowercase().as_str() {
-        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => Ok("minilm"),
-        "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
-            Ok("snowflake-arctic-s")
-        }
-        "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Ok("nomic-embed"),
         "ms-marco" | "ms-marco-minilm" | "ms-marco-minilm-l-6-v2" | "ms-marco-minilm-l6-v2" => {
             Ok("ms-marco")
         }
@@ -96701,7 +95237,7 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
             kind: CliErrorKind::Model.kind_str(),
             message: format!(
                 "Unknown model '{}'. Embedders: all-minilm-l6-v2 (alias minilm), \
-                 snowflake-arctic-s, nomic-embed. Rerankers: ms-marco, jina-reranker-turbo.",
+                 snowflake-arctic-s, nomic-embed, jina. Rerankers: ms-marco, jina-reranker-turbo.",
                 model_name
             ),
             hint: Some("Use 'cass models status' to see available models".into()),
@@ -96713,19 +95249,19 @@ fn resolve_cli_model_name(model_name: &str) -> CliResult<&'static str> {
 /// Returns the on-disk model directory for either an embedder or a reranker.
 ///
 /// `registry_name` must be a canonical name returned by `resolve_cli_model_name`.
-/// Embedders are routed through `FastEmbedder::model_dir_for`; rerankers use
+/// Embedders are routed through `EmbedderRegistry`; rerankers use
 /// `<data_dir>/models/<manifest.id>` so install layout matches the directory
 /// `FastEmbedReranker` reads at startup.
 fn resolve_model_install_dir(
     data_dir: &Path,
     registry_name: &str,
 ) -> CliResult<(PathBuf, crate::search::model_download::ModelManifest)> {
-    use crate::search::fastembed_embedder::FastEmbedder;
     use crate::search::model_download::ModelManifest;
 
     if let Some(manifest) = ModelManifest::for_embedder(registry_name) {
-        let model_dir =
-            FastEmbedder::model_dir_for(data_dir, registry_name).ok_or_else(|| CliError {
+        let model_dir = crate::search::embedder_registry::resolve_embedder(registry_name)
+            .and_then(|e| e.model_dir(data_dir))
+            .ok_or_else(|| CliError {
                 code: 20,
                 kind: CliErrorKind::Model.kind_str(),
                 message: format!(
@@ -97279,11 +95815,12 @@ fn resolve_semantic_index_embedder(raw: &str) -> String {
     {
         return "hash".to_string();
     }
-    let Some(policy_embedder) = crate::search::fastembed_embedder::FastEmbedder::canonical_name(
-        &policy.quality_tier_embedder,
-    ) else {
+    let Some(policy_entry) =
+        crate::search::embedder_registry::resolve_embedder(&policy.quality_tier_embedder)
+    else {
         return requested.to_string();
     };
+    let policy_embedder = policy_entry.name;
     if policy_embedder == "minilm" {
         requested.to_string()
     } else {
@@ -97343,8 +95880,7 @@ fn run_models_backfill(
         });
     let embedder_type = resolve_semantic_index_embedder(&embedder_type);
     let embedder_valid = embedder_type == "hash"
-        || crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .is_some();
+        || crate::search::embedder_registry::resolve_embedder(&embedder_type).is_some();
     if !embedder_valid {
         return Err(CliError {
             code: 20,
@@ -97450,8 +95986,8 @@ fn run_models_backfill(
         retryable: true,
     })?;
     let model_manifest =
-        crate::search::fastembed_embedder::FastEmbedder::canonical_name(&embedder_type)
-            .and_then(ModelManifest::for_embedder)
+        crate::search::embedder_registry::resolve_embedder(&embedder_type)
+            .and_then(|e| ModelManifest::for_embedder(e.name))
             .unwrap_or_else(ModelManifest::minilm_v2);
     let model_revision = if embedder_type == "hash" {
         "hash".to_string()
@@ -98886,6 +97422,11 @@ mod cli_models_resolution_tests {
             ("nomic-embed-768", "nomic-embed"),
             ("nomic-embed-text-v1.5", "nomic-embed"),
             ("NOMIC-EMBED", "nomic-embed"),
+            ("jina", "jina"),
+            ("jina-v2-small", "jina"),
+            ("jina-v2-small-512", "jina"),
+            ("jina-embeddings-v2-small-en", "jina"),
+            ("JINA", "jina"),
         ] {
             assert_eq!(
                 resolve_cli_model_name(alias).expect("registered alias must resolve"),
@@ -98925,29 +97466,31 @@ mod cli_models_resolution_tests {
         assert!(!err.retryable);
     }
 
-    /// `coding_agent_session_search-v3of1`: every name that
-    /// `resolve_cli_model_name` returns MUST be a name that both
-    /// `ModelManifest::for_embedder` and `FastEmbedder::model_dir_for`
-    /// accept. Otherwise install/remove would resolve the alias and
-    /// then crash at the manifest/dir lookup. This is the cross-module
-    /// contract that the original hardcoded `all-minilm-l6-v2` check
-    /// silently maintained — making it explicit prevents drift.
+    /// Every canonical embedder name that `resolve_cli_model_name` returns
+    /// MUST be a name that both `ModelManifest::for_embedder` and the
+    /// embedder registry accept. Otherwise install/remove would resolve the
+    /// alias and then crash at the manifest/dir lookup.
     #[test]
     fn every_resolved_canonical_name_has_manifest_and_dir_mapping() {
-        use crate::search::fastembed_embedder::FastEmbedder;
+        use crate::search::embedder_registry::resolve_embedder;
         use crate::search::model_download::ModelManifest;
 
         let probe_data_dir = std::path::Path::new("/tmp/cass-v3of1-probe");
-        for canonical in ["minilm", "snowflake-arctic-s", "nomic-embed"] {
+        for canonical in ["minilm", "snowflake-arctic-s", "nomic-embed", "jina"] {
             assert!(
                 ModelManifest::for_embedder(canonical).is_some(),
                 "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
                  ModelManifest registered"
             );
+            let entry = resolve_embedder(canonical);
             assert!(
-                FastEmbedder::model_dir_for(probe_data_dir, canonical).is_some(),
-                "canonical name {canonical:?} returned by resolve_cli_model_name must have a \
-                 FastEmbedder::model_dir_for mapping"
+                entry.is_some(),
+                "canonical name {canonical:?} returned by resolve_cli_model_name must be in \
+                 the embedder registry"
+            );
+            assert!(
+                entry.unwrap().model_dir(probe_data_dir).is_some(),
+                "canonical name {canonical:?} must have a model directory mapping"
             );
         }
     }

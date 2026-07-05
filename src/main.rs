@@ -222,12 +222,16 @@ fn apply_default_fsqlite_read_witness_cap() {
 }
 
 fn main() -> anyhow::Result<()> {
-    // (cass #308) The semantic stack is now pure-Rust (frankensearch `native`
-    // frankentorch embedder + reranker), so there is no prebuilt ONNX Runtime and
-    // no AVX/AVX2 static-init hazard. The old pre-AVX2 preflight + `-baseline`
-    // artifact (#256/#307) are obsolete: a single binary runs on any x86_64 CPU,
-    // with NEON (aarch64) / AVX2+FMA-when-present (x86) selected at runtime by the
-    // int8 GEMM kernels.
+    // (cass #308) The reranker and the native embedders (minilm,
+    // snowflake-arctic-s, nomic-embed) are pure-Rust (frankensearch `native`
+    // frankentorch backend), so those paths carry no AVX/AVX2 static-init
+    // hazard. The old pre-AVX2 preflight + `-baseline` artifact (#256/#307) are
+    // obsolete for them: a single binary runs on any x86_64 CPU, with NEON
+    // (aarch64) / AVX2+FMA-when-present (x86) selected at runtime by the int8
+    // GEMM kernels. ONNX Runtime is back, though, via `ort` behind the
+    // `onnx-embedder` feature, for the `jina` embedder (see
+    // `search/onnx_embedder.rs`) — the AVX-static-init hazard applies to that
+    // path.
 
     // Load .env early; ignore if missing.
     dotenvy::dotenv().ok();

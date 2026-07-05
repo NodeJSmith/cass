@@ -9,8 +9,8 @@
 [profile.default]
 # Fail fast during local development
 fail-fast = true
-# Run tests in parallel (default: number of CPUs)
-test-threads = "num-cpus"
+# Cap parallelism to avoid saturating all cores and crashing WSL.
+test-threads = 4
 # Output format for local development
 status-level = "pass"
 final-status-level = "fail"
@@ -25,7 +25,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 [profile.ci]
 # Don't fail fast in CI - run all tests to get complete results
 fail-fast = false
-# Use all CPUs
+# CI can use all CPUs (not resource-constrained like WSL dev)
 test-threads = "num-cpus"
 # Verbose output for CI logs
 status-level = "all"
@@ -51,7 +51,7 @@ store-failure-output = true
 [profile.ci-coverage]
 # Same settings as CI
 fail-fast = false
-test-threads = "num-cpus"
+test-threads = 4
 status-level = "all"
 final-status-level = "all"
 retries = 0

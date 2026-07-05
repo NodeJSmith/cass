@@ -15,7 +15,7 @@ use crate::indexer::semantic::{
     EmbeddingInput, SemanticIndexer, message_id_from_db, saturating_u32_from_i64,
 };
 use crate::search::canonicalize::{canonicalize_for_embedding, content_hash};
-use crate::search::fastembed_embedder::FastEmbedder;
+use crate::search::embedder_registry::resolve_embedder;
 use crate::search::vector_index::{
     VectorIndex, parse_semantic_doc_id, role_code_from_str, vector_index_path,
 };
@@ -131,25 +131,15 @@ fn resolve_embedder_kind(
         return Ok(WorkerEmbedderKind::Hash);
     }
 
-    let normalized_name = match model_name.to_ascii_lowercase().as_str() {
-        "fastembed" | "minilm" | "minilm-384" | "all-minilm-l6-v2" => DEFAULT_SEMANTIC_MODEL,
-        "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
-            "snowflake-arctic-s"
-        }
-        "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => "nomic-embed",
-        _ => {
-            anyhow::bail!(
-                "unsupported semantic model '{model_name}' for daemon embedding worker; supported: minilm, snowflake-arctic-s, nomic-embed"
-            );
-        }
-    };
-
-    let config = FastEmbedder::config_for(normalized_name).ok_or_else(|| {
-        anyhow::anyhow!("missing FastEmbedder config for registered model '{normalized_name}'")
+    let entry = resolve_embedder(model_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported semantic model '{model_name}' for daemon embedding worker; \
+             supported: minilm, snowflake-arctic-s, nomic-embed, jina"
+        )
     })?;
     Ok(WorkerEmbedderKind::FastEmbed {
-        model_name: normalized_name.to_string(),
-        embedder_id: config.embedder_id,
+        model_name: entry.name.to_string(),
+        embedder_id: entry.id.to_string(),
     })
 }
 

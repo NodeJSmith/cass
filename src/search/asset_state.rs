@@ -24,6 +24,7 @@ use crate::indexer::{
 };
 use crate::search::ann_index::hnsw_index_path;
 use crate::search::embedder::Embedder;
+use crate::search::embedder_registry::resolve_embedder;
 use crate::search::fastembed_embedder::FastEmbedder;
 use crate::search::hash_embedder::HashEmbedder;
 use crate::search::model_manager::{
@@ -1026,13 +1027,11 @@ fn semantic_runtime_surface(inputs: SemanticRuntimeInputs<'_>) -> SemanticRuntim
 
 fn active_policy_model_dir(data_dir: &Path) -> Option<PathBuf> {
     let policy = SemanticPolicy::resolve(&CliSemanticOverrides::default());
-    let embedder_name = FastEmbedder::canonical_name(&policy.quality_tier_embedder)?;
-    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+    resolve_embedder(&policy.quality_tier_embedder)?.runtime_model_dir(data_dir)
 }
 
 fn model_dir_for_embedder_id(data_dir: &Path, embedder_id: &str) -> Option<PathBuf> {
-    let embedder_name = FastEmbedder::canonical_name(embedder_id)?;
-    FastEmbedder::runtime_model_dir_for(data_dir, embedder_name)
+    resolve_embedder(embedder_id)?.runtime_model_dir(data_dir)
 }
 
 fn semantic_tier_queryable(
@@ -3086,7 +3085,7 @@ mod tests {
             (
                 SemanticPreference::DefaultModel,
                 "fastembed",
-                Some(FastEmbedder::default_model_dir(data_dir)),
+                active_policy_model_dir(data_dir),
             ),
             (SemanticPreference::HashFallback, "hash", None),
         ];
