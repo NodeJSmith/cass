@@ -18,11 +18,6 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
-# macOS targets use the default ld64 linker from Xcode
-# LLD is not available by default on macOS and causes build failures
-# [target.aarch64-apple-darwin] - uses default linker
-# [target.x86_64-apple-darwin] - uses default linker
-
 # Alias for coverage command
 [alias]
 cov = "llvm-cov --workspace --ignore-filename-regex tests/ --ignore-filename-regex benches/"

@@ -173,6 +173,9 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
         with:
@@ -376,6 +379,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
 
@@ -458,7 +465,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y openssh-client rsync
+          sudo apt-get install -y openssh-client rsync mold
           docker version
           docker info
 
@@ -511,6 +518,9 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
@@ -594,6 +604,9 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
 
@@ -660,6 +673,9 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
 
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
 
@@ -686,6 +702,9 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
@@ -727,6 +746,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/franken_agent_detection.git ../franken_agent_detection
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch.git ../frankensearch
+
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@881ba7bf39a41cda34ac9e123fb41b44ed08232f # nightly
