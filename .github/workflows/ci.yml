@@ -192,7 +192,7 @@ jobs:
         # intentionally opt-in and requires specific sibling-repo git revisions
         # (see build.rs CONTRACTS). `--all-features` would activate it and make
         # the build fail because CI clones siblings at HEAD, not pinned revs.
-        run: cargo clippy --all-targets --features "qr encryption backtrace" -- -D warnings
+        run: cargo clippy --all-targets --features "encryption backtrace" -- -D warnings
 
   # UBS pre-merge gate per coding_agent_session_search-dpfvr.
   # Runs `ubs --format=json --ci <changed-files>` against the diff for the PR
@@ -402,7 +402,7 @@ jobs:
       - name: Run tests
         # Explicit feature list excludes `strict-path-dep-validation` — see the
         # Lint job for rationale.
-        run: cargo test --features "qr encryption backtrace" --verbose -- --nocapture
+        run: cargo test --features "encryption backtrace" --verbose -- --nocapture
         env:
           RUST_LOG: debug
 
@@ -424,7 +424,7 @@ jobs:
           done
           # Explicit feature list excludes `strict-path-dep-validation` — see
           # the Lint job for rationale.
-          E2E_LOG=1 cargo test --features "qr encryption backtrace" --verbose "${args[@]}" -- --nocapture
+          E2E_LOG=1 cargo test --features "encryption backtrace" --verbose "${args[@]}" -- --nocapture
 
       - name: Validate E2E JSONL logs
         if: always()
@@ -476,12 +476,12 @@ jobs:
         uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
       - name: Run SSH sync integration tests
-        run: cargo test --features "qr encryption backtrace" --test ssh_sync_integration -- --ignored --test-threads=1 --nocapture
+        run: cargo test --features "encryption backtrace" --test ssh_sync_integration -- --ignored --test-threads=1 --nocapture
         env:
           RUST_LOG: debug
 
       - name: Run SSH sources E2E tests
-        run: E2E_LOG=1 cargo test --features "qr encryption backtrace" --test e2e_ssh_sources -- --ignored --test-threads=1 --nocapture
+        run: E2E_LOG=1 cargo test --features "encryption backtrace" --test e2e_ssh_sources -- --ignored --test-threads=1 --nocapture
         env:
           RUST_LOG: debug
 
