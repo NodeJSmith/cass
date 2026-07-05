@@ -1,5 +1,4 @@
 use regex::Regex;
-use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -466,39 +465,6 @@ pub fn swarm_evidence_redaction_config() -> RedactionConfig {
     config
 }
 
-pub fn redact_swarm_text(input: &str) -> String {
-    let engine = RedactionEngine::new(swarm_evidence_redaction_config());
-    engine.redact_text(input).output
-}
-
-pub fn redact_swarm_json_value(value: &Value) -> Value {
-    let engine = RedactionEngine::new(swarm_evidence_redaction_config());
-    redact_swarm_json_value_with_engine(&engine, value)
-}
-
-fn redact_swarm_json_value_with_engine(engine: &RedactionEngine, value: &Value) -> Value {
-    match value {
-        Value::String(text) => Value::String(engine.redact_text(text).output),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| redact_swarm_json_value_with_engine(engine, item))
-                .collect(),
-        ),
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        engine.redact_text(key).output,
-                        redact_swarm_json_value_with_engine(engine, value),
-                    )
-                })
-                .collect::<Map<_, _>>(),
-        ),
-        Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
-    }
-}
 
 static EMAIL_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
     Regex::new(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
@@ -921,114 +887,6 @@ mod tests {
         assert!(snippet.contains("[REDACTED_PATH]"));
         assert!(!snippet.contains("alice@example.com"));
         assert!(!snippet.contains("/home/alice"));
-    }
-
-    #[test]
-    fn swarm_redaction_scrubs_absolute_paths_with_spaces() {
-        for path in [
-            "/home/alice/Secret Project",
-            "/Users/alice/Secret Project",
-            "C:\\Users\\alice\\Secret Project",
-            "/data/projects/Secret Project",
-        ] {
-            let redacted = redact_swarm_text(&format!("Blocked on {path}"));
-
-            assert_eq!(redacted, "Blocked on [REDACTED_PATH]");
-            assert!(!redacted.contains(path));
-            assert!(!redacted.contains("Secret Project"));
-        }
-    }
-
-    #[test]
-    fn swarm_json_redaction_scrubs_object_keys_and_values() {
-        let input = serde_json::json!({
-            "/home/alice/private-client/src/lib.rs": {
-                "TOKEN=SECRET_VALUE": "pack:///data/projects/private-client/session.jsonl#L44",
-                "owner": "alice@example.com"
-            }
-        });
-
-        let output = redact_swarm_json_value(&input);
-        let serialized = output.to_string();
-
-        assert!(!serialized.contains("/home/alice"));
-        assert!(!serialized.contains("/data/projects/private-client"));
-        assert!(!serialized.contains("SECRET_VALUE"));
-        assert!(!serialized.contains("TOKEN="));
-        assert!(!serialized.contains("alice@example.com"));
-        assert!(serialized.contains("[REDACTED_PATH]"));
-        assert!(serialized.contains("[SECRET_ENV_REDACTED]"));
-        assert!(serialized.contains("pack://[REDACTED_PATH]#L44"));
-    }
-
-    #[test]
-    fn swarm_redaction_scrubs_quoted_secret_env_values() {
-        for (command, leaked_fragments) in [
-            (
-                r#"rch exec -- env TOKEN="super secret value" cargo test"#,
-                &["TOKEN=", "super secret value"][..],
-            ),
-            (
-                "rch exec -- env PASSWORD='correct horse battery staple' cargo test",
-                &["PASSWORD=", "correct horse battery staple"][..],
-            ),
-            (
-                r#"API_TOKEN="secret \"quoted\" value" cargo check"#,
-                &["API_TOKEN=", "secret", "quoted"][..],
-            ),
-        ] {
-            let redacted = redact_swarm_text(command);
-
-            assert!(
-                redacted.contains(SWARM_SECRET_ENV_ASSIGNMENT_REDACTED),
-                "secret assignment should be replaced in {redacted:?}"
-            );
-            for fragment in leaked_fragments {
-                assert!(
-                    !redacted.contains(fragment),
-                    "redacted command leaked {fragment:?}: {redacted:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn swarm_redaction_scrubs_api_key_literals_in_command_args() {
-        for (input, leaked_fragments) in [
-            (
-                "cass pack --api-key sk-live-secret --json",
-                &["sk-live-secret"][..],
-            ),
-            (
-                "curl -H 'Authorization: Bearer ghp_1234567890abcdef' https://api.example.com",
-                &["ghp_1234567890abcdef"][..],
-            ),
-            (
-                "AWS_ACCESS_KEY_ID ASIA1234567890ABCDEF",
-                &["ASIA1234567890ABCDEF"][..],
-            ),
-        ] {
-            let redacted = redact_swarm_text(input);
-
-            assert!(
-                redacted.contains(SWARM_SECRET_LITERAL_REDACTED),
-                "API key literal should be replaced in {redacted:?}"
-            );
-            for fragment in leaked_fragments {
-                assert!(
-                    !redacted.contains(fragment),
-                    "redacted command leaked {fragment:?}: {redacted:?}"
-                );
-            }
-        }
-
-        let redacted_json = redact_swarm_json_value(&serde_json::json!({
-            "command": "cass pack --api-key sk-live-secret --json"
-        }));
-        let serialized = redacted_json.to_string();
-
-        assert!(!serialized.contains("sk-live-secret"));
-        assert!(serialized.contains(SWARM_SECRET_LITERAL_REDACTED));
     }
 
     #[test]

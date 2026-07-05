@@ -111,14 +111,11 @@ pub fn render_privacy_exposure_fixture(fixture_id: &str, source: Option<&Value>)
     render_payload(fixture_id, "fixture", fixture_facts(source))
 }
 
-/// Redact a single secret-looking sample. Belt-and-suspenders: applies the
-/// ingestion secret redactor (PEM keys, AWS/GitHub/OpenAI/Anthropic tokens,
-/// JWTs, Slack/Stripe keys, DB URLs) and then the strict swarm evidence
-/// redactor (absolute paths, emails, hostnames, env secret assignments). The
-/// raw value is never returned.
+/// Redact a single secret-looking sample. Applies the ingestion secret
+/// redactor (PEM keys, AWS/GitHub/OpenAI/Anthropic tokens, JWTs,
+/// Slack/Stripe keys, DB URLs). The raw value is never returned.
 fn redact_sample(raw: &str) -> String {
-    let stage1 = crate::indexer::redact_secrets::redact_text(raw).into_owned();
-    crate::pages::redact::redact_swarm_text(&stage1)
+    crate::indexer::redact_secrets::redact_text(raw).into_owned()
 }
 
 fn classify_sample(raw: &str) -> &'static str {

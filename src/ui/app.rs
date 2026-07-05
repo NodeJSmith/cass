@@ -20757,20 +20757,6 @@ impl super::ftui_adapter::Model for CassApp {
                     ftui::Cmd::none()
                 };
                 self.clear_loading_context(LoadingContext::Analytics);
-                // Seed the cockpit on first entry so the surface always has
-                // something to render rather than the empty-cache placeholder.
-                // `render_swarm_status_live_partial` is pure (no I/O), so it is
-                // safe to call from the surface-entry path — the bead
-                // (coding_agent_session_search-oh96l.6) forbids heavy doctor
-                // scans, rch, git fetches, and Agent Mail mutations on render.
-                // Subsequent refreshes will land via explicit user action or a
-                // bounded background tick once a live aggregator is wired.
-                if self.swarm_cockpit.snapshot.is_none() {
-                    let payload = crate::render_swarm_status_live_partial();
-                    self.swarm_cockpit = SwarmCockpitState::from_snapshot(
-                        SwarmCockpitSnapshot::from_status_payload(&payload),
-                    );
-                }
                 transition_cmd
             }
 

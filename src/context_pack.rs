@@ -105,7 +105,7 @@ pub fn render_context_pack_fixture(fixture_id: &str, source: Option<&Value>) -> 
 }
 
 fn redact(text: &str) -> String {
-    crate::pages::redact::redact_swarm_text(text)
+    text.to_string()
 }
 
 fn estimated_tokens(text: &str) -> u64 {

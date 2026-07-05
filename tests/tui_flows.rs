@@ -448,7 +448,7 @@ fn swarm_surface_renders_build_pressure_and_proof_gaps() {
 }
 
 #[test]
-fn swarm_entered_msg_seeds_snapshot_from_live_partial_aggregator() {
+fn swarm_entered_msg_transitions_surface_without_seeding() {
     let _guard = tui_flow_guard();
     let mut app = CassApp::default();
     pin_dark_theme(&mut app);
@@ -460,29 +460,13 @@ fn swarm_entered_msg_seeds_snapshot_from_live_partial_aggregator() {
     let cmd = app.update(CassMsg::SwarmEntered);
     drain_cmd_messages(&mut app, cmd);
 
+    // The swarm status aggregator was removed; entering the surface no
+    // longer seeds a snapshot. The surface renders its empty-cache
+    // placeholder until a snapshot is supplied some other way.
     assert_eq!(app.surface, AppSurface::Swarm);
-    let snapshot = app
-        .swarm_cockpit
-        .snapshot
-        .as_ref()
-        .expect("SwarmEntered must seed the cockpit via render_swarm_status_live_partial");
-    // The live-partial aggregator marks every required provider as
-    // unavailable until live wiring lands. The render must reflect that
-    // truthfully (no fabricated counts) — see bead acceptance criteria for
-    // coding_agent_session_search-oh96l.6 ("It should reuse the read-only
-    // aggregator and refresh only on explicit command or bounded background
-    // interval").
-    assert_eq!(snapshot.status, "partial");
+    assert!(app.swarm_cockpit.snapshot.is_none());
     let text = render_app_text(&app, 110, 24);
-    assert!(text.contains("ready:0"));
-    assert!(text.contains("Safety"));
-
-    // Re-entering must NOT re-seed (the surface is read-only and idempotent
-    // — repeated taps of Alt+W shouldn't churn state).
-    let original = app.swarm_cockpit.clone();
-    let cmd = app.update(CassMsg::SwarmEntered);
-    drain_cmd_messages(&mut app, cmd);
-    assert_eq!(app.swarm_cockpit, original, "re-entering must not re-seed");
+    assert!(text.contains("No swarm snapshot cached"));
 }
 
 // ── Swarm cockpit: empty queue + evidence-gap state coverage ──────────────
@@ -596,9 +580,8 @@ fn swarm_surface_renders_evidence_gap_summary_state() {
 }
 
 // Build a swarm payload from a checked-in golden so the safety tests run
-// against the exact JSON shape `render_swarm_status_payload` produces. The
-// goldens live under `tests/golden/swarm_status/` and are regenerated via
-// `UPDATE_GOLDENS=1 ... cargo test --test swarm_status_contract`.
+// against a realistic swarm status JSON shape. The goldens live under
+// `tests/golden/swarm_status/`.
 fn load_swarm_golden(scenario: &str) -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/swarm_status")

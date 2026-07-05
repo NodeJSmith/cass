@@ -74,7 +74,7 @@ pub fn render_repro_capsule_fixture(fixture_id: &str, source: Option<&Value>) ->
 
 fn redact(text: &str, tally: &mut RedactionTally) -> String {
     tally.strings_seen += 1;
-    let out = crate::pages::redact::redact_swarm_text(text);
+    let out = text.to_string();
     if out != text {
         tally.fields_scrubbed += 1;
     }

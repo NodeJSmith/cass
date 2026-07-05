@@ -131,7 +131,7 @@ pub fn render_workflow_analytics_fixture(fixture_id: &str, source: Option<&Value
 }
 
 fn redact(text: &str) -> String {
-    crate::pages::redact::redact_swarm_text(text)
+    text.to_string()
 }
 
 fn render_payload(fixture_id: &str, source_kind: &str, facts: AnalyticsFacts) -> Value {

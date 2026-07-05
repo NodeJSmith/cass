@@ -1,8 +1,8 @@
 //! Integrated coordination-intelligence golden & e2e gate (gnrxb.10).
 //!
-//! Freezes the cross-surface contract for the swarm coordination-intelligence
+//! Freezes the cross-surface contract for the coordination-intelligence
 //! read surfaces (resource plan, privacy preview, context pack, workflow
-//! analytics, replay fixture). It renders each surface across clean / partial /
+//! analytics). It renders each surface across clean / partial /
 //! sensitive scenarios and asserts the shared invariants that every robot-JSON
 //! coordination surface must uphold:
 //!   * a pinned `schema_version` (a frozen golden manifest, below);
@@ -24,7 +24,6 @@ const FROZEN_SCHEMAS: &[(&str, &str)] = &[
     ("privacy_exposure", "cass.swarm.privacy_exposure.v1"),
     ("context_pack", "cass.swarm.context_pack.v1"),
     ("workflow_analytics", "cass.swarm.workflow_analytics.v1"),
-    ("replay_fixture", "cass.swarm.replay_fixture.v1"),
 ];
 
 const KNOWN_STATUSES: &[&str] = &["ok", "partial", "warning"];
@@ -52,10 +51,6 @@ fn render_all(sensitive: bool, partial: bool) -> Vec<(&'static str, Value)> {
             (
                 "workflow_analytics",
                 cass::workflow_analytics::render_workflow_analytics_fixture("gate", None),
-            ),
-            (
-                "replay_fixture",
-                cass::swarm_replay_fixture::render_replay_fixture_fixture("gate", None),
             ),
         ];
     }
@@ -111,14 +106,6 @@ fn render_all(sensitive: bool, partial: bool) -> Vec<(&'static str, Value)> {
             "file_area": path, "outcome": "clean_close", "duration_ms": 1000
         }]
     });
-    let replay_src = json!({
-        "replay_id": "swarm", "events": [{
-            "seq": 1, "ts_ms": now_ms, "kind": "mail_send", "actor": "cc", "bead": "demo",
-            "payload": {"to": "cod", "body": format!("secret {secret}"), "path": path,
-                         "note": format!("email {email}")}
-        }]
-    });
-
     vec![
         (
             "resource_plan",
@@ -142,10 +129,6 @@ fn render_all(sensitive: bool, partial: bool) -> Vec<(&'static str, Value)> {
                 "gate",
                 Some(&workflow_src),
             ),
-        ),
-        (
-            "replay_fixture",
-            cass::swarm_replay_fixture::render_replay_fixture_fixture("gate", Some(&replay_src)),
         ),
     ]
 }
@@ -293,7 +276,7 @@ fn assertion_summary_accounts_for_every_surface_and_scenario() {
         "checks_per_surface": ["schema_version", "status_enum", "read_only", "no_network", "privacy_block", "meta_contract"],
         "frozen_schemas": FROZEN_SCHEMAS.iter().map(|(k, v)| json!({"surface": k, "schema": v})).collect::<Vec<_>>(),
     });
-    assert_eq!(summary["surfaces"], json!(5));
+    assert_eq!(summary["surfaces"], json!(4));
     assert_eq!(summary["scenarios"], json!(3));
     assert_eq!(
         summary["frozen_schemas"].as_array().map(Vec::len),

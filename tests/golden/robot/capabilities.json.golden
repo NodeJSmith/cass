@@ -2948,12 +2948,6 @@
       "has_json_output": false
     },
     {
-      "name": "swarm",
-      "description": "Read-only swarm operations status, work packets, and coordination lint",
-      "arguments": [],
-      "has_json_output": false
-    },
-    {
       "name": "import",
       "description": "Import data from external sources",
       "arguments": [],
