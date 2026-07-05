@@ -145,9 +145,6 @@ pub enum ErrorKind {
     Storage,
     StorageFingerprint,
     Timeout,
-    Tui,
-    TuiHeadlessOnce,
-    TuiResetState,
     Unknown,
     UnknownAgent,
     UpdateCheck,
@@ -246,9 +243,6 @@ impl ErrorKind {
             Self::Storage => "storage",
             Self::StorageFingerprint => "storage-fingerprint",
             Self::Timeout => "timeout",
-            Self::Tui => "tui",
-            Self::TuiHeadlessOnce => "tui-headless-once",
-            Self::TuiResetState => "tui-reset-state",
             Self::Unknown => "unknown",
             Self::UnknownAgent => "unknown-agent",
             Self::UpdateCheck => "update-check",
@@ -346,9 +340,6 @@ impl ErrorKind {
             "storage" => Self::Storage,
             "storage-fingerprint" => Self::StorageFingerprint,
             "timeout" => Self::Timeout,
-            "tui" => Self::Tui,
-            "tui-headless-once" => Self::TuiHeadlessOnce,
-            "tui-reset-state" => Self::TuiResetState,
             "unknown" => Self::Unknown,
             "unknown-agent" => Self::UnknownAgent,
             "update-check" => Self::UpdateCheck,
@@ -446,9 +437,6 @@ impl ErrorKind {
             Self::Storage,
             Self::StorageFingerprint,
             Self::Timeout,
-            Self::Tui,
-            Self::TuiHeadlessOnce,
-            Self::TuiResetState,
             Self::Unknown,
             Self::UnknownAgent,
             Self::UpdateCheck,
@@ -513,10 +501,12 @@ mod tests {
     /// drift immediately at CI time.
     #[test]
     fn variant_count_matches_audited_lib_rs_kind_literals() {
-        // 91 unique kinds at landing time (commit before the pack
-        // landed). If lib.rs grows a new kind, bump this count AND
-        // add the variant + arms above.
-        const AUDITED_KIND_COUNT: usize = 91;
+        // 88 unique kinds at landing time (commit before the pack
+        // landed; TUI-only kinds `tui`, `tui-headless-once`, and
+        // `tui-reset-state` were removed alongside the TUI). If
+        // lib.rs grows a new kind, bump this count AND add the
+        // variant + arms above.
+        const AUDITED_KIND_COUNT: usize = 88;
         assert_eq!(
             ErrorKind::all_variants().len(),
             AUDITED_KIND_COUNT,

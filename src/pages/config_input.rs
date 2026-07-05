@@ -44,7 +44,7 @@ use thiserror::Error;
 
 use super::export::PathMode;
 use super::wizard::{DeployTarget, WizardState};
-use crate::ui::time_parser::parse_time_input;
+use crate::time_parser::parse_time_input;
 
 /// Errors that can occur when loading or validating pages configuration.
 #[derive(Error, Debug)]

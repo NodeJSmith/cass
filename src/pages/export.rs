@@ -1,4 +1,4 @@
-use crate::ui::time_parser::parse_time_input;
+use crate::time_parser::parse_time_input;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::ValueEnum;

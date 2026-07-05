@@ -1,7 +1,7 @@
 //! SQL query builders for analytics.
 //!
 //! All functions accept a `&frankensqlite::Connection` and an [`AnalyticsFilter`],
-//! keeping the SQL and bucketing logic in one place for both CLI and ftui.
+//! keeping the SQL and bucketing logic in one place for CLI consumers.
 
 use std::collections::BTreeMap;
 
